@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "huntress-ctf-robot"
+version = "0.1.0"
+description = "A safe, extensible automation client for Huntress CTF 2026"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+huntress-ctf = "huntress_ctf.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
