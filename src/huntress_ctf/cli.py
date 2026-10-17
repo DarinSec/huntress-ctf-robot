@@ -12,9 +12,16 @@ import warnings
 from .artifacts import save_artifact
 from .autopilot import COMPLETE, EXPIRED, INCORRECT, PENDING, UNRESOLVED, run_autopilot
 from .client import DEFAULT_BASE_URL, GameMasterClient, GameMasterError
+from .config import load_env
+from .containers import DEFAULT_PASSWORDS, unwrap
+from .daily import run_daily
 from .display import print_result, safe_value
-from .diagnostics import run_diagnostics
+from .diagnostics import run_bench, run_diagnostics
+from .fastpath import run_timed_fast
 from .state import AttemptState
+from .workspace import render_triage
+
+CAPTURE_DIR = Path("integration-data")
 
 
 def _positive_timeout(value: str) -> float:
@@ -25,6 +32,16 @@ def _positive_timeout(value: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise argparse.ArgumentTypeError("timeout must be a finite positive number")
     return timeout
+
+
+def _count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("count must be an integer from 1 to 100") from None
+    if not 1 <= count <= 100:
+        raise argparse.ArgumentTypeError("count must be from 1 to 100")
+    return count
 
 
 def _day(value: str) -> int:
@@ -50,14 +67,25 @@ def build_parser() -> argparse.ArgumentParser:
     listing = commands.add_parser("list", help="List current challenges")
     listing.add_argument("--day", type=_day)
     listing.add_argument("--lane")
-    for name, help_text in (
-        ("start", "Start or reconnect; print the assignment"),
-        ("retry", "Explicitly request a variant after completion or expiry"),
-        ("solve", "Analyze and automatically submit supported solutions"),
+    for name, help_text, timed_help in (
+        ("start", "Start or reconnect; print the assignment", "Request a timed attempt"),
+        ("retry", "Explicitly request a variant after completion or expiry", "Request a timed attempt"),
+        ("solve", "Analyze and automatically submit supported solutions",
+         "Request a timed attempt; only start, download, solve, and one submit run on the clock"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("challenge_id")
-        command.add_argument("--timed", action="store_true", help="Request a timed attempt")
+        command.add_argument("--timed", action="store_true", help=timed_help)
+        if name == "solve":
+            command.add_argument("--capture", action="store_true", help=f"Save redacted responses under {CAPTURE_DIR} after the run")
+    daily = commands.add_parser("daily", help="Solve every available challenge untimed, or race the proven ones")
+    daily.add_argument("--day", type=_day)
+    daily.add_argument("--lane")
+    daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
+    daily.add_argument("--capture", action="store_true", help=f"Save redacted responses under {CAPTURE_DIR}")
+    triage = commands.add_parser("triage", help="Print a one-page triage report for a local file (offline)")
+    triage.add_argument("path", type=Path)
+    triage.add_argument("--password", action="append", default=[], help="Archive password to try (repeatable)")
     status = commands.add_parser("status", help="Read current attempt status")
     status.add_argument("challenge_id")
     artifact = commands.add_parser("artifact", help="Save the current assigned artifact with SHA-256")
@@ -72,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="Check API access and capture responses without starting attempts")
     doctor.add_argument("--challenge", action="append", default=[], metavar="ID", help="Also check this existing challenge's status; repeat for more IDs")
     doctor.add_argument("--output", type=Path, help="Save redacted responses in a new capture directory under this path")
+    bench = commands.add_parser("bench", help="Measure request latency with new vs kept-alive connections (read-only)")
+    bench.add_argument("--count", type=_count, default=10, help="Requests per connection mode (1-100)")
+    bench.add_argument("--challenge", metavar="ID", help="Time this challenge's status instead of the list")
     return parser
 
 
@@ -91,7 +122,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     secrets: tuple[str, ...] = ()
+    client = None
+    if args.command == "triage":
+        # Offline: no client, no credentials, nothing executed.
+        try:
+            data = args.path.read_bytes()
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        unwrapped = unwrap(data, tuple(dict.fromkeys([*args.password, *DEFAULT_PASSWORDS])))
+        print(render_triage(data, unwrapped.members, unwrapped.notes, title=args.path.name), end="")
+        return COMPLETE
     try:
+        load_env()
         if args.prompt_token:
             token = _prompt_token()
             secrets = (token,)
@@ -108,7 +151,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             result = client.status(args.challenge_id)
         elif args.command == "solve":
-            return run_autopilot(client, args.challenge_id, timed=args.timed)
+            capture = CAPTURE_DIR if args.capture else None
+            if args.timed:
+                return run_timed_fast(client, args.challenge_id, capture_dir=capture)
+            return run_autopilot(client, args.challenge_id, capture_dir=capture)
+        elif args.command == "daily":
+            return run_daily(
+                client, day=args.day, lane=args.lane, timed=args.timed,
+                capture_dir=CAPTURE_DIR if args.capture else None,
+            )
+        elif args.command == "bench":
+            print_result(run_bench(client, count=args.count, challenge_id=args.challenge), secrets)
+            return COMPLETE
         elif args.command == "doctor":
             report, code = run_diagnostics(
                 client, challenge_ids=tuple(args.challenge), output_root=args.output,
@@ -152,4 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted. Check server status before repeating a POST.", file=sys.stderr)
         return 130
+    finally:
+        if client is not None:
+            client.close()
 

@@ -9,6 +9,12 @@ description = "A safe, extensible automation client for Huntress CTF 2026"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Analysis helpers for the AI while it studies an artifact. Solvers import them lazily,
+# so the core client and the timed path never depend on them. Android work uses jadx
+# (tools/jadx) instead of androguard, which pulls in about 35 more packages.
+analysis = ["pefile", "pyelftools"]
+
 [project.scripts]
 huntress-ctf = "huntress_ctf.cli:main"
 

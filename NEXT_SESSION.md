@@ -20,7 +20,33 @@ Användaren har valt att köra roboten på sin egen Windows-dator med en parad G
 - `scripts/huntress.ps1` startar roboten med tillgänglig Python och projektets källkod.
 - Anslutnings- och parningsinstruktioner finns i `CONNECT.md`. Översikt och begränsningar finns i `README.md`.
 
-Senaste testkörningen: **60 tester passerade** med den tillgängliga Python 3.12-miljön. PowerShell-startaren och hjälpen för `doctor` kontrollerades också. Testerna använde syntetiska data och mockade API-svar.
+### Hastighet (18 oktober 2026)
+
+dot_com löstes på 8,091 s, medan snabbaste lag klarade 0,482 s. Orsakerna var att roboten saknade Morse-/flerlagerslösare, att den gjorde 4–6 anrop efter start och att varje anrop öppnade en ny TCP+TLS-anslutning. Åtgärder:
+
+- `client.py` återanvänder en keep-alive-anslutning. Uppmätt mot den riktiga värden: ≈ 20 ms per anrop i stället för ≈ 88 ms. `submit_many` skickar alla svar i en POST.
+- `solve --timed` (`fastpath.py`): list och status körs före start. Medan klockan går körs bara start → artifact → lösning → en submit. Utskrift, sparning och tidstabell kommer efteråt.
+- `decoders.py` och `LayeredDecodeSolver`: Morse, binär, hex, decimal, Base32, Base64 och ROT13/ROT47 i valfri ordning, tills texten uttryckligen anger svaret. dot_com-artefakten löses på ≈ 3 ms.
+- `bench` är läs-only och jämför ny anslutning med keep-alive.
+
+### Arbetssätt: en AI, kod per lane
+
+- En AI bygger och analyserar. Specialiseringen ligger i kod (`src/huntress_ctf/solvers/<lane>.py`) och i playbooks, inte i separata modeller. Läs `CLAUDE.md` för det dagliga flödet: lös en gång, kodifiera, verifiera otidsatt, kör tidsatt.
+- Subagenter finns bara för tunga lanes: `.claude/agents/ctf-binary.md` och `ctf-android.md` (Opus). Lätta lanes körs i huvudsessionen.
+- `artifact_summary` visar filtyp och lane-tips samt UTF-16LE-strängar.
+- `.venv` innehåller pefile och pyelftools (`.[analysis]`). jadx 1.5.6 ligger i `tools\jadx` med verifierad SHA-256. androguard valdes bort (≈ 35 extra paket).
+
+### Effektivisering (18 oktober 2026, senare)
+
+- **Buggfix:** `solve --timed` efter en slutförd otidsatt lösning använder nu `retry` med `run_for_time`, eftersom `start` bara återansluter. Den startar aldrig när poängsättning väntar, när ett otidsatt försök är aktivt eller när inga nya tidsatta varianter finns kvar.
+- **Bevisade lösare (`.huntress/hints.json`):** sparas efter CORRECT. Ett tidsatt lopp kör dem först, och lösningen tar 0,22 ms i stället för 1,1 ms. `daily --timed` tävlar bara med bevisade.
+- **På klockan:** uppvärmning före start och GC pausad under loppet. Mot lokal låtsasserver: 1,1 ms från start-svar till submit-svar.
+- **Ny förmåga:** uppackning i minnet (ZIP/ZipCrypto med `infected`, gzip, tar), metadata (EXIF/GPS, PNG, PDF, Office), IOC:er och avkodning av PowerShell-, Base64- och char-blobbar, samt `FactSolver` för frågor av typen "vad är författaren/URL:en/IP:n?".
+- **AI-flöde:** `daily` kör allt i ett svep. Olösta uppgifter får `work/<id>/triage.md`. `triage <fil>` fungerar offline. Lösare registreras automatiskt, så det räcker med en ny fil i `solvers/`.
+- `.claude/settings.json` släpper igenom tester och läs-only-kommandon utan fråga.
+- **Väntar på användaren:** `.env` med token (instruktion i `.env.example`). Därefter körs `bench` och `doctor` live och schemat läses för att se om en rundresa kan sparas.
+
+Senaste testkörningen: **118 tester passerade** med Python 3.12, både systemets Python och `.venv`. Testerna använder syntetiska data, mockade API-svar och en lokal HTTP-server för keep-alive-testerna.
 
 ## Nästa steg
 
@@ -35,6 +61,8 @@ Senaste testkörningen: **60 tester passerade** med den tillgängliga Python 3.1
 4. Läs den nya rapporten och de verkliga API-svaren under `integration-data/capture-.../`. Anpassa klienten till eventuella skillnader i API-strukturen.
 5. Hämta status för verkliga tillgängliga utmanings-ID:n i de tre lägena med upprepade `--challenge ID`, utan att starta nya försök för att skapa exempel.
 6. Bygg därefter fler uppgiftsspecifika lösare utifrån verkliga tilldelade filer och fullständiga offentliga instruktioner.
+7. Kör `bench --count 10` med token. Om autentiserade anrop tar över cirka 150 ms: mät från Homebase-proxyn eller en moln-VM och kör tidsatta lopp därifrån.
+8. Kontrollera att `solve <id>` löser en vanlig variant innan en tidsatt variant läggs på `solve <id> --timed`.
 
 ## Återstår att verifiera
 
