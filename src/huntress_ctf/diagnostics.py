@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
+from statistics import median
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -131,3 +134,51 @@ def run_diagnostics(
     report["ok"] = all(entry["status"] == "passed" for entry in report["checks"])
     save("report.json", report)
     return safe_value(report, secrets), 0 if report["ok"] else 1
+
+
+def _latency(samples: list[float]) -> dict[str, float]:
+    ordered = sorted(samples)
+    return {
+        "min": round(ordered[0], 1), "median": round(median(ordered), 1),
+        "p90": round(ordered[math.ceil(0.9 * len(ordered)) - 1], 1),
+        "max": round(ordered[-1], 1),
+    }
+
+
+def run_bench(
+    client: GameMasterClient, *, count: int = 10, challenge_id: str | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    """Only GET list or status. Never create, retry, or submit an attempt.
+
+    Compares a new TCP+TLS connection per request with one kept-alive connection,
+    which is the per-request cost a timed run pays twice on the clock.
+    """
+    if type(count) is not int or count < 1:
+        raise GameMasterError("count must be a positive integer.")
+    fetch = (lambda: client.status(challenge_id)) if challenge_id else client.list_challenges
+
+    def measure(fresh: bool) -> list[float]:
+        samples = []
+        for _ in range(count):
+            if fresh:
+                client.close()
+            began = clock()
+            fetch()
+            samples.append((clock() - began) * 1000)
+        return samples
+
+    fresh = measure(True)
+    client.close()
+    client.warm()
+    kept = measure(False)
+    client.close()
+    fresh_summary, kept_summary = _latency(fresh), _latency(kept)
+    return {
+        "base_url": client.base_url,
+        "operation": "status" if challenge_id else "list",
+        "count": count,
+        "fresh_connection_ms": fresh_summary,
+        "kept_alive_ms": kept_summary,
+        "saved_per_request_ms": round(fresh_summary["median"] - kept_summary["median"], 1),
+    }

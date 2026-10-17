@@ -74,8 +74,12 @@ class PipelineTests(unittest.TestCase):
         self.output = StringIO()
 
     def run_robot(self, client, **kwargs):
+        root = Path(self.directory.name)
         with redirect_stdout(self.output):
-            return run_autopilot(client, "c", artifact_dir=Path(self.directory.name), **kwargs)
+            return run_autopilot(
+                client, "c", artifact_dir=root, work_dir=root / "work",
+                hints_path=root / "hints.json", **kwargs,
+            )
 
     def test_single_solve_submits_derived_answer(self):
         client = FakeClient()

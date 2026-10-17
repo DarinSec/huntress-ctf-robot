@@ -13,4 +13,7 @@ dist/
 .coverage
 artifacts/
 integration-data/
+tools/
+work/
+.huntress/
 

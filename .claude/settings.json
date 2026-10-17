@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest *)",
+      "Bash(PYTHONPATH=src python -m unittest *)",
+      "Bash(python -m huntress_ctf list *)",
+      "Bash(python -m huntress_ctf status *)",
+      "Bash(python -m huntress_ctf bench *)",
+      "Bash(python -m huntress_ctf doctor *)",
+      "Bash(python -m huntress_ctf triage *)",
+      "Bash(python -m huntress_ctf api-schema *)",
+      "Bash(python -m huntress_ctf --help *)",
+      "PowerShell(python -m unittest *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m unittest *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf list *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf status *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf bench *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf doctor *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf triage *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf api-schema *)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m huntress_ctf --help *)",
+      "PowerShell(.\\scripts\\huntress.ps1 list *)",
+      "PowerShell(.\\scripts\\huntress.ps1 status *)",
+      "PowerShell(.\\scripts\\huntress.ps1 bench *)",
+      "PowerShell(.\\scripts\\huntress.ps1 doctor *)",
+      "PowerShell(.\\scripts\\huntress.ps1 triage *)",
+      "PowerShell(.\\scripts\\huntress.ps1 api-schema *)",
+      "PowerShell(.\\scripts\\huntress.ps1 --help *)"
+    ]
+  }
+}

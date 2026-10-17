@@ -1,61 +1,15 @@
-"""Small deterministic strategies; only explicit assignment instructions select them."""
+"""Warmups lane: encoding strategies; explicit instructions or stated answers select them."""
 
 from __future__ import annotations
 
 import base64
 import binascii
 import codecs
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import re
-from typing import Any, Protocol
 
-from .state import current_fields
-
-MAX_TEXT_BYTES = 1024 * 1024
-
-
-@dataclass(frozen=True)
-class SolveContext:
-    challenge_id: str
-    challenge: dict[str, Any]
-    attempt: dict[str, Any]
-    artifact: bytes
-    artifact_path: Path
-    answer_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class AnswerCandidate:
-    answer_id: str
-    answer: str
-    solver: str
-    evidence: str
-
-
-class Solver(Protocol):
-    name: str
-
-    def solve(self, context: SolveContext) -> list[AnswerCandidate]: ...
-
-
-def instruction_text(context: SolveContext) -> str:
-    """Do not treat status, filenames, hashes, artifact text, or examples as clues."""
-    fields = ("description", "instructions", "prompt", "question", "text")
-    parts: list[str] = []
-    for source in (context.challenge, current_fields(context.attempt)):
-        parts.extend(source[key] for key in fields if isinstance(source.get(key), str))
-        questions = source.get("questions")
-        if isinstance(questions, list):
-            for question in questions:
-                if isinstance(question, dict):
-                    parts.extend(
-                        question[key] for key in fields
-                        if isinstance(question.get(key), str)
-                    )
-    return "\n".join(parts)
-
+from ..decoders import apply_chain, as_text, extract_answer, peel
+from .base import MAX_TEXT_BYTES, AnswerCandidate, SolveContext, instruction_text
 
 _ENCODINGS = {
     "base64": re.compile(r"\bbase[\s-]*64\b", re.I),
@@ -81,11 +35,21 @@ def encoding_clue(context: SolveContext) -> str | None:
 
 
 def answer_text(value: bytes) -> str | None:
+    """Decoded text, or only the answer it explicitly states.
+
+    Returns None when the text is a further encoding layer that states an answer:
+    the layered solver submits that answer, and a disagreeing candidate would block it.
+    """
     try:
         text = value.decode("utf-8").strip("\r\n")
     except UnicodeDecodeError:
         return None
     if not text or any(not char.isprintable() and char not in "\t\r\n" for char in text):
+        return None
+    stated = extract_answer(text)
+    if stated is not None:
+        return stated
+    if len(value) <= MAX_TEXT_BYTES and peel(value):
         return None
     return text
 
@@ -192,6 +156,50 @@ class JsonAnswerMapSolver:
         return candidates
 
 
-SOLVERS: tuple[Solver, ...] = (
-    Base64AnswerSolver(), CluedTextDecoderSolver(), JsonAnswerMapSolver(),
+class LayeredDecodeSolver:
+    """Peel stacked encodings (e.g. Morse -> hex -> text) until the text states its answer.
+
+    The artifact is only data here: its decoded text yields one candidate for the single
+    issued answer ID, and nothing else in it is followed.
+    """
+
+    name = "layered-decode"
+
+    def solve(self, context: SolveContext) -> list[AnswerCandidate]:
+        if len(context.answer_ids) != 1:
+            return []
+        sources = [("artifact", context.artifact)] + [
+            (member.name, member.data) for member in context.members
+        ]
+        sources = [(name, data) for name, data in sources if len(data) <= MAX_TEXT_BYTES]
+        proven = tuple((context.hint or {}).get("chain") or ())
+        if proven:
+            # A chain that already scored on this challenge: replay it, skip the search.
+            for name, data in sources:
+                replayed = apply_chain(data, proven)
+                if replayed is not None:
+                    return [self._candidate(context, name, proven, replayed[1])]
+        found = []
+        for name, data in sources:
+            found.extend((name, chain, answer) for chain, _, answer in peel(data))
+            text = as_text(data) if name != "artifact" else None
+            stated = extract_answer(text) if text is not None else None
+            if stated is not None and "{" in stated:
+                # Unpacking the archive was the layer; only a flag-shaped value counts.
+                found.append((name, ("unpack",), stated))
+        if len({answer for _, _, answer in found}) != 1:
+            return []
+        name, chain, answer = found[0]
+        return [self._candidate(context, name, chain, answer)]
+
+    def _candidate(self, context, source, chain, answer) -> AnswerCandidate:
+        return AnswerCandidate(
+            context.answer_ids[0], answer, self.name,
+            f"Decoded {source}: {' -> '.join(chain)} to text that explicitly states the answer.",
+            tuple(chain),
+        )
+
+
+SOLVERS = (
+    LayeredDecodeSolver(), Base64AnswerSolver(), CluedTextDecoderSolver(), JsonAnswerMapSolver(),
 )

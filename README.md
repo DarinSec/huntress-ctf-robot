@@ -2,7 +2,7 @@
 
 A Python client and autonomous solver pipeline for Huntress CTF 2026. It can fetch an assignment, analyze its assigned artifact, submit supported answers, and interpret the Game Master's result. The client has no third-party runtime dependencies.
 
-The current solver library supports explicit Base64, ROT13, hexadecimal, and 8-bit binary decoding tasks, plus assignments explicitly requesting a JSON answer map. It does **not yet solve arbitrary CTF challenges**, investigate live targets, or run the whole contest unattended.
+The current solver library supports explicit Base64, ROT13, hexadecimal, and 8-bit binary decoding tasks, assignments explicitly requesting a JSON answer map, and stacked encodings (Morse, binary, hex, decimal, Base32, Base64, ROT13/ROT47 in any order, e.g. Morse → hex → text) whose decoded text explicitly states the answer. It does **not yet solve arbitrary CTF challenges**, investigate live targets, or run the whole contest unattended.
 
 ## Requirements
 
@@ -23,6 +23,8 @@ python -m venv .venv
 ```
 
 Activation is optional. Examples below use the virtual environment's Python directly. The installed `huntress-ctf` command provides the same interface.
+
+For artifact analysis, `pip install -e ".[analysis]"` adds pefile and pyelftools. Android work uses jadx unpacked into the ignored `tools/jadx/` directory (requires Java 11+).
 
 ## Configure live access
 
@@ -70,9 +72,21 @@ Replace the example IDs and answer with values from the current assignment.
 .\.venv\Scripts\python.exe -m huntress_ctf retry CHALLENGE_ID
 .\.venv\Scripts\python.exe -m huntress_ctf api-schema
 .\.venv\Scripts\python.exe -m huntress_ctf doctor --output integration-data
+.\.venv\Scripts\python.exe -m huntress_ctf bench --count 10
+.\.venv\Scripts\python.exe -m huntress_ctf daily --day 1
+.\.venv\Scripts\python.exe -m huntress_ctf daily --timed
+.\.venv\Scripts\python.exe -m huntress_ctf triage artifacts\sample.bin
 ```
 
+- `daily` solves every listed challenge untimed (only routes where an ordinary start cannot begin a timer) and prints a summary. `daily --timed` races only challenges whose solver already scored CORRECT (`.huntress/hints.json`).
+- `triage` is offline: a one-page report (kind, unpacked members, metadata, IOCs, decoded blobs, stated answers) for any local file.
+- Unsolved runs write `work/<id>/` with the redacted assignment, the artifact, unpacked members (`.bin` suffix), and `triage.md`.
+- `solve --capture` / `daily --capture` save redacted live responses under `integration-data/` after the run.
+- The token can live in a git-ignored `.env` (`HUNTRESS_GM_TOKEN=...`, see `.env.example`); real environment variables win.
+
 - `solve` is the autonomous entry point. It lists and selects the challenge, starts or reconnects, displays the public assignment, downloads the artifact, tries registered solvers, and submits supported answers.
+- `solve --timed` is the fast path for a requested timed run. List, status, route choice, solver warm-up, and connection setup happen before start; only start → artifact → solve → one submission (all answers in one POST) run on the server clock, with garbage collection paused. A proven solver runs first and the rest are skipped when it answers everything. After a completed or expired attempt the race uses `retry` with `run_for_time` (`start` only reconnects); it refuses to start while scoring is pending, while a regular untimed attempt is active, or when no fresh timed variant remains. The full assignment, artifact SHA-256, evidence, final status, and a millisecond timing table are printed after the submission response.
+- `bench` is read-only: it times `list` (or `--challenge ID` status) with a new connection per request vs one kept-alive connection. Use it to compare machines or networks before a timed run.
 - `start` is a lower-level command that prints the assignment without solving it.
 - `retry` is an explicit request for another variant. Use it after expiry or confirmed completion when another run is intended. The solver never retries automatically.
 - `submit` sends one answer under its exact issued ID. Use `solve` for automatic assignment and artifact checks.
@@ -98,9 +112,9 @@ The Game Master can confirm completion; CourseStack is the official points ledge
 - The JSON map strategy requires explicit instructions to use an answer map. Merely finding matching keys in an arbitrary file is insufficient.
 - All candidates are collected before submission. Conflicting values for the same ID are skipped.
 - The pipeline compares attempt IDs, artifact SHA-256, deadlines, modes, and answer IDs when the service supplies them. Known identity fields remain remembered when a later response omits them.
-- Before every submission, status is checked again. If the current status omits an artifact hash, the assigned bytes are downloaded again and compared.
+- Before every untimed submission, status is checked again. If the current status omits an artifact hash, the assigned bytes are downloaded again and compared. A timed run skips these extra round trips: it compares the download with the start response's SHA-256 and submits within milliseconds of start.
 - These checks cannot eliminate the interval between checking and submitting when another teammate changes the attempt. The documented submit operation has no atomic attempt-ID condition.
-- Transport failures never automatically repeat a POST: it may already have reached the server.
+- Requests share one kept-alive HTTP(S) connection. Transport failures never automatically repeat a POST: it may already have reached the server. A GET that fails on a stale kept-alive connection is repeated once on a new connection, and a POST after more than 5 idle seconds opens a fresh connection first.
 - Current response parsing supports explicit top-level fields and `attempt` / `current_attempt` wrappers. `answer_ids` must be an array of strings. History and examples do not define current attempt state. Unsupported or contradictory responses stop processing.
 - Routes without issued answer IDs, including native CourseStack tasks, need additional integration.
 
@@ -149,14 +163,21 @@ Coverage includes the three modes, partial and pending results, malformed respon
 
 ## Code layout
 
-- `client.py`: HTTP transport and documented Game Master operations.
+- `client.py`: kept-alive HTTP transport and documented Game Master operations.
 - `state.py`: current attempt parsing and identity checks.
-- `autopilot.py`: orchestration for one attempt.
-- `solvers.py`: supported deterministic strategies.
+- `autopilot.py`: orchestration for one untimed attempt.
+- `fastpath.py`: timed attempts with only start, download, solve, and one submission on the clock.
+- `solvers/`: deterministic strategies, one module per lane (`encoding.py`, `facts.py`), auto-discovered by `solvers/__init__.py`.
+- `decoders.py`: strict layer decoders, chain replay, and answer-statement extraction.
+- `containers.py`: in-memory ZIP (incl. ZipCrypto), gzip, and tar unpacking with limits.
+- `evidence.py`: metadata, IOC, and script-blob extraction (stdlib only).
+- `hints.py`: proven solvers per challenge; `daily.py`: batch runs; `workspace.py`: triage reports and work folders; `config.py`: `.env` loading; `capture.py`: redacted response captures.
+
+How the AI works in this repo (daily loop, lane routing, solver rules) is in [CLAUDE.md](CLAUDE.md). Heavy lanes have subagents in `.claude/agents/` (`ctf-binary`, `ctf-android`).
 - `artifacts.py`: file preservation and bounded previews.
 - `display.py`: output redaction and escaping.
 - `cli.py`: commands, configuration, and exit codes.
-- `diagnostics.py`: read-only endpoint checks and redacted response capture.
+- `diagnostics.py`: read-only endpoint checks, redacted response capture, and latency bench.
 
 Use `doctor` to obtain the real OpenAPI schema and response samples for available modes. The next integration step is to inspect those captures, adapt unsupported response shapes, and then add challenge-specific strategies using actual assigned artifacts.
 
