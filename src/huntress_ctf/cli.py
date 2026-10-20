@@ -10,14 +10,15 @@ import sys
 import warnings
 
 from .artifacts import save_artifact
-from .autopilot import COMPLETE, EXPIRED, INCORRECT, PENDING, UNRESOLVED, run_autopilot
-from .client import DEFAULT_BASE_URL, GameMasterClient, GameMasterError
+from .autopilot import COMPLETE, EXPIRED, INCORRECT, PENDING, UNRESOLVED
+from .client import DEFAULT_BASE_URL, PROXY_BASE_URL, GameMasterClient, GameMasterError
 from .config import load_env
 from .containers import DEFAULT_PASSWORDS, unwrap
 from .daily import run_daily
 from .display import print_result, safe_value
-from .diagnostics import run_bench, run_diagnostics
-from .fastpath import run_timed_fast
+from .diagnostics import compare_routes, probe_pipelining, run_bench, run_diagnostics
+from .fastpath import run_fast, solver_timings
+from .learn import run_learn
 from .state import AttemptState
 from .workspace import render_triage
 
@@ -78,14 +79,22 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--timed", action="store_true", help=timed_help)
         if name == "solve":
             command.add_argument("--capture", action="store_true", help=f"Save redacted responses under {CAPTURE_DIR} after the run")
+            command.add_argument("--no-pipeline", action="store_true", help=NO_PIPELINE_HELP)
+            _race_options(command)
+    learn = commands.add_parser("learn", help="Spend one variant: submit the robot's answers per question kind and show which kinds are accepted")
+    learn.add_argument("challenge_id")
     daily = commands.add_parser("daily", help="Solve every available challenge untimed, or race the proven ones")
     daily.add_argument("--day", type=_day)
     daily.add_argument("--lane")
     daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
     daily.add_argument("--capture", action="store_true", help=f"Save redacted responses under {CAPTURE_DIR}")
+    daily.add_argument("--no-pipeline", action="store_true", help=NO_PIPELINE_HELP)
+    _race_options(daily)
     triage = commands.add_parser("triage", help="Print a one-page triage report for a local file (offline)")
     triage.add_argument("path", type=Path)
     triage.add_argument("--password", action="append", default=[], help="Archive password to try (repeatable)")
+    triage.add_argument("--time", action="store_true", help="Instead, time unpacking and every solver on the file (median ms, cold caches)")
+    triage.add_argument("--question", default="", help="With --time: the question text the solvers see")
     status = commands.add_parser("status", help="Read current attempt status")
     status.add_argument("challenge_id")
     artifact = commands.add_parser("artifact", help="Save the current assigned artifact with SHA-256")
@@ -102,8 +111,51 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--output", type=Path, help="Save redacted responses in a new capture directory under this path")
     bench = commands.add_parser("bench", help="Measure request latency with new vs kept-alive connections (read-only)")
     bench.add_argument("--count", type=_count, default=10, help="Requests per connection mode (1-100)")
-    bench.add_argument("--challenge", metavar="ID", help="Time this challenge's status instead of the list")
+    # Required: the list is no benchmark, the server takes ~80 s to list every day.
+    bench.add_argument("--challenge", metavar="ID", required=True, help="Time this challenge's status and artifact download (e.g. warmups-day-01)")
+    bench.add_argument("--compare", action="store_true", help="Also bench the other route (direct HTTPS or Homebase proxy) and recommend the faster")
+    bench.add_argument("--pipeline", action="store_true", help="Probe pipelining with two read-only GETs; timed runs use it only where this passed")
     return parser
+
+
+NO_PIPELINE_HELP = "Send start and artifact one at a time even where `bench --pipeline` passed"
+
+
+def _race_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--repeat", type=_count, default=1, help="With --timed: race this many fresh variants; Hall of Fame keeps the best (1-100)")
+    command.add_argument("--gate-ms", type=_positive_timeout, help="With --timed: start only once status answers within this many ms (median of 3)")
+    command.add_argument("--gate-wait", type=_positive_timeout, default=600, help="Seconds to wait for the gate before skipping without spending a variant")
+ROUTE_NAMES = {DEFAULT_BASE_URL: "direct", PROXY_BASE_URL: "homebase-proxy"}
+
+
+def _bench(client: GameMasterClient, args: argparse.Namespace, token: str | None) -> dict:
+    """Read-only: the configured route, and with --compare the other documented one."""
+    def measure(target: GameMasterClient):
+        def bench() -> dict:
+            report = run_bench(target, count=args.count, challenge_id=args.challenge)
+            if args.pipeline:
+                report["pipeline_probe"] = probe_pipelining(target, challenge_id=args.challenge)
+            return report
+        return bench
+
+    if not args.compare:
+        return measure(client)()
+    others = [
+        # The bearer goes only to HTTPS; the proxy supplies identity itself.
+        GameMasterClient(
+            base_url=url, timeout=min(args.timeout, 3),
+            token=token if url.startswith("https://") else None,
+        )
+        for url in (DEFAULT_BASE_URL, PROXY_BASE_URL) if url != client.base_url
+    ]
+    try:
+        return compare_routes([
+            (ROUTE_NAMES.get(target.base_url, "configured"), measure(target))
+            for target in (client, *others)
+        ])
+    finally:
+        for target in others:
+            target.close()
 
 
 def _prompt_token() -> str:
@@ -130,9 +182,13 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        if args.time:
+            print_result(solver_timings(data, args.question, tuple(args.password)))
+            return COMPLETE
         unwrapped = unwrap(data, tuple(dict.fromkeys([*args.password, *DEFAULT_PASSWORDS])))
         print(render_triage(data, unwrapped.members, unwrapped.notes, title=args.path.name), end="")
         return COMPLETE
+    token = None
     try:
         load_env()
         if args.prompt_token:
@@ -152,16 +208,31 @@ def main(argv: list[str] | None = None) -> int:
             result = client.status(args.challenge_id)
         elif args.command == "solve":
             capture = CAPTURE_DIR if args.capture else None
-            if args.timed:
-                return run_timed_fast(client, args.challenge_id, capture_dir=capture)
-            return run_autopilot(client, args.challenge_id, capture_dir=capture)
+            on_clock = []
+            for _ in range(args.repeat if args.timed else 1):
+                report: dict = {}
+                code = run_fast(
+                    client, args.challenge_id, timed=args.timed, capture_dir=capture,
+                    pipeline=not args.no_pipeline, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
+                    report=report,
+                )
+                on_clock.append((report.get("server_clock_ms") or {}).get("from"))
+                if code != COMPLETE:
+                    break
+            if args.timed and args.repeat > 1:
+                measured = [ms for ms in on_clock if ms is not None]
+                print_result({"on_clock_ms": on_clock, "best_on_clock_ms": min(measured) if measured else None})
+            return code
+        elif args.command == "learn":
+            return run_learn(client, args.challenge_id)
         elif args.command == "daily":
             return run_daily(
                 client, day=args.day, lane=args.lane, timed=args.timed,
-                capture_dir=CAPTURE_DIR if args.capture else None,
+                capture_dir=CAPTURE_DIR if args.capture else None, pipeline=not args.no_pipeline,
+                repeat=args.repeat, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
             )
         elif args.command == "bench":
-            print_result(run_bench(client, count=args.count, challenge_id=args.challenge), secrets)
+            print_result(_bench(client, args, token), secrets)
             return COMPLETE
         elif args.command == "doctor":
             report, code = run_diagnostics(

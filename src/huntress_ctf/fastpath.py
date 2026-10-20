@@ -1,14 +1,18 @@
-"""Timed attempts: only start, download, solve, and one submission run on the server clock.
+"""The one solve engine: start, download, solve, and one submission, then the report.
 
-The server clock starts when the timed attempt is created and stops when a correct
-answer arrives. Everything that does not depend on the new attempt (listing, status,
-route choice, solver warm-up, connection setup) happens before the clock; all output,
-file writes, and the final status check happen after the submission response.
+The server clock of a timed attempt starts when the attempt is created and stops when a
+correct answer arrives. Everything that does not depend on the new attempt (listing,
+status, route choice, solver warm-up, connection setup) happens before the clock; all
+output, file writes, and the final status check happen after the submission response.
+Untimed solves run the same path, so `solve <id>` verifies exactly the code that races,
+and an ordinary start on an older timed-by-default route is just as fast.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 import gc
 import hashlib
 import json
@@ -18,16 +22,18 @@ from typing import Any, Callable
 
 from .artifacts import artifact_path, artifact_summary, save_artifact
 from .autopilot import (
-    COMPLETE, CONFLICT, INCORRECT, PENDING, UNRESOLVED, build_context, find_challenge,
+    COMPLETE, CONFLICT, INCORRECT, PENDING, UNRESOLVED, build_context, lookup_challenge,
     select_candidates, terminal_result,
 )
 from .capture import save_capture
 from .client import GameMasterClient, GameMasterError
-from .containers import Member
+from .containers import Member, passwords_from, prepare_tools, unwrap
+from .decoders import clear_cache
 from .display import print_result
 from .hints import get_hint, record_hint
+from . import network
 from .solvers import LOAD_ERRORS, SOLVERS, AnswerCandidate, Solver, SolveContext
-from .state import AttemptState, current_fields, mode_name, remember_identity
+from .state import AttemptState, current_fields, deliveries, mode_name, remember_identity
 from .workspace import write_workspace
 
 KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
@@ -35,8 +41,25 @@ REMAINING_FIELDS = ("ranked_attempts_remaining", "unique_attempts_remaining")
 
 
 @dataclass
-class TimedRun:
+class Run:
+    timed: bool = False
+    # Only routes advertising run_for_time_supported accept the flag; on older timed
+    # routes a plain start or retry is timed already, and the flag would be rejected.
+    run_for_time: bool = False
     route: str = "start"
+    deliveries: tuple[Member, ...] = ()
+    unpacked: Any = None  # The lazy members; their notes are read after the clock.
+    # Wall-clock stamps and the NTP offset place the server's started_at on our timeline.
+    wall: dict[str, float] = field(default_factory=dict)
+    clock_offset: float | None = None
+    # The connection whose download won carries the submit; the slower GET may still run.
+    submitter: Any = None
+    straggler: Future | None = None
+    # Extra kept-alive connections for parallel delivery downloads, warmed before the clock.
+    helpers: list[Any] = field(default_factory=list)
+    # Start and artifact share one write (saves a round trip) where the probe passed.
+    pipelined: bool = False
+    pipeline_failure: str | None = None
     marks: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     attempt: Any = None
@@ -87,8 +110,169 @@ def warm_up(solvers: tuple[Solver, ...]) -> None:
             solver.solve(dummy)
         except Exception:
             pass
+    prepare_tools()
     hashlib.sha256(b"warm-up").hexdigest()
     json.loads(json.dumps({"warm": "up"}))
+
+
+def solver_timings(
+    artifact: bytes, question: str = "", passwords: tuple[str, ...] = (), repeat: int = 5,
+) -> dict[str, Any]:
+    """Offline: what unpacking and each solver cost on the clock for one local file.
+
+    Median milliseconds over `repeat` cold runs (caches cleared, warm-up done first, as
+    before a race), plus the candidates a race would submit for a single answer ID.
+    """
+    warm_up(SOLVERS)
+    challenge = {"instructions": question} if question else {}
+    answer_ids = ("answer",)
+    keys = tuple(dict.fromkeys([*passwords, *passwords_from(question)]))
+    samples: dict[str, list[float]] = {}
+    candidates: list[AnswerCandidate] = []
+
+    def timed(name: str, began: float) -> None:
+        samples.setdefault(name, []).append((time.perf_counter() - began) * 1000)
+
+    for round_ in range(max(1, repeat)):
+        clear_cache()
+        total = time.perf_counter()
+        began = time.perf_counter()
+        members = unwrap(artifact, keys).members
+        timed("unpack", began)
+        context = SolveContext(
+            "local", challenge, {"answer_ids": list(answer_ids)}, artifact, Path("local"),
+            answer_ids, members=members,
+        )
+        for solver in SOLVERS:
+            began = time.perf_counter()
+            found = solver.solve(context)
+            timed(getattr(solver, "name", type(solver).__name__), began)
+            if round_ == 0:
+                candidates.extend(found)
+        timed("total", total)
+    notes: list[str] = []
+    selected, conflict = select_candidates(candidates, answer_ids, notes)
+    return {
+        "bytes": len(artifact),
+        "members": len(members),
+        "median_ms": {name: round(sorted(values)[len(values) // 2], 2) for name, values in samples.items()},
+        "would_submit": [
+            {"solver": candidate.solver, "answer": candidate.answer} for candidate in selected
+        ],
+        "conflict": conflict,
+        "notes": notes,
+    }
+
+
+DELIVERY_CONNECTIONS = 6
+
+
+def _helpers(client: GameMasterClient, count: int) -> list[Any]:
+    """Up to DELIVERY_CONNECTIONS - 1 extra connections; none for clients that cannot clone."""
+    clone = getattr(client, "clone", None)
+    return [clone() for _ in range(min(count, DELIVERY_CONNECTIONS) - 1)] if clone else []
+
+
+def _fetch_deliveries(
+    client: GameMasterClient, challenge_id: str, listed: list[dict[str, Any]], helpers: list[Any],
+) -> tuple[Member, ...]:
+    """Every delivery, SHA-checked, downloaded over several kept-alive connections at once.
+
+    One at a time, 28 deliveries took ~20 s from Sweden against a 30 s Mastery deadline.
+    Each is op=artifact&delivery=<index>; a listed capability link is the fallback.
+    """
+    workers = [client, *(helpers or _helpers(client, len(listed)))]
+    blobs: list[bytes | None] = [None] * len(listed)
+
+    def fetch(worker: Any, share: range) -> None:
+        for index in share:
+            try:
+                blobs[index] = worker.artifact(challenge_id, delivery=listed[index]["index"])
+            except GameMasterError:
+                if not listed[index]["capability"]:
+                    raise
+                blobs[index] = worker.download(listed[index]["capability"])
+
+    shares = [range(start, len(listed), len(workers)) for start in range(len(workers))]
+    if len(workers) == 1:
+        fetch(client, shares[0])
+    else:
+        with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+            for future in [pool.submit(fetch, worker, share) for worker, share in zip(workers, shares)]:
+                future.result()  # Re-raises a failed download.
+    members = []
+    for number, (item, blob) in enumerate(zip(listed, blobs), 1):
+        if item["sha256"] and hashlib.sha256(blob).hexdigest() != item["sha256"]:
+            raise GameMasterError(f"Delivery {number} does not match its listed SHA-256.")
+        members.append(Member(f"delivery {number}: {item['filename']}", blob))
+    return tuple(members)
+
+
+def _hedged_download(
+    workers: list[Any], challenge_id: str, capability: str | None,
+) -> tuple[bytes, Any, Future | None]:
+    """The artifact from whichever warm connection answers first: (bytes, client, straggler).
+
+    The server's answer time swings (0.5 s, then 3.6 s minutes later, 19 Oct 2026), so the
+    same GET goes out on two warm connections and the first answer wins. GET may be
+    repeated; never more than two go out, and a POST is never hedged. The winner's
+    connection is idle again, so it carries the submit.
+    """
+    def fetch(worker: Any) -> bytes:
+        if capability:
+            try:
+                return worker.download(capability)  # ~200 ms faster than op=artifact
+            except GameMasterError:
+                pass
+        return worker.artifact(challenge_id)
+
+    if len(workers) == 1:
+        return fetch(workers[0]), workers[0], None
+    pool = ThreadPoolExecutor(max_workers=len(workers))
+    futures = {pool.submit(fetch, worker): worker for worker in workers}
+    pool.shutdown(wait=False)
+    failure: GameMasterError | None = None
+    for future in as_completed(futures):
+        try:
+            data = future.result()
+        except GameMasterError as exc:
+            failure = exc
+            continue
+        others = [other for other in futures if other is not future and not other.done()]
+        return data, futures[future], others[0] if others else None
+    raise failure or GameMasterError("The artifact download failed.")
+
+
+GATE_SAMPLES = 3
+GATE_PAUSE_SECONDS = 30.0
+
+
+def _gate(
+    client: GameMasterClient, challenge_id: str, gate_ms: float, max_wait: float,
+    clock: Callable[[], float], sleep: Callable[[float], None],
+) -> tuple[bool, float]:
+    """Wait (before the clock) until the server answers status within gate_ms.
+
+    The race time is almost all server answer time, and it swings by seconds within
+    minutes. A variant spent while the server is slow is a wasted Hall of Fame chance.
+    Returns (ready, median ms of the last probe).
+    """
+    waited = 0.0
+    while True:
+        samples = []
+        for _ in range(GATE_SAMPLES):
+            began = clock()
+            client.status(challenge_id)
+            samples.append((clock() - began) * 1000)
+        median = sorted(samples)[len(samples) // 2]
+        if median <= gate_ms:
+            print(f"Gate: status answered in {median:.0f} ms (median of {GATE_SAMPLES}); racing.")
+            return True, median
+        if waited >= max_wait:
+            return False, median
+        print(f"Gate: status answered in {median:.0f} ms, over {gate_ms:.0f} ms; waiting {GATE_PAUSE_SECONDS:.0f} s.")
+        sleep(GATE_PAUSE_SECONDS)
+        waited += GATE_PAUSE_SECONDS
 
 
 def _workable(state: AttemptState) -> bool:
@@ -99,26 +283,56 @@ def _workable(state: AttemptState) -> bool:
 
 def _race(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
-    run: TimedRun, artifact_dir: Path, hint: dict[str, Any] | None,
+    run: Run, artifact_dir: Path, hint: dict[str, Any] | None,
     clock: Callable[[], float],
 ) -> None:
     """The on-clock critical path. No output, no disk, no extra requests."""
-    begin = client.retry if run.route == "retry" else client.start
+    retry = run.route == "retry"
+    early: Any = None
+    run.wall["start sent"] = time.time()
     run.marks["start sent"] = clock()
-    run.attempt = begin(challenge_id, timed=True)
+    if run.pipelined:
+        run.attempt, early = client.start_with_artifact(challenge_id, timed=run.run_for_time, retry=retry)
+    else:
+        run.attempt = (client.retry if retry else client.start)(challenge_id, timed=run.run_for_time)
     run.marks["start received"] = clock()
+    run.wall["start received"] = time.time()
     run.started = AttemptState.parse(run.attempt)
     if not _workable(run.started):
         return
-    run.artifact = client.artifact(challenge_id)
+    listed = deliveries(run.attempt)
+    if len(listed) > 1:
+        # Separate deliveries (Warmups Mastery Days 2-6): each question names one.
+        run.deliveries = _fetch_deliveries(client, challenge_id, listed, run.helpers)
+        run.artifact = run.deliveries[0].data
+    elif run.pipelined:
+        # Use the early bytes only when they provably belong to this new attempt.
+        expected = run.started.artifact_sha256
+        if isinstance(early, GameMasterError):
+            run.pipeline_failure = f"pipelined artifact failed: {early}"
+        elif not isinstance(early, bytes):
+            run.pipeline_failure = "pipelined artifact returned no bytes"
+        elif expected and hashlib.sha256(early).hexdigest() == expected:
+            run.artifact = early
+        elif expected:
+            run.pipeline_failure = "pipelined artifact did not match the new attempt's SHA-256"
+        else:
+            # Unverifiable early bytes mean downloading twice on the clock: worse than no pipelining.
+            run.pipeline_failure = "the start response has no artifact_sha256 to verify pipelined bytes"
+    if run.artifact is None:
+        # The start response's own link skips the challenge lookup (~200 ms faster than
+        # op=artifact from Sweden); timed runs hedge it on a second warm connection.
+        workers = [client, *run.helpers[:1]] if run.timed else [client]
+        capability = listed[0]["capability"] if len(listed) == 1 else None
+        run.artifact, run.submitter, run.straggler = _hedged_download(workers, challenge_id, capability)
     run.marks["artifact received"] = clock()
     digest = hashlib.sha256(run.artifact).hexdigest()
     if run.started.artifact_sha256 and run.started.artifact_sha256 != digest:
         raise GameMasterError("Downloaded bytes do not match the assigned artifact SHA-256.")
     answer_ids = run.started.answer_ids
-    context, run.unpack_notes = build_context(
+    context, run.unpacked = build_context(
         challenge_id, challenge, run.attempt, run.artifact,
-        artifact_path(challenge_id, digest, artifact_dir), answer_ids, hint,
+        artifact_path(challenge_id, digest, artifact_dir), answer_ids, hint, run.deliveries,
     )
     run.members = context.members
     needed = set(answer_ids) - run.started.accepted_ids
@@ -139,34 +353,74 @@ def _race(
     }
     run.marks["solved"] = clock()
     if run.submitted:
-        run.result = client.submit_many(challenge_id, run.submitted)
+        run.wall["submit sent"] = time.time()
+        run.result = (run.submitter or client).submit_many(challenge_id, run.submitted)
         run.marks["submit received"] = clock()
+        run.wall["submit received"] = time.time()
 
 
-def _timings(marks: dict[str, float]) -> dict[str, float]:
+def _timings(run: Run) -> dict[str, Any]:
+    marks = run.marks
     spans = (
+        # Pipelined, the start round trip also carries the artifact download.
         ("start_round_trip", "start sent", "start received"),
         ("artifact_download", "start received", "artifact received"),
         ("solve", "artifact received", "solved"),
         ("submit_round_trip", "solved", "submit received"),
         ("start_response_to_submit_response", "start received", "submit received"),
+        ("start_sent_to_submit_response", "start sent", "submit received"),
     )
-    return {
+    timings: dict[str, Any] = {
         name: round((marks[end] - marks[begin]) * 1000, 1)
         for name, begin, end in spans if begin in marks and end in marks
     }
+    timings["pipelined"] = run.pipelined and run.pipeline_failure is None
+    server_clock = _server_clock(run)
+    if server_clock:
+        timings["server_clock_ms"] = server_clock
+    return timings
+
+
+def _server_clock(run: Run) -> dict[str, float] | None:
+    """Time on the server clock, bounded from started_at (set when the material is ready).
+
+    It stops between our submit leaving and its response arriving, so the range is
+    [started_at -> submit sent, started_at -> submit response], NTP-corrected. The
+    start request's preparation (~2.8 s from Sweden) comes before started_at and is free.
+    """
+    if run.clock_offset is None or "submit received" not in run.wall or run.attempt is None:
+        return None
+    try:
+        started = current_fields(run.attempt).get("started_at")
+        started_at = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError, GameMasterError):
+        return None
+    true = lambda name: run.wall[name] - run.clock_offset
+    clock = {
+        # Most likely the race time: the server almost surely stamps the answer on arrival.
+        "from": round((true("submit sent") - started_at) * 1000),
+        "to": round((true("submit received") - started_at) * 1000),
+    }
+    if "start received" in run.wall:
+        # started_at -> start response here: how far this machine sits from the server.
+        clock["start_tail"] = round((true("start received") - started_at) * 1000)
+    return clock
 
 
 def _report(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
-    before: Any, run: TimedRun, hint: dict[str, Any] | None, artifact_dir: Path,
+    before: Any, run: Run, hint: dict[str, Any] | None, artifact_dir: Path,
     work_dir: Path, responses: dict[str, Any], secrets: tuple[str, ...],
 ) -> None:
     print("Challenge:")
     print_result(challenge, secrets)
-    print("Status before start:")
-    print_result(before, secrets)
-    print(f"Route: {run.route}" + (" (new timed variant after the previous attempt ended)" if run.route == "retry" else ""))
+    if before is not None:
+        print("Status before start:")
+        print_result(before, secrets)
+    if not run.timed:
+        print("Route: start (untimed request; reconnects to the current attempt)")
+    else:
+        print(f"Route: {run.route}" + (" (new timed variant after the previous attempt ended)" if run.route == "retry" else ""))
     if hint:
         print(f"Proven solver: {json.dumps(hint.get('solvers'))}, chain {json.dumps(hint.get('chain'))}")
     for error in LOAD_ERRORS:
@@ -194,6 +448,8 @@ def _report(
             print(line)
         for note in run.unpack_notes:
             print(f"Unpack: {note}")
+        if run.deliveries:
+            print(f"Downloaded {len(run.deliveries)} separate deliveries.")
         if run.members:
             print(f"Unpacked {len(run.members)} member(s) in memory.")
     for note in run.notes:
@@ -224,13 +480,13 @@ def _report(
             print_result(current, secrets)
         except GameMasterError as exc:
             print(f"Status after the run is unavailable: {exc}")
-    print_result({"timings_ms": _timings(run.marks)})
+    print_result({"timings_ms": _timings(run)})
 
 
-def _outcome(run: TimedRun, challenge_id: str, hints_path: Path | None) -> int:
+def _outcome(run: Run, challenge_id: str, hints_path: Path | None) -> int:
     started = run.started
     if started is None:
-        raise GameMasterError("The timed start did not complete.")
+        raise GameMasterError("The start did not complete.")
     terminal = terminal_result(started)
     if terminal is not None:
         return terminal
@@ -239,7 +495,10 @@ def _outcome(run: TimedRun, challenge_id: str, hints_path: Path | None) -> int:
         print("No answer_ids were issued by start. This route needs additional instructions or a CourseStack submission.")
         return UNRESOLVED
     if run.result is None:
-        print("No unambiguous supported solution. The current attempt is preserved; its clock keeps running.")
+        print(
+            "No unambiguous supported solution. The current attempt is preserved"
+            + ("; its clock keeps running." if started.deadline else ".")
+        )
         return CONFLICT if run.conflict else UNRESOLVED
     result = run.result
     if not isinstance(result, dict) or not isinstance(result.get("result"), str):
@@ -274,30 +533,66 @@ def _outcome(run: TimedRun, challenge_id: str, hints_path: Path | None) -> int:
     return CONFLICT if run.conflict else UNRESOLVED
 
 
-def run_timed_fast(
-    client: GameMasterClient, challenge_id: str, *,
+def run_fast(
+    client: GameMasterClient, challenge_id: str, *, timed: bool = False,
+    challenge: dict[str, Any] | None = None,
     artifact_dir: Path = Path("artifacts"), work_dir: Path = Path("work"),
     hints_path: Path | None = None, capture_dir: Path | None = None,
-    clock: Callable[[], float] = time.perf_counter,
+    clock: Callable[[], float] = time.perf_counter, pipeline: bool = True,
+    ntp: Callable[[], float | None] = network.clock_offset,
+    gate_ms: float | None = None, gate_wait: float = 600.0,
+    sleep: Callable[[float], None] = time.sleep, report: dict[str, Any] | None = None,
 ) -> int:
+    """Solve one challenge. `challenge` is its record from a list the caller already has.
+
+    Untimed: an ordinary start (which only reconnects; never an automatic retry).
+    Timed: status first, then start or retry with run_for_time, as `plan_route` decides.
+    `pipeline=False` keeps one request at a time even where the probe passed.
+    `gate_ms` (timed) waits up to `gate_wait` s for the server to answer status that fast
+    before spending a variant. `report`, when given, receives the run's timings.
+    """
     secrets = (client.token,) if client.token else ()
     responses: dict[str, Any] = {}
-    # Before the clock. These requests also leave the connection warm for start.
-    responses["list"] = listing = client.list_challenges()
-    challenge = find_challenge(listing, challenge_id)
-    try:
-        responses["before"] = before = client.status(challenge_id)
-    except GameMasterError as exc:
-        before = {"unavailable": str(exc)}
-    run = TimedRun()
-    run.route, reason = plan_route(before, challenge)
-    if run.route in ("pending", "stop"):
-        print("Challenge:")
-        print_result(challenge, secrets)
-        print("Status before start:")
-        print_result(before, secrets)
-        print(f"No timed run was started: {reason}")
-        return PENDING if run.route == "pending" else UNRESOLVED
+    if challenge is None:
+        challenge, responses["list"] = lookup_challenge(client, challenge_id)
+    network_path = network.default_path(hints_path)
+    base_url = getattr(client, "base_url", None)
+    run = Run(
+        timed=timed, run_for_time=timed and challenge.get("run_for_time_supported") is True,
+        pipelined=pipeline and network.pipelining_ok(base_url, network_path),
+    )
+    before = None
+    if timed:
+        # Before the clock. This request also leaves the connection warm for start.
+        try:
+            responses["before"] = before = client.status(challenge_id)
+        except GameMasterError as exc:
+            before = {"unavailable": str(exc)}
+        run.route, reason = plan_route(before, challenge)
+        if run.route in ("pending", "stop"):
+            print("Challenge:")
+            print_result(challenge, secrets)
+            print("Status before start:")
+            print_result(before, secrets)
+            print(f"No timed run was started: {reason}")
+            return PENDING if run.route == "pending" else UNRESOLVED
+        if gate_ms is not None:
+            ready, latency = _gate(client, challenge_id, gate_ms, gate_wait, clock, sleep)
+            if not ready:
+                print(
+                    f"No timed run was started: the server answered status in {latency:.0f} ms, "
+                    f"over the {gate_ms:.0f} ms gate, for {gate_wait:.0f} s. No variant was spent."
+                )
+                return UNRESOLVED
+        # Extra warm connections: one hedges the download; more fetch separate deliveries
+        # (the previous attempt shows how many).
+        for helper in _helpers(client, max(len(deliveries(before)), 2)):
+            try:
+                helper.warm()
+                run.helpers.append(helper)
+            except GameMasterError:
+                helper.close()
+        run.clock_offset = ntp()
     hint = get_hint(challenge_id, hints_path)
     warm_up(SOLVERS)
     collecting = gc.isenabled()
@@ -307,9 +602,28 @@ def run_timed_fast(
     finally:
         if collecting:
             gc.enable()
+        if run.straggler is not None:
+            # The losing GET may still hold a connection the report needs; let it finish.
+            try:
+                run.straggler.result(timeout=getattr(client, "timeout", 30))
+            except Exception:
+                pass
+        for helper in run.helpers:
+            helper.close()
+        if run.unpacked is not None:
+            run.unpack_notes = run.unpacked.notes  # Unpacks now, off the clock, if no solver did.
         responses["attempt"], responses["result"] = run.attempt, run.result
         _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets)
+        if report is not None:
+            report.update(_timings(run))
+        if run.pipeline_failure and base_url:
+            # The probe passed but a real run did not: stop pipelining on this route.
+            print(f"Pipelining turned off for {base_url}: {run.pipeline_failure}. Re-run `bench --pipeline` to re-check.")
+            note = network.record(base_url, network_path, pipelining=False, reason=run.pipeline_failure)
+            if note:
+                print(note)
         if capture_dir is not None:
             responses = {key: value for key, value in responses.items() if value is not None}
-            print(f"Capture: {json.dumps(str(save_capture(capture_dir, 'timed', responses, secrets)))}")
+            label = "timed" if timed else "solve"
+            print(f"Capture: {json.dumps(str(save_capture(capture_dir, label, responses, secrets)))}")
     return _outcome(run, challenge_id, hints_path)

@@ -62,10 +62,18 @@ def _values(facts, category: str) -> list[str]:
     return list(unique.values())
 
 
+# Lanes with structured questions and their own solvers: "What is its SHA-256 digest?"
+# there means compute it from the named file, not find one written in the text.
+DEDICATED_LANES = {"warmups", "metadata-forensics"}
+
+
 class FactSolver:
     name = "fact-lookup"
 
     def solve(self, context: SolveContext) -> list[AnswerCandidate]:
+        lane = context.challenge.get("lane") or context.challenge_id.split("-day-")[0]
+        if lane in DEDICATED_LANES:
+            return []
         pairs = questions(context)
         if not pairs and len(context.answer_ids) == 1:
             pairs = [(context.answer_ids[0], instruction_text(context))]
@@ -73,7 +81,14 @@ class FactSolver:
         wanted = [(answer_id, category) for answer_id, category in wanted if category]
         if not wanted:
             return []
-        facts = collect(context.artifact, context.members)
+        # Extract only what the questions ask for: each IOC pattern is a pass over the text.
+        kinds = {CATEGORIES[category][2] for _, category in wanted} - {None}
+        facts = collect(
+            context.artifact, context.members, ioc_kinds=kinds,
+            want_metadata=any(CATEGORIES[category][1] for _, category in wanted),
+            # Obfuscated scripts hide IOCs in Base64/char-code blobs; metadata never needs them.
+            want_blobs=bool(kinds),
+        )
         candidates = []
         for answer_id, category in wanted:
             values = _values(facts, category)

@@ -10,7 +10,8 @@ from unittest.mock import patch
 import zipfile
 import zlib
 
-from huntress_ctf.containers import passwords_from, unwrap
+from huntress_ctf import containers
+from huntress_ctf.containers import UnzipTool, passwords_from, unwrap, unzip_tool
 from huntress_ctf.solvers import LayeredDecodeSolver, SolveContext
 from huntress_ctf.workspace import write_workspace
 
@@ -77,6 +78,40 @@ class ContainerTests(unittest.TestCase):
         wrong = unwrap(archive, ("nope",))
         self.assertEqual(wrong.members, ())
         self.assertIn("could not be decrypted", wrong.notes[0])
+
+    @unittest.skipUnless(unzip_tool(), "no bsdtar, 7-Zip, or unzip on this machine")
+    def test_large_encrypted_zip_uses_the_external_tool(self):
+        data = os.urandom(64 * 1024)
+        archive = zipcrypto("sample.bin", data, b"infected")
+        calls = []
+        real = containers._run_bounded
+
+        def spy(command, limit):
+            calls.append(command)
+            return real(command, limit)
+
+        with patch("huntress_ctf.containers._run_bounded", spy):
+            result = unwrap(archive, ("wrong", "infected"))
+        self.assertEqual([(m.name, m.data) for m in result.members], [("sample.bin", data)])
+        self.assertEqual(len(calls), 2)  # the wrong password fails, the published one works
+        self.assertEqual(result.notes, ())
+
+    def test_unverified_tool_output_falls_back_to_the_standard_library(self):
+        archive = zipcrypto("note.txt", b"answer: flag{fallback}", b"infected")
+        wrong_bytes = lambda command, limit: b"x" * limit  # right length, wrong CRC
+        for tool, runner in ((UnzipTool("bsdtar", "tar"), wrong_bytes), (None, None)):
+            with self.subTest(tool=tool), \
+                 patch("huntress_ctf.containers.FAST_UNZIP_MIN_BYTES", 0), \
+                 patch("huntress_ctf.containers.unzip_tool", lambda: tool), \
+                 patch("huntress_ctf.containers._run_bounded", runner):
+                result = unwrap(archive)
+            self.assertEqual([m.data for m in result.members], [b"answer: flag{fallback}"])
+
+    def test_tool_commands_stream_to_stdout(self):
+        for kind, expected in (("bsdtar", "-xOf"), ("7z", "-so"), ("unzip", "-p")):
+            command = UnzipTool(kind, "tool").command("a.zip", "infected")
+            self.assertIn(expected, command)
+            self.assertIn("a.zip", command)
 
     def test_passwords_from_instructions_come_first(self):
         self.assertEqual(passwords_from("The archive password is hunter2."), ("hunter2", "infected"))
