@@ -54,6 +54,16 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   until status answers that fast (skips without spending a variant after `--gate-wait`);
   `--repeat N` races N fresh variants, Hall of Fame keeps the best. `daily` reports
   `on_clock_ms`/`best_on_clock_ms`; `wall_seconds` is the whole command.
+- One robot per machine: `start`, `retry`, `solve`, `learn`, `daily` and `submit` hold
+  `~/.huntress/robot.lock` (`HUNTRESS_LOCK` overrides); a second robot stops with the
+  holder's command, or queues with `--lock-wait SECONDS`. Read-only commands never lock.
+- `daily` untimed runs each challenge family (Single Solve, then Time Trial, then
+  Mastery) in its own thread and connection; the timed routes of an unsolved Single
+  Solve are skipped (HTTP 409). Races stay one at a time, each route once: hints.json
+  keeps `raced_at`, `races` and `best_on_clock_ms`; `--rerace` races again.
+  `--wait-release S` (with `--day`) polls one lane until the day is listed.
+- Web routes return `targets[]` and no file: nothing is downloaded, and `daily` skips
+  them unless asked with `--lane web-exploitation`.
 
 ## Lane status
 

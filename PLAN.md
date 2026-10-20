@@ -65,21 +65,30 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
 1. **En robot per lag, även för hand.** Låset i `day.sh` gäller bara skriptet. Lägg
    låset i Python (`~/.huntress/robot.lock`) runt allt som anropar start, retry och
    submit, så att en körning för hand väntar eller avbryts med ett tydligt besked.
+   **Klart (`lock.py`):** andra roboten stoppas och får veta vem som håller låset,
+   eller väntar med `--lock-wait`; `day.sh` väntar upp till en timme.
 2. **Kör lanes parallellt.** `daily` kör uppgifterna en i taget (`daily.py`, rad 76).
    Kör varje uppgiftsfamilj (Single Solve, Time Trial, Mastery i den ordningen) i en
    egen tråd med egen anslutning. Idag tog den otidsatta delen 37 s; parallellt blir det
    ungefär den längsta kedjan (Binary, cirka 13 s).
+   **Klart:** sex familjer åt gången (`--workers`), utskriften hålls ihop per familj.
 3. **Börja exakt 15:00:00.** `day.sh` sover till 15:02. Fråga i stället `list --day N
    --lane <lane>` (~1 s per anrop) från 15:00:00 tills den nya dagen syns, och starta
    sedan direkt.
+   **Klart:** `day.sh` vaknar 14:59:30; `daily --wait-release` frågar Warmups varje sekund.
 4. **Fortsätt efter första svepet.** Byt markeringen "dagen klar" mot en ny körning var
    15:e minut så länge dagen har olösta uppgifter. Då löser roboten själv Single Solve
    och kör loppet när någon pushar en ny lösare och driftsätter den. Tidsatta lopp får
    bara köras en gång per rutt och dag. Spara bästa tid i `hints.json`, så att varje
    körning inte förbrukar en tidsatt variant (32 för dagens Metadata-rutter, 256 för
    Warmups).
+   **Klart:** cron var 15:e minut; ett nytt svep bara när `~/src` eller `hints.json`
+   ändrats (`~/.huntress/dayNN.swept`). Varje rutt körs tidsatt en gång (`--rerace`
+   kör om); `hints.json` sparar `races` och `best_on_clock_ms`.
 5. **Web: hoppa över filhämtningen** när start-svaret har `targets[]`. Då rapporteras
    rutten som olöst i stället för som fel, och ett meningslöst anrop försvinner.
+   **Klart:** ingen hämtning och ingen pipelining; `daily` startar Web bara med
+   `--lane web-exploitation`, så svepen inte väcker mål i onödan.
 6. **Mach-O i `metadata.py` och `artifacts.py`** (`macho.cpu_type_set`): triage kallade
    filen "unrecognized binary data". Fat-header `0xCAFEBABE`, thin
    `0xFEEDFACE`/`0xFEEDFACF`. Ordning och namnformat för CPU-typerna är okända;

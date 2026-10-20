@@ -242,6 +242,24 @@ class FastPathTests(unittest.TestCase):
         self.assertFalse([call for call in client.calls if call[0] == "submit_many"])
         self.assertIn("clock keeps running", self.output.getvalue())
 
+    def test_web_targets_are_reported_without_a_download(self):
+        client = self.pipelining_client()
+        client.assignment = {
+            "answer_ids": ["flag"], "attempt_id": "w", "state": "active",
+            "targets": [{"name": "shop", "url": "http://10.1.2.3:8080/"}],
+        }
+        record = {"id": "c", "lane": "web-exploitation", "run_for_time_supported": True}
+        root = Path(self.directory.name)
+        with redirect_stdout(self.output):
+            code = run_fast(client, "c", challenge=record, artifact_dir=root, work_dir=root / "work",
+                            hints_path=root / "hints.json", ntp=lambda: None)
+        self.assertEqual(code, UNRESOLVED)
+        # No artifact GET and no pipelined pair, so pipelining stays on for the route.
+        self.assertEqual(client.calls, [("start", False), "status"])
+        self.assertIn('"pipelining": true', self.network_state())
+        self.assertIn("http://10.1.2.3:8080/", self.output.getvalue())
+        self.assertIn("need a Web solver", self.output.getvalue())
+
     def test_conflicting_candidates_are_not_submitted(self):
         class DisagreeingSolver:
             def solve(self, context):

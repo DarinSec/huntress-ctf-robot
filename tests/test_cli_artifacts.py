@@ -9,6 +9,7 @@ import zipfile
 from huntress_ctf.artifacts import artifact_kind, artifact_summary, save_artifact
 from huntress_ctf.cli import main
 from huntress_ctf.client import GameMasterError
+from huntress_ctf.lock import robot_lock
 
 
 class CliTests(unittest.TestCase):
@@ -17,6 +18,13 @@ class CliTests(unittest.TestCase):
         patcher = patch("huntress_ctf.cli.load_env")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The robot lock lives in a temp directory, never in the developer's home.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.lock = Path(directory.name) / "robot.lock"
+        environment = patch.dict("os.environ", {"HUNTRESS_LOCK": str(self.lock)})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_triage_is_offline_and_reports_members(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,6 +88,19 @@ class CliTests(unittest.TestCase):
                         self.assertEqual(main(["submit", "c", "a", "value"]), code)
                     self.assertNotIn("secret-token", stdout.getvalue())
                     self.assertNotIn('"hidden"', stdout.getvalue())
+
+    def test_second_robot_stops_before_any_request(self):
+        client = Mock(token=None)
+        client.status.return_value = {"state": "active"}
+        with robot_lock("daily --day 20", path=self.lock):
+            with patch("huntress_ctf.cli.GameMasterClient", return_value=client):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as stderr:
+                    self.assertEqual(main(["submit", "c", "a", "value"]), 1)
+                    # Reading never needs the lock.
+                    self.assertEqual(main(["status", "c"]), 0)
+        self.assertIn("daily --day 20", stderr.getvalue())
+        client.submit.assert_not_called()
+        client.status.assert_called_once()
 
 
 class ArtifactTests(unittest.TestCase):

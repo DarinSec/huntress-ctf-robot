@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import getpass
 import math
 from pathlib import Path
@@ -19,10 +20,23 @@ from .display import print_result, safe_value
 from .diagnostics import compare_routes, probe_pipelining, run_bench, run_diagnostics
 from .fastpath import run_fast, solver_timings
 from .learn import run_learn
+from .lock import robot_lock
 from .state import AttemptState
 from .workspace import render_triage
 
 CAPTURE_DIR = Path("integration-data")
+# Commands that can start, retry or submit: one robot per machine (lock.py).
+LOCKED_COMMANDS = {"start", "retry", "solve", "learn", "daily", "submit"}
+
+
+def _seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("seconds must be a number of 0 or more") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("seconds must be a finite number of 0 or more")
+    return seconds
 
 
 def _positive_timeout(value: str) -> float:
@@ -64,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=_positive_timeout, default=30, help="HTTP timeout in seconds")
     parser.add_argument("--prompt-token", action="store_true", help="Read a bearer token with hidden terminal input")
+    parser.add_argument(
+        "--lock-wait", type=_seconds, default=0,
+        help="Seconds to wait when another robot on this machine holds the lock (default: stop at once)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list", help="List current challenges")
     listing.add_argument("--day", type=_day)
@@ -87,6 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--day", type=_day)
     daily.add_argument("--lane")
     daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
+    daily.add_argument("--rerace", action="store_true", help="With --timed: also race routes that were raced before (spends variants)")
+    daily.add_argument("--wait-release", type=_seconds, default=0, metavar="SECONDS",
+                       help="With --day: poll for that day's release for up to this long, then start at once")
+    daily.add_argument("--workers", type=_count, default=6, help="Untimed: challenge families solved in parallel (1-100)")
     daily.add_argument("--capture", action="store_true", help=f"Save redacted responses under {CAPTURE_DIR}")
     daily.add_argument("--no-pipeline", action="store_true", help=NO_PIPELINE_HELP)
     _race_options(daily)
@@ -189,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         print(render_triage(data, unwrapped.members, unwrapped.notes, title=args.path.name), end="")
         return COMPLETE
     token = None
+    held = ExitStack()
     try:
         load_env()
         if args.prompt_token:
@@ -198,6 +221,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             client = GameMasterClient(base_url=args.base_url, timeout=args.timeout)
         secrets = (client.token,) if client.token else ()
+        if args.command in LOCKED_COMMANDS:
+            command = " ".join(sys.argv[1:] if argv is None else argv)
+            held.enter_context(robot_lock(command, wait=args.lock_wait))
         if args.command == "list":
             result = client.list_challenges(args.day, args.lane)
         elif args.command == "start":
@@ -226,10 +252,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "learn":
             return run_learn(client, args.challenge_id)
         elif args.command == "daily":
+            if args.wait_release and args.day is None:
+                parser.error("--wait-release requires --day")
             return run_daily(
                 client, day=args.day, lane=args.lane, timed=args.timed,
                 capture_dir=CAPTURE_DIR if args.capture else None, pipeline=not args.no_pipeline,
                 repeat=args.repeat, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
+                rerace=args.rerace, wait_release=args.wait_release, workers=args.workers,
             )
         elif args.command == "bench":
             print_result(_bench(client, args, token), secrets)
@@ -278,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Interrupted. Check server status before repeating a POST.", file=sys.stderr)
         return 130
     finally:
+        held.close()
         if client is not None:
             client.close()
 
