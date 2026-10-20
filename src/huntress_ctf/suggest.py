@@ -72,7 +72,10 @@ def suggest(prop: str, data: bytes, limit: int = 4) -> list[str]:
         if label_kind and not label.startswith(label_kind):
             continue
         for key, value in fields.items():
-            score = len(wanted & _words(key)) + (2 if key in (name, _bare(name)) else 0)
+            joined = key.replace("_", "")
+            score = (len(wanted & _words(key)) + (2 if key in (name, _bare(name)) else 0)
+                     # "cputype" is one word in the header but "cpu_type" in a property.
+                     + (1 if len(joined) > 3 and joined in _bare(name).replace("_", "") else 0))
             if score:
                 scored.append((score, len(key), label, key, value))
     scored.sort(key=lambda item: (-item[0], item[1]))

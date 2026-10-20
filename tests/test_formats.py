@@ -118,6 +118,7 @@ class SuggestTests(unittest.TestCase):
         self.assertIn("exports", suggest("wasm.export_names_list", tiny_wasm())[0])
         self.assertIn("'14.1.0'", suggest("macho.min_os_version", macho_with_commands())[0])
         self.assertEqual(suggest("elf.e_type_u16_hex", macho_with_commands()), [])  # Other format.
+        self.assertIn("cputype = 16777228", suggest("macho.cpu_type_u32_hex", macho_with_commands())[0])
 
     def test_triage_shows_suggestions_and_fields(self):
         buffer = BytesIO()
