@@ -144,8 +144,8 @@ Lagets sista flagga per dag, i minuter efter släppet (`scripts/homebase.sh time
   inom 60 s.
 - **Script Mastery dag 17–18 och Web Mastery dag 19:** Ilses, Parsas och Davids lösare
   bör ligga i den gemensamma roboten, så att de körs automatiskt från 15:00.
-- **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter två
-  gånger per natt, med `--reserve 8` och `--gate-ms 350`.
+- **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter varannan
+  timme 00:30–10:30 UTC, med `--reserve 8` och `--gate-ms 250` (median 208 ms uppmätt).
 
 ## Arbetssätt i laget
 

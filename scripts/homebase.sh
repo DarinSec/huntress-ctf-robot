@@ -1,8 +1,10 @@
 #!/bin/bash
 # The robot's Homebase chores from this computer, over SSH through the CTF VPN.
-# Needs the key ~/.ssh/huntress_homebase in the VM's authorized_keys; add it once yourself:
-#   ssh-copy-id -i ~/.ssh/huntress_homebase.pub HuntressCTF@<homebase-ip>
+# Logs in with the key ~/.ssh/huntress_homebase when the VM accepts it; otherwise with the
+# password from the macOS keychain (service huntress-homebase, account HuntressCTF), typed
+# once by expect into a shared connection that stays open for 10 minutes.
 #
+#   scripts/homebase.sh run '<cmd>'  run one command there (PYTHONPATH and the proxy URL set)
 #   scripts/homebase.sh deploy       test src/ on the VM, then swap it into ~/src (keeps
 #                                    ~/src.previous) and install day.sh and hof.sh; the
 #                                    minute cron sweeps the day with the new code
@@ -16,9 +18,36 @@ set -euo pipefail
 host="${HB_HOST:-HuntressCTF@<homebase-ip>}"
 key="${HB_KEY:-$HOME/.ssh/huntress_homebase}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
-remote() { ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 "$host" "$@"; }
+mkdir -p "$HOME/.ssh"
+options=(-o ConnectTimeout=10 -o ControlPath="$HOME/.ssh/cm-huntress-%r@%h:%p")
+
+connect() {
+  ssh "${options[@]}" -O check "$host" 2>/dev/null && return 0
+  if [ -f "$key" ] && ssh "${options[@]}" -i "$key" -o BatchMode=yes -o ControlMaster=yes \
+      -o ControlPersist=600 -fN "$host" 2>/dev/null; then
+    return 0
+  fi
+  HB_HOST="$host" HB_CONTROL="$HOME/.ssh/cm-huntress-%r@%h:%p" expect <<'EOF' >/dev/null
+set timeout 30
+set password [exec security find-generic-password -a HuntressCTF -s huntress-homebase -w]
+spawn ssh -o ConnectTimeout=10 -o PubkeyAuthentication=no -o ControlMaster=yes -o ControlPersist=600 -o ControlPath=$env(HB_CONTROL) -fN $env(HB_HOST)
+expect {
+  "assword:" { send -- "$password\r"; exp_continue }
+  timeout { exit 2 }
+  eof
+}
+catch wait result
+exit [lindex $result 3]
+EOF
+  ssh "${options[@]}" -O check "$host" 2>/dev/null || { echo "Cannot reach $host: is the CTF VPN up?" >&2; exit 1; }
+}
+remote() { ssh "${options[@]}" "$host" "$@"; }
+connect
 
 case "${1:-}" in
+  run)
+    remote "cd ~ && export PYTHONPATH=~/src HUNTRESS_GM_URL=http://10.0.0.219/huntress-ctf-proxy; ${2:?usage: homebase.sh run '<command>'}"
+    ;;
   deploy)
     stamp=$(date +%Y%m%d-%H%M%S)
     (cd "$root" && find src tests -name __pycache__ -prune -o -type f -print \
@@ -52,7 +81,7 @@ case "${1:-}" in
     remote "python3 -I - ${2:-1}" < "$root/scripts/solvetimes.py"
     ;;
   *)
-    sed -n '2,15p' "$0"
+    sed -n '2,19p' "$0"
     exit 2
     ;;
 esac

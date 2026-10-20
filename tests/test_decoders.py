@@ -81,6 +81,72 @@ class DecoderTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - began, 0.25)
 
 
+BRAILLE_CELLS = {
+    "a": 0x01, "b": 0x03, "c": 0x09, "d": 0x19, "e": 0x11, "f": 0x0B, "g": 0x1B, "h": 0x13, "i": 0x0A,
+    "j": 0x1A, "k": 0x05, "l": 0x07, "m": 0x0D, "n": 0x1D, "o": 0x15, "p": 0x0F, "q": 0x1F, "r": 0x17,
+    "s": 0x0E, "t": 0x1E, "u": 0x25, "v": 0x27, "w": 0x3A, "x": 0x2D, "y": 0x3D, "z": 0x35,
+    ":": 0x12, "-": 0x24, " ": 0x00, ".": 0x32, "!": 0x16, ",": 0x02,
+}
+NATO_WORDS = {
+    "A": "Alfa", "B": "Bravo", "C": "Charlie", "D": "Delta", "E": "Echo", "F": "Foxtrot",
+    **{str(n): word for n, word in enumerate(
+        ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"))},
+}
+
+
+def to_braille(text):
+    cells = []
+    for char in text.lower():
+        if char.isdigit():
+            cells += [0x3C, BRAILLE_CELLS["jabcdefghi"[int(char)]]]
+        else:
+            cells.append(BRAILLE_CELLS[char])
+    return "".join(chr(0x2800 + cell) for cell in cells).encode()
+
+
+class UnusedFormatTests(unittest.TestCase):
+    """Formats no warmup used up to day 20, ready for a later day."""
+
+    def answers(self, data):
+        return {(chain, answer) for chain, _, answer in peel(data)}
+
+    def test_each_format_reaches_the_answer(self):
+        import quopri
+        import zlib
+        phrase = PHRASE.encode()
+        hexed = phrase.hex()
+        cases = {
+            ("ascii85",): base64.a85encode(phrase, adobe=True),
+            ("base85",): base64.b85encode(phrase),
+            ("qp",): quopri.encodestring(phrase, quotetabs=True).replace(b" ", b"=20"),
+            ("uu",): b"begin 644 note.txt\n" + b"".join(
+                __import__("binascii").b2a_uu(phrase[i:i + 45]) for i in range(0, len(phrase), 45)) + b"`\nend\n",
+            ("base64", "zlib"): base64.b64encode(zlib.compress(phrase)),
+            ("braille",): to_braille("submit this exact answer: brave-otter-lamp-42"),
+            ("nato", "hex"): " ".join(NATO_WORDS[c] for c in hexed.upper()).encode(),
+            ("unicode",): " ".join(f"U+{ord(c):04X}" for c in PHRASE).encode(),
+            ("octal",): "".join(f"\\{b:03o}" for b in phrase).encode(),
+        }
+        for chain, data in cases.items():
+            with self.subTest(chain=chain):
+                self.assertIn((chain, "brave-otter-lamp-42"), self.answers(data))
+
+    def test_quiet_on_plain_text_and_known_formats(self):
+        from huntress_ctf.decoders import (
+            ascii85, base85, braille, codepoints, inflated, nato, quoted_printable, uuencoded,
+        )
+        samples = [
+            b"Great job to solve submit this", base64.b64encode(b"hello world!"), b"SGVsbG8=",
+            b"68 65 6c 6c 6f", b"one two three four", b"%4e%69%63", b"&#78;&#105;",
+            b"just some words without any encoding at all", b"x\x9c not really zlib",
+        ]
+        for sample in samples:
+            for decode in (ascii85, base85, quoted_printable, uuencoded, inflated, braille, codepoints):
+                with self.subTest(sample=sample, decode=decode.__name__):
+                    self.assertIsNone(decode(sample))
+        self.assertIsNone(nato(b"Alpha and omega"))  # Not every word is a code word.
+
+
 class LayeredSolverTests(unittest.TestCase):
     def test_layered_solver_submits_only_the_stated_answer(self):
         artifact = to_morse(PHRASE.encode().hex().upper())

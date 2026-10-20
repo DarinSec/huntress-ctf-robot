@@ -12,8 +12,10 @@ from collections import deque
 from functools import lru_cache
 import html
 import json
+import quopri
 import re
 from urllib.parse import unquote_to_bytes
+import zlib
 
 MAX_LAYER_DEPTH = 5
 MAX_NODES = 64
@@ -164,6 +166,7 @@ def base32_text(data: bytes) -> bytes | None:
 
 
 _OCTAL_TEXT = re.compile(r"[0-3][0-7]{2}(?:\s+[0-3][0-7]{2})+")
+_OCTAL_ESCAPES = re.compile(r"(?:\\[0-3][0-7]{2}){2,}")
 _URL_TEXT = re.compile(r"(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9\-._~!$&'()*+,;=:@/?# ])+")
 _ENTITY = re.compile(r"&(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 _BACON_TEXT = re.compile(r"[abAB]{5}(?:\s+[abAB]{5})*")
@@ -171,9 +174,13 @@ _BACON_BITS = str.maketrans("abAB", "0101")
 
 
 def octal(data: bytes) -> bytes | None:
-    """Three-digit octal byte codes: "116 151 143" (Warmups Day 6)."""
+    """Three-digit octal byte codes: "116 151 143" (Warmups Day 6), or escapes "\\116\\151"."""
     text = as_text(data)
-    if text is None or not _OCTAL_TEXT.fullmatch(text):
+    if text is None:
+        return None
+    if _OCTAL_ESCAPES.fullmatch(text):
+        return bytes(int(code, 8) for code in text.split("\\")[1:])
+    if not _OCTAL_TEXT.fullmatch(text):
         return None
     return bytes(int(code, 8) for code in text.split())
 
@@ -221,6 +228,153 @@ def bacon(data: bytes) -> bytes | None:
     if all(value < 26 for value in values):
         return "".join(chr(65 + value) for value in values).encode("ascii")
     return None
+
+
+# Formats no warmup has used yet (days 1-20), each strict enough to stay quiet on other
+# text, so a new day that uses one is solved at the release instead of by hand.
+_BASE85_TEXT = re.compile(r"[0-9A-Za-z!#$%&()*+\-;<=>?@^_`{|}~]+")
+_QP_ESCAPE = re.compile(r"=[0-9A-Fa-f]{2}")
+_QP_LONE_EQUALS = re.compile(r"=(?![0-9A-Fa-f]{2}|\r?\n|$)")
+_UU_BEGIN = re.compile(r"begin [0-7]{3,4} \S.*")
+_CODEPOINT_TEXT = re.compile(r"U\+[0-9A-Fa-f]{4,6}(?:[\s,]*U\+[0-9A-Fa-f]{4,6})*")
+MAX_INFLATED = 4 * 1024 * 1024
+_BRAILLE = {  # Grade 1 cells by dot bits (dot 1 = 0x01 ... dot 6 = 0x20).
+    0x01: "a", 0x03: "b", 0x09: "c", 0x19: "d", 0x11: "e", 0x0B: "f", 0x1B: "g", 0x13: "h",
+    0x0A: "i", 0x1A: "j", 0x05: "k", 0x07: "l", 0x0D: "m", 0x1D: "n", 0x15: "o", 0x0F: "p",
+    0x1F: "q", 0x17: "r", 0x0E: "s", 0x1E: "t", 0x25: "u", 0x27: "v", 0x3A: "w", 0x2D: "x",
+    0x3D: "y", 0x35: "z", 0x02: ",", 0x06: ";", 0x12: ":", 0x32: ".", 0x16: "!", 0x26: "?",
+    0x04: "'", 0x24: "-", 0x00: " ",
+}
+_BRAILLE_NUMBER, _BRAILLE_CAPITAL = 0x3C, 0x20
+_BRAILLE_DIGITS = dict(zip("abcdefghij", "1234567890"))
+_NATO = {
+    "alfa": "A", "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D", "echo": "E",
+    "foxtrot": "F", "golf": "G", "hotel": "H", "india": "I", "juliett": "J", "juliet": "J",
+    "kilo": "K", "lima": "L", "mike": "M", "november": "N", "oscar": "O", "papa": "P",
+    "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T", "uniform": "U", "victor": "V",
+    "whiskey": "W", "whisky": "W", "x-ray": "X", "xray": "X", "yankee": "Y", "zulu": "Z",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+    "seven": "7", "eight": "8", "nine": "9", "niner": "9",
+}
+
+
+def ascii85(data: bytes) -> bytes | None:
+    """Adobe Ascii85 between <~ and ~>; without them too much ordinary text would fit."""
+    text = as_text(data)
+    if text is None or not (text.startswith("<~") and text.endswith("~>")):
+        return None
+    try:
+        return base64.a85decode(text, adobe=True)
+    except ValueError:
+        return None
+
+
+def base85(data: bytes) -> bytes | None:
+    """RFC 1924 Base85 (git, Python b85), only when it decodes to text and re-encodes exactly."""
+    compact = data.translate(None, _WHITESPACE)
+    if len(compact) < 10 or len(compact) % 5 == 1:
+        return None
+    try:
+        if not _BASE85_TEXT.fullmatch(compact.decode("ascii")):
+            return None
+        decoded = base64.b85decode(compact)
+    except ValueError:
+        return None
+    if base64.b85encode(decoded) != compact or raw_text(decoded) is None:
+        return None
+    return decoded
+
+
+def quoted_printable(data: bytes) -> bytes | None:
+    """MIME quoted-printable: "=4E=69c=65"; every "=" must start an escape or a soft break."""
+    text = as_text(data)
+    if text is None or not _QP_ESCAPE.search(text) or _QP_LONE_EQUALS.search(text):
+        return None
+    decoded = quopri.decodestring(text.encode("ascii", "ignore"))
+    return decoded if decoded != text.encode() else None
+
+
+def uuencoded(data: bytes) -> bytes | None:
+    """Classic uuencode between "begin <mode> <name>" and "end"."""
+    text = raw_text(data)
+    lines = text.strip().splitlines() if text else []
+    if len(lines) < 3 or not _UU_BEGIN.fullmatch(lines[0]) or lines[-1].strip() != "end":
+        return None
+    out = bytearray()
+    try:
+        for line in lines[1:-1]:
+            if line.strip() not in ("", "`"):
+                out += binascii.a2b_uu(line)
+    except binascii.Error:
+        return None
+    return bytes(out) or None
+
+
+def inflated(data: bytes) -> bytes | None:
+    """A zlib or gzip stream, by its header: e.g. Base64 of a compressed message."""
+    if data[:2] == b"\x1f\x8b":
+        wbits = 16 + zlib.MAX_WBITS
+    elif len(data) > 2 and data[0] == 0x78 and int.from_bytes(data[:2], "big") % 31 == 0:
+        wbits = zlib.MAX_WBITS
+    else:
+        return None
+    inflater = zlib.decompressobj(wbits)
+    try:
+        out = inflater.decompress(data, MAX_INFLATED)
+    except zlib.error:
+        return None
+    return out if out and inflater.eof and not inflater.unconsumed_tail else None
+
+
+def braille(data: bytes) -> bytes | None:
+    """Unicode Braille, grade 1: letters, the number sign before digits, the capital sign."""
+    text = as_text(data)
+    if text is None or not all(0x2800 <= ord(char) <= 0x283F or char.isspace() for char in text):
+        return None
+    out: list[str] = []
+    number = capital = False
+    for char in text:
+        cell = ord(char) - 0x2800 if not char.isspace() else 0
+        if cell == _BRAILLE_NUMBER:
+            number = True
+            continue
+        if cell == _BRAILLE_CAPITAL:
+            capital = True
+            continue
+        letter = _BRAILLE.get(cell)
+        if letter is None:
+            return None
+        if number and letter in _BRAILLE_DIGITS:
+            letter = _BRAILLE_DIGITS[letter]
+        else:
+            number = False
+        out.append(letter.upper() if capital else letter)
+        capital = False
+    decoded = "".join(out)
+    return decoded.encode("utf-8") if any(c.isalnum() for c in decoded) else None
+
+
+def nato(data: bytes) -> bytes | None:
+    """NATO spelling ("Hotel Echo Xray"); "/" or "|" separates words."""
+    text = as_text(data)
+    if text is None:
+        return None
+    words = [word.split() for word in re.split(r"\s*[/|]\s*", text.lower())]
+    tokens = [token for word in words for token in word]
+    if len(tokens) < 3 or any(token not in _NATO for token in tokens):
+        return None
+    return " ".join("".join(_NATO[token] for token in word) for word in words).encode("ascii")
+
+
+def codepoints(data: bytes) -> bytes | None:
+    """Unicode code points: "U+004E U+0069"."""
+    text = as_text(data)
+    if text is None or not _CODEPOINT_TEXT.fullmatch(text):
+        return None
+    try:
+        return "".join(chr(int(code, 16)) for code in re.findall(r"U\+([0-9A-Fa-f]{4,6})", text)).encode("utf-8")
+    except (ValueError, UnicodeEncodeError):
+        return None
 
 
 _ROT13 = str.maketrans(
@@ -277,6 +431,9 @@ LAYERS = (
     ("hex", hexadecimal), ("decimal", decimal), ("base32", base32_text),
     ("base64", base64_text), ("url", url_encoded), ("html", html_entities),
     ("json", json_escapes),
+    # Not used by days 1-20; after the known ones, so they never crowd a known chain out.
+    ("ascii85", ascii85), ("base85", base85), ("qp", quoted_printable), ("uu", uuencoded),
+    ("zlib", inflated), ("braille", braille), ("nato", nato), ("unicode", codepoints),
 )
 # Letter rotations apply to any text, so they are tried only as a last step.
 FINAL_STEPS = (("rot13", rot13), ("rot47", rot47))

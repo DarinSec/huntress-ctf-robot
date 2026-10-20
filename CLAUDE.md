@@ -33,7 +33,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
 - Unpacks ZIP (incl. ZipCrypto with the lesson password, default `infected`), gzip and tar
   in memory (`containers.py`); solvers see them as `context.members`. Encrypted entries of
   32 KiB or more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
-  in pure Python), CRC-checked against the ZIP itself.
+  in pure Python), CRC-checked against the ZIP itself. Where none reads AES (the playing
+  Homebase has only Info-ZIP unzip), the `cryptography` package decrypts it in Python with
+  the HMAC checked (day 20 Script: 145 members in 356 ms).
 - Peels stacked encodings until text states an answer (`decoders.py`, `LayeredDecodeSolver`).
 - Extracts metadata (EXIF/GPS, PNG text, PDF Info/XMP, Office docProps), IOCs, and decoded
   PowerShell/Base64/char-code blobs (`evidence.py`); `FactSolver` answers "what is the
@@ -73,6 +75,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   offline; 34 Time Trial/Mastery routes scored CORRECT live (19 Oct 2026); four have no
   fresh variants left. A new day's line chain is learned from its proven single-solve
   hint; if its encoding is new, add a strict layer (or a weak step) to `decoders.py`.
+  Strict layers for formats no day used yet are ready: ascii85 (`<~ ~>`), base85, qp,
+  uu, zlib/gzip, braille, nato, unicode (`U+XXXX`), and `\116`-style octal escapes;
+  the 79 saved warmup artifacts decode exactly as before with them.
 - **Metadata Forensics: done.** `solvers/metadata.py` (`metadata-facts`): references
   "[delivery N: ]archive -> member", file facts, filename by role, digest-ordered JSON,
   and one stdlib parser per `Determine <property>` (incl. OLE2/MSI, .NET metadata, LNK,
@@ -172,7 +177,7 @@ Never read, print, or copy that file.
 On the Homebase that plays, `scripts/homebase-day.sh` (cron every minute; install steps in
 its header) runs `daily` untimed from the release and then races the proven routes; it
 sweeps again within a minute whenever `~/src` or hints.json changes.
-`scripts/homebase-hof.sh` (cron 00:30 and 03:30 UTC) re-races every proven Warmups and
+`scripts/homebase-hof.sh` (cron every two hours 00:30-10:30 UTC) re-races every proven Warmups and
 Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
 
 ## Release day: a new question type

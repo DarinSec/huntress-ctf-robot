@@ -30,7 +30,7 @@ COURSE_LANES = {"warmups", "metadata-forensics"}
 WORKERS = 6
 # One lane is enough to see a release: ~1 s per list instead of ~4 s for a whole day.
 RELEASE_PROBE_LANE = "warmups"
-RELEASE_POLL_SECONDS = 1.0
+RELEASE_POLL_SECONDS = 0.25  # Plus ~0.6 s per list: a release is seen within ~1 s.
 
 OUTCOMES = {
     COMPLETE: "complete", UNRESOLVED: "unresolved", INCORRECT: "incorrect",

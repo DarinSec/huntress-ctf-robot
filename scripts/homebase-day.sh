@@ -19,7 +19,7 @@
 #   crontab -e, then add:
 #     @reboot sleep 90 && /home/HuntressCTF/day.sh >> /home/HuntressCTF/day-auto.log 2>&1
 #     * * * * * /home/HuntressCTF/day.sh >> /home/HuntressCTF/day-auto.log 2>&1
-#     30 0,3 * * * /home/HuntressCTF/hof.sh >> /home/HuntressCTF/hof-auto.log 2>&1
+#     30 0-10/2 * * * /home/HuntressCTF/hof.sh >> /home/HuntressCTF/hof-auto.log 2>&1
 set -u
 day="${1:-$(TZ=America/New_York date +%-d)}"
 state="$HOME/.huntress"

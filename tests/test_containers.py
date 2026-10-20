@@ -167,3 +167,54 @@ class ContainerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    Cipher = None
+
+
+def aes_zip(name, content, password, *, tamper=False):
+    """One WinZip AES-256 (AE-2) deflated entry, built byte by byte like 7-Zip writes it."""
+    import hashlib
+    import hmac
+    salt = bytes(range(16))
+    keys = hashlib.pbkdf2_hmac("sha1", password.encode(), salt, 1000, 66)
+    deflater = zlib.compressobj(9, zlib.DEFLATED, -15)
+    plain = deflater.compress(content) + deflater.flush()
+    blocks = b"".join(n.to_bytes(16, "little") for n in range(1, len(plain) // 16 + 2))
+    stream = Cipher(algorithms.AES(keys[:32]), modes.ECB()).encryptor().update(blocks)
+    cipher_text = bytes(a ^ b for a, b in zip(plain, stream))
+    if tamper:
+        cipher_text = bytes([cipher_text[0] ^ 1]) + cipher_text[1:]
+    code = hmac.new(keys[32:64], cipher_text, hashlib.sha1).digest()[:10]
+    data = salt + keys[64:] + cipher_text + code
+    extra = struct.pack("<HHH2sBH", 0x9901, 7, 2, b"AE", 3, 8)
+    encoded = name.encode()
+    local = struct.pack("<4sHHHHHIIIHH", b"PK\x03\x04", 51, 1, 99, 0, 0, 0, len(data), len(content),
+                        len(encoded), len(extra)) + encoded + extra + data
+    central = struct.pack("<4sHHHHHHIIIHHHHHII", b"PK\x01\x02", 51, 51, 1, 99, 0, 0, 0, len(data),
+                          len(content), len(encoded), len(extra), 0, 0, 0, 0, 0) + encoded + extra
+    end = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 1, 1, len(central), len(local), 0)
+    return local + central + end
+
+
+@unittest.skipIf(Cipher is None, "the cryptography package is not installed")
+class AesZipTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("huntress_ctf.containers.unzip_tool", return_value=None)  # Python path only.
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_aes_entries_unpack_in_python(self):
+        content = b"<?php // descriptor ...\n" * 50
+        result = unwrap(aes_zip("polyglot-php-stager.php", content, "infected"))
+        self.assertEqual(result.members, (containers.Member("polyglot-php-stager.php", content),))
+        self.assertEqual(result.notes, ())
+
+    def test_wrong_password_or_tampered_bytes_give_a_note_not_data(self):
+        for archive in (aes_zip("a.ps1", b"x" * 100, "other"), aes_zip("a.ps1", b"x" * 100, "infected", tamper=True)):
+            result = unwrap(archive)
+            self.assertEqual(result.members, ())
+            self.assertIn("AES-encrypted entry", result.notes[0])
