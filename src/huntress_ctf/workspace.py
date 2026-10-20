@@ -17,6 +17,7 @@ from .containers import Member
 from .decoders import peel
 from .display import safe_value
 from .evidence import collect
+from .macho import describe, field, slices
 
 MAX_BLOB_CHARS = 2000
 MAX_VALUES = 25
@@ -45,6 +46,13 @@ def render_triage(
             lines.append(
                 f"| {index} | {_quoted(member.name, 120)} | {len(member.data)} | {artifact_kind(member.data)} |"
             )
+    binaries = [(name, images) for name, data in (("artifact", artifact), *(
+        (member.name, member.data) for member in members)) if (images := slices(data))]
+    if binaries:
+        lines += ["", "## Mach-O slices", ""]
+        for name, images in binaries:
+            lines.append(f"- {_quoted(name, 120)}: cpu_type_set `{field('cpu_type_set', images)}`")
+            lines += [f"  - {describe(item)}" for item in images[:MAX_VALUES]]
     found = [(name, chain, answer) for name, data in (("artifact", artifact), *(
         (member.name, member.data) for member in members)) for chain, _, answer in peel(data)]
     if found:
