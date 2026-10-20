@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hall of Fame re-races at night on the Homebase that plays for the team. Every fresh timed
 # variant can lower the team's best time on a route, so this races each proven Warmups and
-# Metadata route of day 1 to yesterday again: only while the server answers status fast
+# Metadata route of every released day again: only while the server answers status fast
 # (--gate-ms; a slow server spends nothing) and never below 8 fresh variants per route
 # (--reserve). The robot lock keeps it from overlapping day.sh or a run by hand.
 # hints.json keeps each route's races and best_on_clock_ms.
@@ -12,7 +12,9 @@
 # (00:30 and 03:30 UTC, far from the 13:00 UTC release.)
 set -u
 export PYTHONPATH="$HOME/src" HUNTRESS_GM_URL="http://10.0.0.219/huntress-ctf-proxy"
-last=$(( $(TZ=America/New_York date +%-d) - 1 ))
+# The last released day: today's once 09:00 New York has passed (00:30 UTC is 20:30 there).
+day=$(TZ=America/New_York date +%-d); hour=$(TZ=America/New_York date +%-H)
+last=$(( hour >= 9 ? day : day - 1 ))
 [ "$last" -ge 1 ] || exit 0
 cd "$HOME"
 for lane in warmups metadata-forensics; do
