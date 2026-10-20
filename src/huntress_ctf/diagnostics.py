@@ -15,6 +15,7 @@ from uuid import uuid4
 from .autopilot import find_challenge
 from .client import GameMasterClient, GameMasterError
 from .display import safe_value
+from .network import record as record_network
 from .state import AttemptState, mode_name
 
 
@@ -172,13 +173,113 @@ def run_bench(
     client.close()
     client.warm()
     kept = measure(False)
-    client.close()
     fresh_summary, kept_summary = _latency(fresh), _latency(kept)
-    return {
+    report: dict[str, Any] = {
         "base_url": client.base_url,
         "operation": "status" if challenge_id else "list",
         "count": count,
         "fresh_connection_ms": fresh_summary,
         "kept_alive_ms": kept_summary,
         "saved_per_request_ms": round(fresh_summary["median"] - kept_summary["median"], 1),
+    }
+    if challenge_id:
+        # The download is on the timed clock too; a few kept-alive GETs show its cost.
+        try:
+            samples = []
+            for _ in range(min(count, 3)):
+                began = clock()
+                size = len(client.artifact(challenge_id))
+                samples.append((clock() - began) * 1000)
+            report["artifact_ms"] = {**_latency(samples), "bytes": size}
+        except GameMasterError as exc:
+            report["artifact_ms"] = {"unavailable": str(exc)}
+    client.close()
+    return report
+
+
+# Pipelining is only worth turning on where it measurably beats one request at a time.
+MIN_PIPELINE_SAVING_MS = 5.0
+
+
+def probe_pipelining(
+    client: GameMasterClient, *, challenge_id: str, rounds: int = 3,
+    clock: Callable[[], float] = time.perf_counter, network_path: Path | None = None,
+) -> dict[str, Any]:
+    """Only GET status and artifact. Never create, retry, or submit an attempt.
+
+    Sends the race's own pair shape (a JSON response, then the artifact bytes) in one
+    write, `rounds` times, on one kept-alive connection. It passes only if every round
+    returns both, in order, and the connection stays open; the verdict is saved so timed
+    runs pipeline start + artifact only where it passed. (Not the list: listing every
+    day takes the server about 80 s.)
+    """
+    calls = (
+        {"operation": "status", "params": {"challenge": challenge_id}},
+        {"operation": "artifact", "params": {"challenge": challenge_id}, "expect_json": False},
+    )
+    pipelined: list[float] = []
+    sequential: list[float] = []
+    reason = None
+    client.close()
+    client.warm()
+    for _ in range(rounds):
+        began = clock()
+        results = client.pipeline(*calls)
+        pipelined.append((clock() - began) * 1000)
+        failed = next((result for result in results if isinstance(result, GameMasterError)), None)
+        if failed is not None:
+            reason = str(failed)
+        elif not client.connected:
+            reason = "The server closed the connection after a pipelined pair."
+        elif not isinstance(results[0], dict) or not isinstance(results[1], bytes):
+            reason = "The pipelined responses did not come back as status, then artifact."
+        if reason:
+            break
+        began = clock()
+        for call in calls:
+            client.request(**call)
+        sequential.append((clock() - began) * 1000)
+    client.close()
+    report: dict[str, Any] = {"base_url": client.base_url, "rounds": rounds}
+    timings: dict[str, Any] = {}
+    if not reason:
+        report["pipelined_pair_ms"] = _latency(pipelined)
+        report["sequential_pair_ms"] = _latency(sequential)
+        saved = report["saved_per_race_ms"] = round(median(sequential) - median(pipelined), 1)
+        timings = {"pipelined_pair_ms": report["pipelined_pair_ms"]["median"],
+                   "sequential_pair_ms": report["sequential_pair_ms"]["median"]}
+        if saved < MIN_PIPELINE_SAVING_MS:
+            # Correct but no faster: the server answers the pair one after the other.
+            reason = f"Pipelining works but saved {saved} ms; one request at a time is kept."
+    report["pipelining"] = reason is None
+    if reason:
+        report["reason"] = reason
+    note = record_network(
+        client.base_url, network_path, pipelining=reason is None,
+        **({"reason": reason} if reason else {}), **timings,
+    )
+    if note:
+        report["note"] = note
+    return report
+
+
+def compare_routes(
+    benches: list[tuple[str, Callable[[], dict[str, Any]]]],
+) -> dict[str, Any]:
+    """Run each route's bench; recommend the lowest kept-alive median that answered."""
+    routes = []
+    for label, bench in benches:
+        try:
+            routes.append({"route": label, **bench()})
+        except GameMasterError as exc:
+            routes.append({"route": label, "unavailable": str(exc)})
+    answered = [route for route in routes if "kept_alive_ms" in route]
+    best = min(answered, key=lambda route: route["kept_alive_ms"]["median"], default=None)
+    return {
+        "routes": routes,
+        "recommended": None if best is None else {
+            "route": best["route"], "base_url": best["base_url"],
+            "kept_alive_median_ms": best["kept_alive_ms"]["median"],
+            "why": "Lowest kept-alive round trip; a timed run pays about two of them on the clock.",
+        },
     }

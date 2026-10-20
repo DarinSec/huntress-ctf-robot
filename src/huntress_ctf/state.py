@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from .client import GameMasterError
 
@@ -32,6 +33,45 @@ def current_fields(response: Any) -> dict[str, Any]:
     return fields
 
 
+_CAPABILITY_PATH = re.compile(r"/download/([A-Za-z0-9_-]{16,})/?$")
+
+
+def deliveries(response: Any) -> list[dict[str, Any]]:
+    """Every listed artifact in listed order: {index, filename, sha256, capability}.
+
+    Questions name them "delivery N: <filename>" (N = index + 1). The robot fetches each
+    with op=artifact&delivery=<index>, which works on every route. The download link's
+    capability ("/?op=download&capability=..." directly, ".../download/<capability>" in
+    Homebase-style links, absent through the proxy) is kept as a fallback.
+    """
+    try:
+        fields = current_fields(response)
+    except GameMasterError:
+        return []
+    found = []
+    listed = fields.get("artifacts")
+    if not isinstance(listed, list) and isinstance(fields.get("download"), str):
+        # A single-artifact start response carries its link and hash at the top level.
+        listed = [{"download": fields["download"], "sha256": fields.get("sha256")}]
+    for item in listed or ():
+        if not isinstance(item, dict):
+            continue
+        capability = None
+        if isinstance(item.get("download"), str):
+            parts = urlsplit(item["download"])
+            capability = (parse_qs(parts.query).get("capability") or [None])[0]
+            if not capability:
+                match = _CAPABILITY_PATH.search(parts.path)
+                capability = match[1] if match else None
+        found.append({
+            "index": len(found),
+            "filename": item.get("filename") if isinstance(item.get("filename"), str) else "artifact",
+            "capability": capability,
+            "sha256": item["sha256"].lower() if isinstance(item.get("sha256"), str) else None,
+        })
+    return found
+
+
 def _text(value: Any) -> str:
     return value.casefold() if isinstance(value, str) else ""
 
@@ -54,8 +94,8 @@ class AttemptState:
     def parse(cls, response: Any) -> AttemptState:
         fields = current_fields(response)
         known = {
-            "answer_ids", "accepted_answer_ids", "attempt_id", "artifact_sha256",
-            "artifact", "mode", "deadline", "remaining", "result", "status", "state",
+            "answer_ids", "accepted_answer_ids", "accepted_ids", "attempt_id", "artifact_sha256",
+            "artifact", "artifacts", "mode", "deadline", "remaining", "result", "status", "state",
         }
         if not known.intersection(fields):
             raise GameMasterError("The Game Master response has no recognized attempt fields.")
@@ -68,10 +108,9 @@ class AttemptState:
         if completed and "incorrect" in states:
             raise GameMasterError("The submission response contradicts itself about completion.")
         ids = string_ids(fields["answer_ids"], "answer_ids") if "answer_ids" in fields else None
-        accepted = (
-            string_ids(fields["accepted_answer_ids"], "accepted_answer_ids")
-            if "accepted_answer_ids" in fields else ()
-        )
+        # The live service says `accepted_ids`; `accepted_answer_ids` is the older spelling.
+        accepted_key = next((key for key in ("accepted_answer_ids", "accepted_ids") if key in fields), None)
+        accepted = string_ids(fields[accepted_key], accepted_key) if accepted_key else ()
         attempt_id = fields.get("attempt_id")
         if attempt_id is not None and (
             not isinstance(attempt_id, str) or not attempt_id.strip()
@@ -80,6 +119,14 @@ class AttemptState:
         digest = fields.get("artifact_sha256")
         if digest is None and isinstance(fields.get("artifact"), dict):
             digest = fields["artifact"].get("sha256")
+        if digest is None and isinstance(fields.get("download"), str):
+            # A single-artifact start response: top-level {download, sha256} (19 Oct 2026).
+            digest = fields.get("sha256")
+        listed = fields.get("artifacts")
+        if digest is None and isinstance(listed, list) and len(listed) == 1 and isinstance(listed[0], dict):
+            # The live service lists one artifact {filename, sha256, size, download}; its
+            # sha256 is that of the op=artifact bytes (checked on Day 1 responses).
+            digest = listed[0].get("sha256")
         if digest is not None:
             if not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
                 raise GameMasterError("The assigned artifact SHA-256 is malformed.")

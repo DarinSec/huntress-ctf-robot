@@ -10,7 +10,7 @@ import warnings
 
 from huntress_ctf.cli import main
 from huntress_ctf.client import GameMasterClient, GameMasterError
-from huntress_ctf.diagnostics import run_diagnostics, schema_summary
+from huntress_ctf.diagnostics import compare_routes, probe_pipelining, run_diagnostics, schema_summary
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -119,6 +119,72 @@ class DiagnosticsTests(unittest.TestCase):
                          {"openapi": "3.1.0", "paths": {"/": {"$ref": "other"}}}):
             with self.subTest(response=response), self.assertRaises(GameMasterError):
                 schema_summary(response)
+
+
+class PipelineProbeTests(unittest.TestCase):
+    STATUS = {"answer_ids": ["a"], "result": "CORRECT"}
+
+    def probe(self, results, connected=True, pipelined_ms=10, sequential_ms=20):
+        client = Mock(base_url="https://gm.example", connected=connected)
+        client.pipeline.return_value = results
+        now = [0.0]
+        spans = [pipelined_ms, sequential_ms]
+        ticks = []
+
+        def clock():
+            # Calls alternate begin/end; each round times the pipelined pair, then two singles.
+            if len(ticks) % 2:
+                now[0] += spans[(len(ticks) // 2) % 2] / 1000
+            ticks.append(now[0])
+            return now[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "network.json"
+            report = probe_pipelining(client, challenge_id="c", network_path=path, clock=clock)
+            saved = json.loads(path.read_text(encoding="utf-8"))["https://gm.example"]
+        used = {name.split(".")[0] for name, _, _ in client.mock_calls}
+        # Read-only: nothing can start, retry, or submit an attempt.
+        self.assertLessEqual(used, {"close", "warm", "pipeline", "request"})
+        for _, _, kwargs in client.request.mock_calls:
+            self.assertNotIn("payload", kwargs)
+        return report, saved
+
+    def test_in_order_pair_on_a_kept_connection_passes_and_is_saved(self):
+        report, saved = self.probe([self.STATUS, b"artifact bytes"])
+        self.assertTrue(report["pipelining"])
+        self.assertIn("saved_per_race_ms", report)
+        self.assertTrue(saved["pipelining"])
+
+    def test_correct_but_not_faster_stays_off(self):
+        # Measured live: the server answers a pipelined pair one after the other.
+        report, saved = self.probe([self.STATUS, b"artifact bytes"], pipelined_ms=1559, sequential_ms=1456)
+        self.assertFalse(report["pipelining"])
+        self.assertIn("saved -103.0 ms", report["reason"])
+        self.assertFalse(saved["pipelining"])
+        self.assertEqual(saved["sequential_pair_ms"], 1456.0)
+
+    def test_failures_turn_pipelining_off(self):
+        for results, connected, reason in (
+            ([self.STATUS, GameMasterError("closed early")], True, "closed early"),
+            ([self.STATUS, b"artifact bytes"], False, "closed the connection"),
+            ([b"artifact bytes", self.STATUS], True, "status, then artifact"),
+        ):
+            with self.subTest(reason=reason):
+                report, saved = self.probe(results, connected)
+                self.assertFalse(report["pipelining"])
+                self.assertIn(reason, report["reason"])
+                self.assertFalse(saved["pipelining"])
+
+    def test_compare_recommends_the_fastest_reachable_route(self):
+        def unreachable():
+            raise GameMasterError("Game Master transport failed while connecting.")
+        result = compare_routes([
+            ("direct", lambda: {"base_url": "https://d", "kept_alive_ms": {"median": 41.0}}),
+            ("proxy", unreachable),
+            ("other", lambda: {"base_url": "http://o", "kept_alive_ms": {"median": 3.5}}),
+        ])
+        self.assertEqual(result["recommended"]["route"], "other")
+        self.assertIn("unavailable", result["routes"][1])
 
 
 class HiddenInputTests(unittest.TestCase):

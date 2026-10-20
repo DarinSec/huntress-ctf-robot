@@ -29,6 +29,18 @@ class CliTests(unittest.TestCase):
         self.assertIn("Unpacked members", stdout.getvalue())
         self.assertIn("notes.txt", stdout.getvalue())
 
+    def test_triage_time_reports_solver_costs_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.txt"
+            path.write_bytes(b"aGVsbG8=")
+            with patch("huntress_ctf.cli.GameMasterClient") as client:
+                with redirect_stdout(StringIO()) as stdout:
+                    code = main(["triage", str(path), "--time", "--question", "Decode the Base64 text."])
+                client.assert_not_called()
+        self.assertEqual(code, 0)
+        for expected in ("median_ms", "unpack", "base64-answer", "would_submit", "hello"):
+            self.assertIn(expected, stdout.getvalue())
+
     def test_help_works_without_client_or_credentials(self):
         with patch("huntress_ctf.cli.GameMasterClient") as client:
             with redirect_stdout(StringIO()), self.assertRaises(SystemExit) as result:

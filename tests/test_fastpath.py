@@ -1,5 +1,6 @@
 from contextlib import redirect_stdout
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 from io import StringIO
 from itertools import count
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 from huntress_ctf.autopilot import COMPLETE, CONFLICT, EXPIRED, INCORRECT, PENDING, UNRESOLVED
 from huntress_ctf.client import GameMasterError
-from huntress_ctf.fastpath import run_timed_fast
+from huntress_ctf.fastpath import run_fast
 from huntress_ctf.solvers import AnswerCandidate
 
 
@@ -71,14 +72,140 @@ class FastPathTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.output = StringIO()
 
-    def run_fast(self, client, output=None):
+    def run_fast(self, client, output=None, **kwargs):
         ticks = count()
         root = Path(self.directory.name)
         with redirect_stdout(output or self.output):
-            return run_timed_fast(
-                client, "c", artifact_dir=root, work_dir=root / "work",
-                hints_path=root / "hints.json", clock=lambda: next(ticks) / 1000,
+            return run_fast(
+                client, "c", timed=True, artifact_dir=root, work_dir=root / "work",
+                hints_path=root / "hints.json",
+                **{"ntp": lambda: None, "clock": lambda: next(ticks) / 1000, **kwargs},
             )
+
+    def pipelining_client(self, early=None):
+        """A client on a route whose probe passed; `early` overrides the pipelined bytes."""
+        client = FakeClient(self.output)
+        client.base_url = "https://gm.example"
+        (Path(self.directory.name) / "network.json").write_text(
+            '{"https://gm.example": {"pipelining": true}}', encoding="utf-8",
+        )
+
+        def start_with_artifact(challenge_id, timed=False, retry=False):
+            client.calls.append(("start_with_artifact", timed, retry))
+            return deepcopy(client.assignment), client.artifact_bytes if early is None else early
+        client.start_with_artifact = start_with_artifact
+        return client
+
+    def network_state(self):
+        return (Path(self.directory.name) / "network.json").read_text(encoding="utf-8")
+
+    def test_probed_route_pipelines_start_and_artifact(self):
+        client = self.pipelining_client()
+        self.assertEqual(self.run_fast(client), COMPLETE)
+        self.assertEqual(client.calls, [
+            "list", "status", ("start_with_artifact", True, False),
+            ("submit_many", {"a": "hello"}), "status",
+        ])
+        self.assertIn('"pipelined": true', self.output.getvalue())
+        self.assertIn('"pipelining": true', self.network_state())
+
+    def test_unverifiable_pipelined_bytes_are_fetched_again_and_pipelining_stops(self):
+        for early, reason in (
+            (b"bytes of the previous attempt", "did not match"),
+            (GameMasterError("HTTP 409"), "HTTP 409"),
+        ):
+            with self.subTest(reason=reason):
+                client = self.pipelining_client(early)
+                self.assertEqual(self.run_fast(client), COMPLETE)
+                self.assertIn("artifact", client.calls)  # The ordinary GET after the pair.
+                self.assertIn(("submit_many", {"a": "hello"}), client.calls)
+                self.assertIn('"pipelining": false', self.network_state())
+                self.assertIn(reason, self.network_state())
+
+    def test_gate_waits_for_a_fast_server_and_never_spends_a_slow_variant(self):
+        slow = count()
+        pauses = []
+        client = FakeClient(self.output)
+        code = self.run_fast(client, clock=lambda: next(slow) * 0.5, gate_ms=100, gate_wait=60,
+                             sleep=pauses.append)
+        self.assertEqual(code, UNRESOLVED)
+        self.assertEqual(pauses, [30.0, 30.0])
+        self.assertFalse([c for c in client.calls if isinstance(c, tuple) and c[0] in ("start", "retry")])
+        self.assertIn("No variant was spent", self.output.getvalue())
+        fast = FakeClient(StringIO())
+        self.assertEqual(self.run_fast(fast, StringIO(), gate_ms=100), COMPLETE)  # 1 ms per probe
+
+    def test_hedged_download_lets_the_faster_connection_win_and_submit(self):
+        import threading
+        import time as real_time
+        release = threading.Event()
+
+        class Primary(FakeClient):
+            def warm(self):
+                pass
+
+            def close(self):
+                pass
+
+            def clone(self):
+                helper = Helper(self.stdout)
+                helper.calls = self.helper_calls
+                return helper
+
+            def artifact(self, challenge_id, delivery=None):
+                release.wait(2)  # Slow: answers only after the helper has won.
+                return super().artifact(challenge_id)
+
+        class Helper(Primary):
+            def artifact(self, challenge_id, delivery=None):
+                self.calls.append("artifact")
+                return self.artifact_bytes
+
+            def submit_many(self, challenge_id, answers):
+                release.set()
+                return super().submit_many(challenge_id, answers)
+
+        client = Primary(self.output)
+        client.helper_calls = []
+        self.assertEqual(self.run_fast(client), COMPLETE)
+        self.assertIn(("submit_many", {"a": "hello"}), client.helper_calls)  # The winner submitted.
+        self.assertFalse([c for c in client.calls if c[0] == "submit_many"])
+        self.assertEqual(client.calls[-1], "status")  # The report waited for the slow GET.
+
+    def test_server_clock_is_placed_with_the_ntp_offset(self):
+        from huntress_ctf.fastpath import Run, _server_clock
+        run = Run(timed=True, clock_offset=5.0)  # The local clock runs 5 s fast.
+        run.attempt = {"answer_ids": ["a"], "started_at": "2027-01-15T08:00:00.000Z"}
+        started = datetime(2027, 1, 15, 8, 0, tzinfo=timezone.utc).timestamp()
+        run.wall = {"submit sent": started + 5.0 + 1.145, "submit received": started + 5.0 + 2.921}
+        self.assertEqual(_server_clock(run), {"from": 1145, "to": 2921})
+        self.assertIsNone(_server_clock(Run(timed=True)))  # No NTP answer: no estimate.
+
+    def test_start_response_link_is_used_for_the_download(self):
+        for failing, expected_calls in ((False, ["download"]), (True, ["download", "artifact"])):
+            with self.subTest(failing=failing):
+                client = FakeClient(StringIO())
+                client.assignment.pop("artifact_sha256")
+                client.assignment.update(
+                    download="/?op=download&capability=cap-123",
+                    sha256=hashlib.sha256(client.artifact_bytes).hexdigest(),
+                )
+
+                def download(capability, client=client, failing=failing):
+                    client.calls.append("download")
+                    if failing:
+                        raise GameMasterError("Game Master returned HTTP 404.")
+                    self.assertEqual(capability, "cap-123")
+                    return client.artifact_bytes
+                client.download = download
+                self.assertEqual(self.run_fast(client, StringIO()), COMPLETE)
+                self.assertEqual([c for c in client.calls if c in ("download", "artifact")], expected_calls)
+
+    def test_pipelining_can_be_switched_off(self):
+        client = self.pipelining_client()
+        self.assertEqual(self.run_fast(client, pipeline=False), COMPLETE)
+        self.assertIn(("start", True), client.calls)
+        self.assertNotIn(("start_with_artifact", True, False), client.calls)
 
     def test_only_start_artifact_and_one_submit_are_on_the_clock(self):
         client = FakeClient(self.output)

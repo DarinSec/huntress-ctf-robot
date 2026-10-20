@@ -85,6 +85,20 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(state.deadline)
         self.assertIsNone(state.remaining)
 
+    def test_live_schema_accepted_ids_and_listed_artifact_hash(self):
+        digest = "AB" * 32
+        state = AttemptState.parse({
+            "answer_ids": ["q1", "q2"], "accepted_ids": ["q1"], "mode": "mastery",
+            "artifacts": [{"filename": "a.zip", "sha256": digest, "size": 3, "download": "/x"}],
+        })
+        self.assertEqual(state.accepted_ids, frozenset({"q1"}))
+        self.assertEqual(state.artifact_sha256, digest.lower())
+        # Two listed artifacts do not say which one op=artifact returns: no hash is assumed.
+        two = AttemptState.parse({"artifacts": [{"sha256": digest}, {"sha256": "cd" * 32}]})
+        self.assertIsNone(two.artifact_sha256)
+        with self.assertRaises(GameMasterError):
+            AttemptState.parse({"artifacts": [{"sha256": "not-a-hash"}]})
+
     def test_modes_are_explicit_not_guessed(self):
         self.assertEqual(mode_name({}, AttemptState(mode="mastery_mode")), "Mastery Mode")
         self.assertEqual(mode_name({}, AttemptState(mode="untimed")), "untimed")

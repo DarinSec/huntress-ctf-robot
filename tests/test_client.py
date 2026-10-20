@@ -1,4 +1,5 @@
 from email.message import Message
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
@@ -6,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
-from huntress_ctf.client import GameMasterClient, GameMasterError, PROXY_BASE_URL
+from huntress_ctf.client import GameMasterClient, GameMasterError, LIST_TIMEOUT_SECONDS, PROXY_BASE_URL
 
 
 def reply(body=b'{"ok":true}', kind="application/json", attachment=False, status=200):
@@ -18,7 +19,7 @@ def reply(body=b'{"ok":true}', kind="application/json", attachment=False, status
 
 
 def sent(client):
-    method, target, body, headers, _limit = client._send.call_args.args
+    method, target, body, headers, _limit, _timeout = client._send.call_args.args
     return method, target, body, headers
 
 
@@ -221,6 +222,54 @@ class KeepAliveTests(unittest.TestCase):
             with self.assertRaises(GameMasterError):
                 self.client.submit("x", "a", "value")
         self.assertEqual([method for method, _ in self.server.requests], ["GET", "GET"])
+
+    def test_pipelined_requests_keep_order_and_the_connection(self):
+        with patch.dict("os.environ", {"NO_PROXY": "*"}):
+            self.client.warm()
+            first, second = self.client.pipeline(
+                {"operation": "status", "params": {"challenge": "x"}},
+                {"operation": "artifact", "params": {"challenge": "x"}, "expect_json": False},
+            )
+            attempt, artifact = self.client.start_with_artifact("x", timed=True)
+            self.client.submit_many("x", {"a": "one"})
+        self.assertEqual((first["n"], json.loads(second)["n"]), (1, 2))
+        self.assertEqual((attempt["n"], json.loads(artifact)["n"]), (3, 4))
+        self.assertEqual(self.server.connections, 1)
+        self.assertEqual([method for method, _ in self.server.requests], ["GET", "GET", "POST", "GET", "POST"])
+        self.assertIn("op=artifact", self.server.requests[3][1])
+
+    def test_closing_server_returns_the_artifact_error_and_never_repeats_the_post(self):
+        self.server.drop_after_response = True
+        with patch.dict("os.environ", {"NO_PROXY": "*"}):
+            attempt, artifact = self.client.start_with_artifact("x", timed=True)
+            self.assertEqual(attempt["n"], 1)
+            self.assertIsInstance(artifact, GameMasterError)
+            self.assertEqual([method for method, _ in self.server.requests], ["POST"])
+            self.client.artifact("x")  # The caller's own GET goes out on a new connection.
+        self.assertEqual(self.server.connections, 2)
+
+    def test_list_gets_a_longer_timeout_that_is_restored_afterwards(self):
+        seen = []
+        real = HTTPConnection.request
+
+        def spy(connection, *args, **kwargs):
+            seen.append((connection.timeout, connection.sock.gettimeout() if connection.sock else None))
+            return real(connection, *args, **kwargs)
+
+        with patch.dict("os.environ", {"NO_PROXY": "*"}), patch.object(HTTPConnection, "request", spy):
+            self.client.warm()
+            self.client.list_challenges(day=1)
+            self.client.status("x")
+        self.assertEqual(seen[0], (LIST_TIMEOUT_SECONDS, LIST_TIMEOUT_SECONDS))
+        self.assertEqual(seen[1], (5, 5))
+        self.assertEqual(self.server.connections, 1)
+
+    def test_failed_pipelined_start_raises_without_retry(self):
+        with patch.dict("os.environ", {"NO_PROXY": "*"}), \
+             patch.object(self.client, "_wire", side_effect=OSError("reset")):
+            with self.assertRaisesRegex(GameMasterError, "may have reached"):
+                self.client.start_with_artifact("x", timed=True)
+        self.assertEqual(self.server.requests, [])
 
 
 if __name__ == "__main__":

