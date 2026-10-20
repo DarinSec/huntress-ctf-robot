@@ -80,17 +80,19 @@ class Run:
     targets: list[Any] = field(default_factory=list)  # Web: live sites, no artifact.
 
 
-def plan_route(before: Any, challenge: dict[str, Any]) -> tuple[str, str | None]:
+def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tuple[str, str | None]:
     """Choose 'start' or 'retry', or 'pending'/'stop' with a reason, before the clock starts.
 
     `start` only reconnects to the current attempt and never changes its mode, so a new
     timed run after a completed or expired attempt needs `retry` with run_for_time.
+    `reserve` keeps that many fresh timed variants unspent (Hall of Fame re-races); with
+    a reserve, an unknown remaining count stops the run too.
     """
     try:
         state = AttemptState.parse(before)
         fields = current_fields(before)
     except GameMasterError:
-        return "start", None
+        return ("stop", "The remaining timed variants are unknown, and a reserve is set.") if reserve else ("start", None)
     remaining = next((
         source[name] for source in (fields, challenge) for name in REMAINING_FIELDS
         if type(source.get(name)) is int
@@ -100,6 +102,8 @@ def plan_route(before: Any, challenge: dict[str, Any]) -> tuple[str, str | None]
     if state.complete or state.expired:
         if remaining == 0:
             return "stop", "No fresh timed variant remains for this challenge."
+        if reserve and (remaining is None or remaining <= reserve):
+            return "stop", f"{remaining} fresh timed variants remain; {reserve} are kept in reserve."
         return "retry", None
     active = not state.inactive and (state.attempt_id is not None or bool(state.answer_ids))
     if active and not state.deadline:
@@ -588,6 +592,7 @@ def run_fast(
     ntp: Callable[[], float | None] = network.clock_offset,
     gate_ms: float | None = None, gate_wait: float = 600.0,
     sleep: Callable[[float], None] = time.sleep, report: dict[str, Any] | None = None,
+    reserve: int = 0,
 ) -> int:
     """Solve one challenge. `challenge` is its record from a list the caller already has.
 
@@ -596,6 +601,7 @@ def run_fast(
     `pipeline=False` keeps one request at a time even where the probe passed.
     `gate_ms` (timed) waits up to `gate_wait` s for the server to answer status that fast
     before spending a variant. `report`, when given, receives the run's timings.
+    `reserve` (timed) never spends the last that many fresh timed variants.
     """
     secrets = (client.token,) if client.token else ()
     responses: dict[str, Any] = {}
@@ -616,7 +622,7 @@ def run_fast(
             responses["before"] = before = client.status(challenge_id)
         except GameMasterError as exc:
             before = {"unavailable": str(exc)}
-        run.route, reason = plan_route(before, challenge)
+        run.route, reason = plan_route(before, challenge, reserve)
         if run.route in ("pending", "stop"):
             print("Challenge:")
             print_result(challenge, secrets)

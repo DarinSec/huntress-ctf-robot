@@ -125,6 +125,28 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
 12. **Gemensam hints-källa.** `hints.json` finns på PC:n och på Homebase och glider
     isär. Den Homebase som spelar är sanningen.
 
+## Läget 21 okt: alla dag 1–20 lösta; tiden och Hall of Fame avgör
+
+`list` visar att laget har löst alla 6 lanes × 3 lägen för dag 1–20. Poäng för gamla
+dagar finns alltså inte kvar. Kvar finns dag 21–31 och Hall of Fame (varje ny tidsatt
+variant kan sänka lagets bästa tid per rutt).
+
+Lagets sista flagga per dag, i minuter efter släppet (`scripts/homebase.sh times`):
+
+| Dag | 15 | 16 | 17 | 18 | 19 | 20 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sista flagga | 52,6 | 13,6 | 83,6 | 65,0 | 49,3 | 14,9 |
+| Lane | Metadata M | Metadata M | Script M | Script M | Web M | Metadata M |
+
+- **Metadata Mastery var sist tre av sex dagar.** En ny typ löses för hand och kodas
+  sedan. Körschemat i `CLAUDE.md` ("Release day: a new question type") siktar på cirka
+  6 min: `homebase.sh pull`, parser, `deploy`, `sweep`. Cron varje minut tar upp ny kod
+  inom 60 s.
+- **Script Mastery dag 17–18 och Web Mastery dag 19:** Ilses, Parsas och Davids lösare
+  bör ligga i den gemensamma roboten, så att de körs automatiskt från 15:00.
+- **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter två
+  gånger per natt, med `--reserve 8` och `--gate-ms 350`.
+
 ## Arbetssätt i laget
 
 - **Gren per lane**, till exempel `lane/script-analysis`, och PR till `main`. Alla

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Solve and race one release day on the Homebase that plays for the team. Started by cron
-# every 15 minutes and at boot (see `crontab -l`). Run by hand: ~/day.sh [day]
+# every minute and at boot (see `crontab -l`). Run by hand: ~/day.sh [day]
 #
 # Before the release (09:00 New York = 15:00 in Sweden) it sleeps until just before it;
 # `daily --wait-release` then starts the moment the day is listed:
@@ -8,7 +8,8 @@
 #      proven solvers in ~/.huntress/hints.json);
 #   2. races each proven Time Trial and Mastery route once (hints.json keeps the best).
 # Later cron runs sweep again only when the code in ~/src or hints.json changed since the
-# last sweep, so a solver deployed in the afternoon still scores and races the same day.
+# last sweep (checking takes milliseconds), so a solver deployed during the day scores and
+# races within a minute of `scripts/homebase.sh deploy`.
 # Logs: ~/day-auto.log (summaries), ~/dayNN-HHMM-untimed.log and ~/dayNN-HHMM-timed.log.
 # The robot holds ~/.huntress/robot.lock around every start, retry and submit, so a run
 # by hand and this script never play at once: this script waits its turn (--lock-wait).
@@ -17,7 +18,8 @@
 #   cp scripts/homebase-day.sh ~/day.sh && chmod +x ~/day.sh   (code in ~/src)
 #   crontab -e, then add:
 #     @reboot sleep 90 && /home/HuntressCTF/day.sh >> /home/HuntressCTF/day-auto.log 2>&1
-#     */15 * * * * /home/HuntressCTF/day.sh >> /home/HuntressCTF/day-auto.log 2>&1
+#     * * * * * /home/HuntressCTF/day.sh >> /home/HuntressCTF/day-auto.log 2>&1
+#     30 0,3 * * * /home/HuntressCTF/hof.sh >> /home/HuntressCTF/hof-auto.log 2>&1
 set -u
 day="${1:-$(TZ=America/New_York date +%-d)}"
 state="$HOME/.huntress"

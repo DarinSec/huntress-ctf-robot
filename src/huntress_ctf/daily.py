@@ -168,16 +168,23 @@ def run_daily(
     clock: Callable[[], float] = time.perf_counter, pipeline: bool = True,
     repeat: int = 1, gate_ms: float | None = None, gate_wait: float = 600.0,
     rerace: bool = False, wait_release: float = 0.0, workers: int = WORKERS,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = time.sleep, days: list[int] | None = None,
+    reserve: int = 0,
 ) -> int:
     """`repeat` (timed) races each challenge that many times: Hall of Fame keeps the best.
 
     The summary's `on_clock_ms` is the server-clock estimate per race (started_at ->
     submit sent); `wall_seconds` is the whole command, which also covers free parts.
     `wait_release` (needs `day`) polls for the day's release for up to that many seconds.
+    `days` runs several days in one go (one list per day: ~1 s with a lane, ~4 s without);
+    `reserve` (timed) keeps that many fresh variants per route unspent.
     """
     began_all = clock()
-    if wait_release and day is not None:
+    if days:
+        listing = {"challenges": [
+            record for number in days for record in _records(client.list_challenges(number, lane))
+        ]}
+    elif wait_release and day is not None:
         released = wait_for_release(client, day, lane, wait_release, sleep=sleep)
         listing = released if lane else client.list_challenges(day, lane)
     else:
@@ -201,7 +208,7 @@ def run_daily(
                     target, challenge_id, timed=timed, challenge=record,
                     artifact_dir=artifact_dir, work_dir=work_dir, hints_path=hints_path,
                     capture_dir=capture_dir, clock=clock, pipeline=pipeline,
-                    gate_ms=gate_ms, gate_wait=gate_wait, report=report,
+                    gate_ms=gate_ms, gate_wait=gate_wait, report=report, reserve=reserve,
                 )
                 measured = (report.get("server_clock_ms") or {}).get("from")
                 if measured is not None:

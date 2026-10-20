@@ -9,7 +9,9 @@ import zipfile
 from huntress_ctf.artifacts import artifact_kind, artifact_summary, save_artifact
 from huntress_ctf.cli import main
 from huntress_ctf.client import GameMasterError
+from huntress_ctf.containers import unwrap
 from huntress_ctf.lock import robot_lock
+from huntress_ctf.workspace import render_triage
 
 
 class CliTests(unittest.TestCase):
@@ -162,6 +164,22 @@ class TriageTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, artifact_kind(artifact))
+
+    def test_triage_lists_questions_and_missing_parsers(self):
+        artifact = zipped("macos-001.bin", "doc.pdf")
+        questions = [
+            {"id": "a", "question": "Determine pdf.header_version for doc.pdf.", "artifact": "e.zip -> doc.pdf",
+             "answer_format": {"kind": "pattern"}},
+            {"id": "b", "question": "Determine macho.uuid for macos-001.bin.", "artifact": "e.zip -> macos-001.bin"},
+            {"id": "c", "question": "Recover the exact synthetic campaign identifier."},
+            {"id": "d", "question": "Recover the exact synthetic campaign identifier."},
+        ]
+        report = render_triage(artifact, unwrap(artifact).members, questions=questions)
+        self.assertIn("## Questions (4, 3 distinct)", report)
+        self.assertIn("2 x `c`", report)
+        self.assertIn("pdf.header_version for doc.pdf.\" **(parser exists)**", report)
+        self.assertIn("macho.uuid for macos-001.bin.\" **(NO PARSER", report)
+        self.assertIn('{\\"kind\\": \\"pattern\\"}', report)
 
     def test_binary_summary_includes_utf16_strings(self):
         artifact = b"\x00\xfe" + "http://wide.example/x".encode("utf-16-le") + b"\xff\x00plain-ascii\x00"

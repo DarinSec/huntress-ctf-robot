@@ -329,6 +329,18 @@ class FastPathTests(unittest.TestCase):
         self.assertNotIn(("start", True), client.calls)
         self.assertIn("Route: retry", self.output.getvalue())
 
+    def test_reserve_keeps_the_last_variants(self):
+        for remaining, raced in ((9, True), (8, False), (None, False)):
+            with self.subTest(remaining=remaining):
+                client = FakeClient(self.output)
+                client.status_response = {"answer_ids": ["a"], "result": "CORRECT"}
+                if remaining is not None:
+                    client.status_response["ranked_attempts_remaining"] = remaining
+                code = self.run_fast(client, reserve=8)
+                self.assertEqual(("retry", True) in client.calls, raced)
+                self.assertEqual(code, COMPLETE if raced else UNRESOLVED)
+        self.assertIn("kept in reserve", self.output.getvalue())
+
     def test_routes_that_must_not_start_a_timer(self):
         for status, expected, reason in (
             ({"result": "CORRECT", "status": "pending"}, PENDING, "pending"),

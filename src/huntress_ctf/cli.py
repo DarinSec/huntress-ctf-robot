@@ -69,6 +69,20 @@ def _day(value: str) -> int:
     return day
 
 
+def _days(value: str) -> list[int]:
+    """Days such as "1-20", "3" or "1,5,7-9", each from 1 to 31."""
+    days: list[int] = []
+    try:
+        for part in value.split(","):
+            first, _, last = part.strip().partition("-")
+            days.extend(range(int(first), int(last or first) + 1))
+    except ValueError:
+        raise argparse.ArgumentTypeError("days look like 1-20, 3 or 1,5,7-9") from None
+    if not days or not all(1 <= day <= 31 for day in days):
+        raise argparse.ArgumentTypeError("days must be from 1 to 31")
+    return sorted(set(days))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="huntress-ctf", description="Interact with the Huntress CTF 2026 Game Master.",
@@ -102,7 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
     learn = commands.add_parser("learn", help="Spend one variant: submit the robot's answers per question kind and show which kinds are accepted")
     learn.add_argument("challenge_id")
     daily = commands.add_parser("daily", help="Solve every available challenge untimed, or race the proven ones")
-    daily.add_argument("--day", type=_day)
+    daily_days = daily.add_mutually_exclusive_group()
+    daily_days.add_argument("--day", type=_day)
+    daily_days.add_argument("--days", type=_days, help="Several days, e.g. 1-20 (Hall of Fame re-races)")
     daily.add_argument("--lane")
     daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
     daily.add_argument("--rerace", action="store_true", help="With --timed: also race routes that were raced before (spends variants)")
@@ -147,6 +163,7 @@ def _race_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--repeat", type=_count, default=1, help="With --timed: race this many fresh variants; Hall of Fame keeps the best (1-100)")
     command.add_argument("--gate-ms", type=_positive_timeout, help="With --timed: start only once status answers within this many ms (median of 3)")
     command.add_argument("--gate-wait", type=_positive_timeout, default=600, help="Seconds to wait for the gate before skipping without spending a variant")
+    command.add_argument("--reserve", type=int, default=0, metavar="N", help="With --timed: never spend a route's last N fresh timed variants")
 ROUTE_NAMES = {DEFAULT_BASE_URL: "direct", PROXY_BASE_URL: "homebase-proxy"}
 
 
@@ -240,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
                 code = run_fast(
                     client, args.challenge_id, timed=args.timed, capture_dir=capture,
                     pipeline=not args.no_pipeline, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
-                    report=report,
+                    report=report, reserve=args.reserve,
                 )
                 on_clock.append((report.get("server_clock_ms") or {}).get("from"))
                 if code != COMPLETE:
@@ -259,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_dir=CAPTURE_DIR if args.capture else None, pipeline=not args.no_pipeline,
                 repeat=args.repeat, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
                 rerace=args.rerace, wait_release=args.wait_release, workers=args.workers,
+                days=args.days, reserve=args.reserve,
             )
         elif args.command == "bench":
             print_result(_bench(client, args, token), secrets)

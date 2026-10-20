@@ -169,7 +169,27 @@ Never read, print, or copy that file.
 .\scripts\huntress.ps1 daily --timed                       # only on request; proven only
 ```
 
-On the Homebase that plays, `scripts/homebase-day.sh` (cron; install steps in its header)
-runs `daily` untimed at the release and then races the proven routes.
+On the Homebase that plays, `scripts/homebase-day.sh` (cron every minute; install steps in
+its header) runs `daily` untimed from the release and then races the proven routes; it
+sweeps again within a minute whenever `~/src` or hints.json changes.
+`scripts/homebase-hof.sh` (cron 00:30 and 03:30 UTC) re-races every proven Warmups and
+Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
+
+## Release day: a new question type
+
+The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
+one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
+last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
+
+1. `scripts/homebase.sh log`: which routes are `unresolved`.
+2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format and
+   marks a `Determine <property>` without a parser.
+3. Add the parser to `PROPERTIES` in `solvers/metadata.py` (or a layer in `decoders.py`)
+   with a synthetic test; run the tests.
+4. `scripts/homebase.sh deploy` (tests on the VM, then swaps `~/src`), then
+   `scripts/homebase.sh sweep`: Single Solve, Time Trial and Mastery score untimed, then
+   race once.
+5. `scripts/homebase.sh times`: minutes after the release per route; the last flag of the
+   day is the team's finish.
 
 Tests must pass temp paths for `work_dir` and `hints_path` so nothing lands in the repo.

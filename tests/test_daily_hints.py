@@ -123,7 +123,10 @@ class DayClient:
         self.lists.append((day, lane))
         if len(self.lists) <= self.released_after:
             return {"challenges": []}
-        return {"challenges": [c for c in DAY["challenges"] if lane is None or c["lane"] == lane]}
+        return {"challenges": [
+            c for c in DAY["challenges"]
+            if (lane is None or c["lane"] == lane) and (day is None or f"-day-{day:02d}" in c["id"])
+        ]}
 
     def clone(self):
         self.clones += 1
@@ -194,6 +197,15 @@ class ReleaseDayTests(unittest.TestCase):
         # A later CORRECT keeps the race record.
         record_hint("warmups-day-21/time_trial", [AnswerCandidate("a", "x", "t", "e")], self.hints)
         self.assertEqual(get_hint("warmups-day-21/time_trial", self.hints)["races"], 2)
+
+    def test_several_days_race_their_proven_routes_with_a_reserve(self):
+        record_hint("warmups-day-21/time_trial", [AnswerCandidate("a", "x", "s", "e")], self.hints)
+        client = DayClient()
+        with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
+            self.run_daily(client, days=[19, 20, 21], lane="warmups", timed=True, reserve=8)
+        self.assertEqual(client.lists, [(19, "warmups"), (20, "warmups"), (21, "warmups")])
+        self.assertEqual([call.args[1] for call in fast.call_args_list], ["warmups-day-21/time_trial"])
+        self.assertEqual(fast.call_args_list[0].kwargs["reserve"], 8)
 
     def test_waiting_for_the_release_polls_one_lane(self):
         client = DayClient(released_after=3)
