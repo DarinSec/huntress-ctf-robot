@@ -242,6 +242,17 @@ class FastPathTests(unittest.TestCase):
         self.assertFalse([call for call in client.calls if call[0] == "submit_many"])
         self.assertIn("clock keeps running", self.output.getvalue())
 
+    def test_questions_are_printed_once(self):
+        client = FakeClient(self.output)
+        questions = [{"id": "a", "question": "Decode the Base64 text, question %d." % n} for n in range(3)]
+        client.assignment["questions"] = questions
+        client.status_response = {"attempt": {**client.assignment, "result": "CORRECT"}}
+        client.status_response["attempt"].pop("deadline")
+        self.run_fast(client)
+        output = self.output.getvalue()
+        self.assertEqual(output.count("question 2."), 1)
+        self.assertIn("[3 questions, as in the assignment]", output)
+
     def test_web_targets_are_reported_without_a_download(self):
         client = self.pipelining_client()
         client.assignment = {

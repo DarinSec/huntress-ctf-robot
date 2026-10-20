@@ -105,10 +105,17 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
    proxyn och om HTTP Range går att dela upp på flera anslutningar. Ta reda på om
    servern kompenserar (`ranked_reference_bytes_per_second` = 1 MiB/s,
    `ranked_transfer_allowance_ms` 600 för TT och 3 000 för Mastery).
+   **Mätt 21 okt 00:20 (Homebase → proxyn, Binary dag 20):** Range stöds inte (svaret
+   är 200 med hela filen), så uppdelad hämtning går inte. Utanför rusningen tog filen
+   3,0–3,6 s (~9 MB/s), mot 8,4 s vid släppet. Datan går inte att komprimera (gzip ger
+   samma storlek och 4,8 s), och roboten skickar redan `Accept-Encoding: identity`.
+   Kvar att ta reda på: om servern kompenserar för storleken.
 10. **Kortare utskrift.** Loggen blev 2,2 MB eftersom uppgiften skrivs ut två gånger
     (16 000 rader för Script). Skriv ut den en gång och sammanfatta när frågorna är fler
     än ~50. Hela listan finns redan i `work/<id>/assignment.json`, så kravet på full
     insyn i `AGENTS.md` uppfylls ändå.
+    **Klart:** frågelistan skrivs ut en gång, med uppdraget; status före och efter
+    hänvisar till den.
 
 ### P2: när P0 och P1 är klara
 

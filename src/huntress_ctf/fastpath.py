@@ -419,6 +419,33 @@ def _server_clock(run: Run) -> dict[str, float] | None:
     return clock
 
 
+def _without_repeats(value: Any, printed: set[str]) -> Any:
+    """`value` with every question list already printed replaced by a short note.
+
+    A Script Analysis Mastery holds up to 6,245 questions; printing them with the
+    assignment and again with the status made a 2.2 MB log (20 Oct 2026).
+    """
+    if isinstance(value, dict):
+        return {
+            key: f"[{len(item)} questions, as in the assignment]"
+            if key == "questions" and isinstance(item, list) and json.dumps(item, sort_keys=True) in printed
+            else _without_repeats(item, printed)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_without_repeats(item, printed) for item in value]
+    return value
+
+
+def _question_lists(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        found = {json.dumps(value["questions"], sort_keys=True)} if isinstance(value.get("questions"), list) else set()
+        return found.union(*(_question_lists(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_question_lists(item) for item in value))
+    return set()
+
+
 def _report(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
     before: Any, run: Run, hint: dict[str, Any] | None, artifact_dir: Path,
@@ -426,9 +453,10 @@ def _report(
 ) -> None:
     print("Challenge:")
     print_result(challenge, secrets)
+    printed = _question_lists(run.attempt)
     if before is not None:
         print("Status before start:")
-        print_result(before, secrets)
+        print_result(_without_repeats(before, printed), secrets)
     if not run.timed:
         print("Route: start (untimed request; reconnects to the current attempt)")
     else:
@@ -492,7 +520,7 @@ def _report(
         try:
             responses["after"] = current = client.status(challenge_id)
             print("Current status:")
-            print_result(current, secrets)
+            print_result(_without_repeats(current, printed), secrets)
         except GameMasterError as exc:
             print(f"Status after the run is unavailable: {exc}")
     print_result({"timings_ms": _timings(run)})
