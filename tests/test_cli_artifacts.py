@@ -39,6 +39,16 @@ class CliTests(unittest.TestCase):
         self.assertIn("Unpacked members", stdout.getvalue())
         self.assertIn("notes.txt", stdout.getvalue())
 
+    def test_suggest_is_offline_and_names_the_field(self):
+        from test_formats import macho_with_commands
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "macos-001.bin"
+            path.write_bytes(macho_with_commands())
+            with patch("huntress_ctf.cli.GameMasterClient") as client, redirect_stdout(StringIO()) as stdout:
+                self.assertEqual(main(["suggest", "macho.uuid", str(path)]), 0)
+            client.assert_not_called()
+        self.assertIn("uuid = '385DB3EB-80F9-2D37-68A1-01BF9A83EA22'", stdout.getvalue())
+
     def test_triage_time_reports_solver_costs_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sample.txt"

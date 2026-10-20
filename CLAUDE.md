@@ -187,10 +187,15 @@ one most days, Warmups now and then) is the team's slowest flag: Metadata Master
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
 
 1. `scripts/homebase.sh log`: which routes are `unresolved`.
-2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format and
-   marks a `Determine <property>` without a parser.
-3. Add the parser to `PROPERTIES` in `solvers/metadata.py` (or a layer in `decoders.py`)
-   with a synthetic test; run the tests.
+2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format,
+   marks a `Determine <property>` without a parser and, under it, suggests the matching
+   field and a candidate answer in the suffix convention (`_u16_hex` -> `0x%04x`, `_set`
+   -> sorted JSON). "## Format fields" lists every header field of each executable
+   (`formats.py`: Mach-O load commands, ELF, PE, WebAssembly, Java class, DEX).
+   Offline on any file: `python -m huntress_ctf suggest <property> <file>`.
+3. Add the parser to `PROPERTIES` in `solvers/metadata.py`, usually one line on top of
+   `formats.py` (e.g. `formats.macho_fields(data)["uuid"]`, `formats.elf(data)`), or a layer in
+   `decoders.py`, with a synthetic test; run the tests.
 4. `scripts/homebase.sh deploy` (tests on the VM, then swaps `~/src`), then
    `scripts/homebase.sh sweep`: Single Solve, Time Trial and Mastery score untimed, then
    race once.

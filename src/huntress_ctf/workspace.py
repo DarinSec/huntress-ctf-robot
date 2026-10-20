@@ -18,13 +18,16 @@ from .containers import Member
 from .decoders import peel
 from .display import safe_value
 from .evidence import collect
+from .formats import describe as format_fields
 from .macho import describe, field, slices
 from .solvers.metadata import PROPERTIES
 from .state import current_fields
+from .suggest import suggest
 
 MAX_BLOB_CHARS = 2000
 MAX_VALUES = 25
 MAX_QUESTION_GROUPS = 60
+MAX_FORMAT_IMAGES = 12
 _PROPERTY = re.compile(r"Determine ([a-z0-9_.]+) for ")
 
 
@@ -46,6 +49,9 @@ def _question_section(questions: list[dict[str, Any]], members: tuple[Member, ..
     A Script Analysis day holds ~1,300 questions but only ~80 distinct texts.
     """
     kinds = {member.name.rsplit("/", 1)[-1]: artifact_kind(member.data) for member in members}
+    blobs: dict[str, bytes] = {}
+    for member in members:
+        blobs.setdefault(member.name.rsplit("/", 1)[-1], member.data)
     groups: dict[str, list[dict[str, Any]]] = {}
     for item in questions:
         groups.setdefault(str(item.get("question", "")), []).append(item)
@@ -60,8 +66,33 @@ def _question_section(questions: list[dict[str, Any]], members: tuple[Member, ..
         lines.append(f"  - format: {_quoted(json.dumps(first.get('answer_format'), ensure_ascii=True), 300)}")
         if target:
             lines.append(f"  - file: {_quoted(target, 200)}" + (f" ({kinds[member]})" if member in kinds else ""))
+        if prop and prop[1] not in PROPERTIES and member in blobs:
+            lines += [f"  - suggestion: {line}" for line in suggest(prop[1], blobs[member])] or [
+                "  - suggestion: no field of a known format matches; see the format fields below"]
     if len(groups) > MAX_QUESTION_GROUPS:
         lines.append(f"- ... {len(groups) - MAX_QUESTION_GROUPS} more distinct questions in assignment.json")
+    return lines
+
+
+def _shown(value: Any) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value} (0x{value:x})"
+    text = json.dumps(value[:MAX_VALUES] if isinstance(value, list) else value, ensure_ascii=True)
+    return text[:400] + ("..." if len(text) > 400 else "")
+
+
+def _format_section(artifact: bytes, members: tuple[Member, ...]) -> list[str]:
+    """Every header field of each executable (formats.py): the likely next property's value."""
+    found = [(name, label, fields) for name, data in (("artifact", artifact), *(
+        (member.name, member.data) for member in members)) for label, fields in format_fields(data)]
+    if not found:
+        return []
+    lines = ["", f"## Format fields ({len(found)} images)", ""]
+    for name, label, fields in found[:MAX_FORMAT_IMAGES]:
+        lines.append(f"- {_quoted(name, 120)} ({label}): " + "; ".join(
+            f"{key}={_shown(value)}" for key, value in fields.items()))
+    if len(found) > MAX_FORMAT_IMAGES:
+        lines.append(f"- ... {len(found) - MAX_FORMAT_IMAGES} more images")
     return lines
 
 
@@ -86,6 +117,7 @@ def render_triage(
             lines.append(
                 f"| {index} | {_quoted(member.name, 120)} | {len(member.data)} | {artifact_kind(member.data)} |"
             )
+    lines += _format_section(artifact, members)
     binaries = [(name, images) for name, data in (("artifact", artifact), *(
         (member.name, member.data) for member in members)) if (images := slices(data))]
     if binaries:

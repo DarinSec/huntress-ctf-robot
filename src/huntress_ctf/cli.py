@@ -14,7 +14,7 @@ from .artifacts import save_artifact
 from .autopilot import COMPLETE, EXPIRED, INCORRECT, PENDING, UNRESOLVED
 from .client import DEFAULT_BASE_URL, PROXY_BASE_URL, GameMasterClient, GameMasterError
 from .config import load_env
-from .containers import DEFAULT_PASSWORDS, unwrap
+from .containers import DEFAULT_PASSWORDS, Member, unwrap
 from .daily import run_daily
 from .display import print_result, safe_value
 from .diagnostics import compare_routes, probe_pipelining, run_bench, run_diagnostics
@@ -22,6 +22,7 @@ from .fastpath import run_fast, solver_timings
 from .learn import run_learn
 from .lock import robot_lock
 from .state import AttemptState
+from .suggest import suggest
 from .workspace import render_triage
 
 CAPTURE_DIR = Path("integration-data")
@@ -133,6 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
     triage.add_argument("--password", action="append", default=[], help="Archive password to try (repeatable)")
     triage.add_argument("--time", action="store_true", help="Instead, time unpacking and every solver on the file (median ms, cold caches)")
     triage.add_argument("--question", default="", help="With --time: the question text the solvers see")
+    hint = commands.add_parser("suggest", help="Offline: candidate fields and answers for a property without a parser")
+    hint.add_argument("property", help='e.g. macho.uuid (from "Determine macho.uuid for x.bin")')
+    hint.add_argument("path", type=Path, help="The file, or an archive whose members are checked")
     status = commands.add_parser("status", help="Read current attempt status")
     status.add_argument("challenge_id")
     artifact = commands.add_parser("artifact", help="Save the current assigned artifact with SHA-256")
@@ -226,6 +230,21 @@ def main(argv: list[str] | None = None) -> int:
             return COMPLETE
         unwrapped = unwrap(data, tuple(dict.fromkeys([*args.password, *DEFAULT_PASSWORDS])))
         print(render_triage(data, unwrapped.members, unwrapped.notes, title=args.path.name), end="")
+        return COMPLETE
+    if args.command == "suggest":
+        # Offline, like triage: the AI's first look at a new Metadata property.
+        try:
+            data = args.path.read_bytes()
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        found = False
+        for member in (*unwrap(data).members, Member(args.path.name, data)):
+            for line in suggest(args.property, member.data):
+                print(f"{member.name}: {line}")
+                found = True
+        if not found:
+            print("No field of a known format matches; run `triage` for every field.")
         return COMPLETE
     token = None
     held = ExitStack()
