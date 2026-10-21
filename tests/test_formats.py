@@ -130,7 +130,7 @@ class SuggestTests(unittest.TestCase):
                     "artifact": "evidence.zip -> macos-001.bin"}
         report = render_triage(artifact, unwrap(artifact).members, questions=[question])
         self.assertIn("suggestion: macho: uuid = '385DB3EB", report)
-        self.assertIn("## Format fields (1 images)", report)
+        self.assertIn("## Format fields (2 images)", report)  # The ZIP itself, then the Mach-O.
         self.assertIn('min_os="14.1.0"', report)
 
 
@@ -261,3 +261,42 @@ class OtherFormatTests(unittest.TestCase):
         with gzip.GzipFile(filename="report.txt", mode="wb", fileobj=buffer, mtime=0) as stream:
             stream.write(b"x")
         self.assertIn("'report.txt'", suggest("gzip.original_name", buffer.getvalue())[0])
+
+
+class DocumentFormatTests(unittest.TestCase):
+    def fields(self, data, label):
+        found = dict(describe(data))
+        self.assertIn(label, found)
+        self.assertNotIn("damaged", found[label])
+        return found[label]
+
+    def test_png_jpeg_pdf(self):
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 7, 5, 8, 6, 0, 0, 0))
+               + chunk(b"tIME", struct.pack(">HBBBBB", 2026, 10, 21, 9, 0, 1)) + chunk(b"tEXt", b"Author\0Jane")
+               + chunk(b"IDAT", b"x") + chunk(b"IEND", b""))
+        fields = self.fields(png, "png")
+        self.assertEqual((fields["dimensions"], fields["bit_depth"], fields["color_type_name"]), ("7x5", 8, "truecolor_alpha"))
+        self.assertEqual((fields["last_modified"], fields["author"], fields["trailing_bytes"]), ("2026-10-21 09:00:01", "Jane", 0))
+        sof = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 4, 6, 3) + b"\0" * 3
+        jfif = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0\x01\x02\x01" + struct.pack(">HH", 72, 72) + b"\0\0"
+        fields = self.fields(b"\xff\xd8" + jfif + sof + b"\xff\xd9", "jpeg")
+        self.assertEqual((fields["dimensions"], fields["jfif_version"], fields["components"]), ("6x4", "1.02", 3))
+        pdf = b"%PDF-1.7\n1 0 obj << /Type /Pages /Count 2 >> endobj\n2 0 obj << /Type /Page >> endobj\n3 0 obj << /Type /Page >> endobj\n%%EOF"
+        fields = self.fields(pdf, "pdf")
+        self.assertEqual((fields["version"], fields["page_count"], fields["object_count"]), ("1.7", 2, 3))
+
+    def test_zip_aliases_and_email(self):
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.txt", "x")
+            archive.writestr("b/c.txt", "y")
+            archive.comment = b"evidence"
+        fields = self.fields(buffer.getvalue(), "zip")
+        self.assertEqual((fields["total_entries"], fields["member_names"], fields["comment"]), (2, ["a.txt", "b/c.txt"], "evidence"))
+        self.assertIn("'[\"a.txt\",\"b/c.txt\"]'", suggest("zip.central_directory_member_names", buffer.getvalue())[0])
+        mail = (b"From: Ops <ops@example.test>\r\nTo: you@example.test\r\nSubject: Invoice\r\n"
+                b"Message-ID: <abc@example.test>\r\nX-Mailer: Synthetic 1.0\r\n\r\nbody\r\n")
+        fields = self.fields(mail, "email")
+        self.assertEqual((fields["message_id"], fields["x_mailer"], fields["subject"]), ("<abc@example.test>", "Synthetic 1.0", "Invoice"))

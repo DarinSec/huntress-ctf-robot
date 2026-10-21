@@ -33,7 +33,10 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "dex": "dex", "android": "dex", "gzip": "gzip", "gz": "gzip", "tar": "tar",
                "sqlite": "sqlite", "pcap": "pcap", "pcapng": "pcapng", "gif": "gif", "bmp": "bmp",
                "ico": "ico", "icon": "ico", "7z": "sevenzip", "sevenzip": "sevenzip", "rar": "rar",
-               "iso": "iso", "iso9660": "iso"}
+               "iso": "iso", "iso9660": "iso", "png": "png", "jpeg": "jpeg", "jpg": "jpeg",
+               "exif": "jpeg", "pdf": "pdf", "zip": "zip", "ooxml": "ooxml", "docx": "ooxml",
+               "xlsx": "ooxml", "pptx": "ooxml", "office": "ooxml", "email": "email", "eml": "email",
+               "mail": "email"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 
 
@@ -75,7 +78,7 @@ def ranked(prop: str, data: bytes) -> list[tuple[int, str, str, Any]]:
         if label_kind and not label.startswith(label_kind):
             continue
         for key, value in fields.items():
-            joined = key.replace("_", "")
+            joined = key.replace("_", "").lower()
             score = (len(wanted & _words(key)) + (2 if key in (name, _bare(name)) else 0)
                      # "cputype" is one word in the header but "cpu_type" in a property.
                      + (1 if len(joined) > 3 and joined in _bare(name).replace("_", "") else 0))

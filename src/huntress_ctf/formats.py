@@ -13,8 +13,13 @@ damage plus a "damaged" note; nothing here raises on untrusted bytes or executes
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import email
+import email.policy
 import hashlib
+from io import BytesIO
+import re
 import struct
+import zipfile
 from typing import Any, Callable
 
 from . import macho
@@ -525,6 +530,132 @@ def other_formats(data: bytes) -> list[tuple[str, dict]]:
     return found
 
 
+# --- Documents and images the Metadata lane asks about ------------------------------------
+
+PNG_COLOR_TYPES = {0: "grayscale", 2: "truecolor", 3: "indexed", 4: "grayscale_alpha", 6: "truecolor_alpha"}
+
+
+def _snake(name: str) -> str:
+    """"DateTimeOriginal" -> "date_time_original"; "dc:creator" -> "dc_creator"."""
+    name = re.sub(r"[^A-Za-z0-9]+", "_", name)
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).strip("_").lower()
+
+
+def _evidence_fields(data: bytes, prefixes: tuple[str, ...]) -> dict:
+    from .evidence import metadata  # evidence.py parses EXIF, PNG text, PDF Info, XMP, docProps.
+
+    fields: dict = {}
+    for key, values in metadata(data).items():
+        prefix, _, name = key.partition(":")
+        if prefix in prefixes and name and not name.startswith("modified:"):
+            field = _snake(name) if prefix not in ("XMP", "GPS") else f"{prefix.lower()}_{_snake(name)}"
+            fields.setdefault(field, values[0] if len(values) == 1 else values)
+    return fields
+
+
+def _png(data: bytes, f: dict) -> None:
+    chunks, at, idat = [], 8, 0
+    while at + 8 <= len(data) and len(chunks) < 10_000:
+        length, kind = struct.unpack_from(">I4s", data, at)
+        body = data[at + 8:at + 8 + length]
+        name = kind.decode("latin-1")
+        chunks.append(name)
+        if name == "IHDR":
+            width, height, depth, color, compression, filtering, interlace = struct.unpack_from(">IIBBBBB", body)
+            f.update(width=width, height=height, dimensions=f"{width}x{height}", bit_depth=depth, color_type=color,
+                     color_type_name=PNG_COLOR_TYPES.get(color, "unknown"), compression_method=compression,
+                     filter_method=filtering, interlace_method=interlace)
+        elif name == "tIME":
+            year, month, day, hour, minute, second = struct.unpack_from(">HBBBBB", body)
+            f["last_modified"] = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+        elif name == "pHYs":
+            f["pixels_per_unit_x"], f["pixels_per_unit_y"], f["unit"] = struct.unpack_from(">IIB", body)
+        elif name == "gAMA":
+            f["gamma"] = struct.unpack_from(">I", body)[0]
+        elif name == "iCCP":
+            f["icc_profile_name"] = _cstring(body, 0)
+        elif name == "IDAT":
+            idat += 1
+        at += 12 + length
+        if name == "IEND":
+            f["trailing_bytes"] = len(data) - at
+            break
+    f.update(chunks=chunks, chunk_count=len(chunks), idat_count=idat, **_evidence_fields(data, ("PNG", "XMP")))
+
+
+def _jpeg(data: bytes, f: dict) -> None:
+    markers, at = [], 2
+    while at + 4 <= len(data) and len(markers) < 10_000:
+        if data[at] != 0xFF:
+            break
+        marker = data[at + 1]
+        if marker in (0xD9, 0xDA):  # End of image, or start of scan: the header part is done.
+            markers.append(f"FF{marker:02X}")
+            break
+        length = struct.unpack_from(">H", data, at + 2)[0]
+        body = data[at + 4:at + 2 + length]
+        markers.append(f"FF{marker:02X}")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            precision, height, width, components = struct.unpack_from(">BHHB", body)
+            f.update(sof_marker=f"FF{marker:02X}", precision=precision, width=width, height=height,
+                     dimensions=f"{width}x{height}", components=components, progressive=marker == 0xC2)
+        elif marker == 0xE0 and body.startswith(b"JFIF\0"):
+            f.update(jfif_version=f"{body[5]}.{body[6]:02d}", density_unit=body[7],
+                     density_x=struct.unpack_from(">H", body, 8)[0], density_y=struct.unpack_from(">H", body, 10)[0])
+        at += 2 + length
+    f.update(markers=markers, **_evidence_fields(data, ("EXIF", "GPS", "JPEG", "XMP")))
+
+
+def _pdf(data: bytes, f: dict) -> None:
+    header = re.match(rb"%PDF-(\d+\.\d+)", data)
+    f.update(version=header[1].decode() if header else None,
+             page_count=len(re.findall(rb"/Type\s*/Page(?![a-zA-Z])", data)),
+             object_count=len(re.findall(rb"\d+\s+\d+\s+obj\b", data)),
+             encrypted=b"/Encrypt" in data, linearized=b"/Linearized" in data[:2048],
+             eof_markers=data.count(b"%%EOF"), **_evidence_fields(data, ("PDF", "XMP")))
+
+
+def _zip(data: bytes, f: dict) -> None:
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        # Also under the words the Metadata lane uses (zip.eocd_total_entries, ..._member_names).
+        f.update(entry_count=len(infos), total_entries=len(infos), names=names, member_names=names,
+                 comment=archive.comment.decode("utf-8", "replace"),
+                 compression_methods=sorted({info.compress_type for info in infos}),
+                 encrypted_entries=sum(1 for info in infos if info.flag_bits & 1),
+                 total_uncompressed=sum(info.file_size for info in infos))
+
+
+def _email(data: bytes, f: dict) -> None:
+    message = email.message_from_bytes(data, policy=email.policy.default)
+    for header in ("from", "to", "cc", "subject", "date", "message-id", "x-mailer", "user-agent",
+                   "return-path", "reply-to", "x-originating-ip", "in-reply-to"):
+        if message[header] is not None:
+            f[_snake(header)] = str(message[header])
+    f.update(received_count=len(message.get_all("received") or []), content_type=message.get_content_type(),
+             attachments=[part.get_filename() for part in message.walk() if part.get_filename()])
+
+
+def document_formats(data: bytes) -> list[tuple[str, dict]]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return [("png", _guarded(_png, data))]
+    if data.startswith(b"\xff\xd8\xff"):
+        return [("jpeg", _guarded(_jpeg, data))]
+    if data.startswith(b"%PDF-"):
+        return [("pdf", _guarded(_pdf, data))]
+    if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
+        found = [("zip", _guarded(_zip, data))]
+        office = _evidence_fields(data, ("Office", "Office:app", "Office:custom"))
+        if office:
+            found.append(("ooxml", office))
+        return found
+    head = data[:4096]
+    if re.search(rb"(?im)^from:", head) and re.search(rb"(?im)^(subject|message-id|received):", head):
+        return [("email", _guarded(_email, data))]
+    return []
+
+
 def macho_fields(data: bytes) -> dict | None:
     """Fields of the first thin Mach-O image (a fat file's first slice), like elf() and pe()."""
     image = next(macho.images(data), None)
@@ -542,4 +673,4 @@ def describe(data: bytes) -> list[tuple[str, dict]]:
         fields = parse(data)
         if fields is not None:
             return [(label, fields)]
-    return other_formats(data)
+    return other_formats(data) + document_formats(data)
