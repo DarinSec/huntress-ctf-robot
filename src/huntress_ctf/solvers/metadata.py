@@ -31,6 +31,7 @@ from xml.etree import ElementTree
 import zipfile
 import zlib
 
+from .. import formats
 from ..macho import field as macho_field, slices as macho_slices
 from ..state import deliveries
 from .base import AnswerCandidate, Question, SolveContext, fits_format, question_items
@@ -596,6 +597,14 @@ def elf_e_machine_u16_hex(data: bytes) -> str:
     return f"0x{struct.unpack_from(order + 'H', data, 18)[0]:04x}"  # Convention: four digits.
 
 
+def apk_package_name(data: bytes) -> str | None:
+    """The manifest's package attribute (Day 21), from AndroidManifest.xml's binary XML."""
+    fields = formats.apk(data)
+    if fields is None or "damaged" in fields:
+        return None
+    return fields["package_name"]
+
+
 def macho_cpu_type_set(data: bytes) -> str | None:
     # Each slice's own header, not the fat table; unique and ascending (order unconfirmed).
     return macho_field("cpu_type_set", macho_slices(data))
@@ -620,6 +629,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "media.primary_video_dimensions": media_primary_video_dimensions,
     "elf.e_machine_u16_hex": elf_e_machine_u16_hex,
     "macho.cpu_type_set": macho_cpu_type_set,
+    "apk.package_name": apk_package_name,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [

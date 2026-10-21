@@ -30,7 +30,7 @@ _SUFFIXES = (
 )
 _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm": "wasm",
                "webassembly": "wasm", "java": "java_class", "class": "java_class", "jar": "java_class",
-               "dex": "dex", "android": "dex", "gzip": "gzip", "gz": "gzip", "tar": "tar",
+               "dex": "dex", "apk": "apk", "android": "apk", "gzip": "gzip", "gz": "gzip", "tar": "tar",
                "sqlite": "sqlite", "pcap": "pcap", "pcapng": "pcapng", "gif": "gif", "bmp": "bmp",
                "ico": "ico", "icon": "ico", "7z": "sevenzip", "sevenzip": "sevenzip", "rar": "rar",
                "iso": "iso", "iso9660": "iso", "png": "png", "jpeg": "jpeg", "jpg": "jpeg",

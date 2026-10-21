@@ -710,6 +710,114 @@ def _text(data: bytes, f: dict) -> None:
              trailing_newline=text.endswith(("\n", "\r")))
 
 
+# Android attribute resource IDs, for manifests whose attribute name strings are empty.
+ANDROID_ATTRIBUTES = {
+    0x01010003: "name", 0x01010001: "label", 0x0101021B: "versionCode", 0x0101021C: "versionName",
+    0x0101020C: "minSdkVersion", 0x01010270: "targetSdkVersion", 0x01010271: "maxSdkVersion",
+    0x01010572: "compileSdkVersion", 0x01010573: "compileSdkVersionCodename",
+}
+
+
+def _axml_strings(data: bytes, at: int) -> list[str]:
+    count, _, flags, strings_start = struct.unpack_from("<IIII", data, at + 8)
+    utf8 = bool(flags & 0x100)
+    offsets = struct.unpack_from(f"<{count}I", data, at + 28)
+    found = []
+    for offset in offsets:
+        position = at + strings_start + offset
+        if utf8:
+            position += 2 if data[position] & 0x80 else 1  # Length in characters.
+            length = data[position]
+            if length & 0x80:
+                length = ((length & 0x7F) << 8) | data[position + 1]
+                position += 1
+            found.append(data[position + 1:position + 1 + length].decode("utf-8", "replace"))
+        else:
+            length = struct.unpack_from("<H", data, position)[0]
+            if length & 0x8000:
+                length = ((length & 0x7FFF) << 16) | struct.unpack_from("<H", data, position + 2)[0]
+                position += 2
+            found.append(data[position + 2:position + 2 + 2 * length].decode("utf-16-le", "replace"))
+    return found
+
+
+def axml(data: bytes) -> list[tuple[str, dict[str, str]]]:
+    """Elements of Android binary XML (AndroidManifest.xml) as (tag, {attribute: value})."""
+    if data[:2] != b"\x03\x00":
+        raise ValueError("not Android binary XML")
+    strings: list[str] = []
+    resource_ids: list[int] = []
+    elements = []
+    at = struct.unpack_from("<H", data, 2)[0]
+    while at + 8 <= len(data):
+        kind, header, size = struct.unpack_from("<HHI", data, at)
+        if size < 8:
+            break
+        if kind == 0x0001:
+            strings = _axml_strings(data, at)
+        elif kind == 0x0180:
+            resource_ids = list(struct.unpack_from(f"<{(size - header) // 4}I", data, at + header))
+        elif kind == 0x0102:
+            name_index, attribute_start, attribute_size, count = struct.unpack_from("<4xIHHH", data, at + 16)
+            tag = strings[name_index] if name_index < len(strings) else ""
+            attributes = {}
+            for index in range(count):
+                base = at + 16 + attribute_start + index * attribute_size
+                _, name, raw, _, data_type, value = struct.unpack_from("<IIIHxBI", data, base)
+                key = strings[name] if name < len(strings) else ""
+                if not key and name < len(resource_ids):
+                    key = ANDROID_ATTRIBUTES.get(resource_ids[name], f"0x{resource_ids[name]:08x}")
+                if raw != 0xFFFFFFFF and raw < len(strings):
+                    text = strings[raw]
+                elif data_type == 0x03 and value < len(strings):
+                    text = strings[value]
+                elif data_type == 0x12:
+                    text = "true" if value else "false"
+                elif data_type == 0x11:
+                    text = f"0x{value:x}"
+                elif data_type == 0x01:
+                    text = f"@0x{value:08x}"
+                else:
+                    text = str(value)
+                attributes[key] = text
+            elements.append((tag, attributes))
+        at += size
+    return elements
+
+
+def _apk(data: bytes, f: dict) -> None:
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        names = archive.namelist()
+        manifest = archive.read("AndroidManifest.xml")
+    elements = axml(manifest)
+    root = next((attributes for tag, attributes in elements if tag == "manifest"), {})
+    sdk = next((attributes for tag, attributes in elements if tag == "uses-sdk"), {})
+    application = next((attributes for tag, attributes in elements if tag == "application"), {})
+    f.update(package_name=root.get("package", "none"), version_code=root.get("versionCode"),
+             version_name=root.get("versionName"), compile_sdk_version=root.get("compileSdkVersion"),
+             platform_build_version_name=root.get("platformBuildVersionName"),
+             min_sdk_version=sdk.get("minSdkVersion"), target_sdk_version=sdk.get("targetSdkVersion"),
+             application_label=application.get("label"), application_name=application.get("name"),
+             permissions=[a.get("name") for tag, a in elements if tag == "uses-permission"],
+             activities=[a.get("name") for tag, a in elements if tag == "activity"],
+             services=[a.get("name") for tag, a in elements if tag == "service"],
+             receivers=[a.get("name") for tag, a in elements if tag == "receiver"],
+             dex_files=[name for name in names if name.endswith(".dex")],
+             signature_files=[name for name in names if name.startswith("META-INF/")])
+
+
+def apk(data: bytes) -> dict | None:
+    if not data.startswith(b"PK"):
+        return None
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            if "AndroidManifest.xml" not in archive.namelist():
+                return None
+    except (zipfile.BadZipFile, ValueError):
+        return None
+    return _guarded(_apk, data)
+
+
 def document_formats(data: bytes) -> list[tuple[str, dict]]:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return [("png", _guarded(_png, data))]
@@ -718,7 +826,9 @@ def document_formats(data: bytes) -> list[tuple[str, dict]]:
     if data.startswith(b"%PDF-"):
         return [("pdf", _guarded(_pdf, data))]
     if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
-        found = [("zip", _guarded(_zip, data))]
+        android = apk(data)
+        found = [("apk", android)] if android is not None else []
+        found.append(("zip", _guarded(_zip, data)))
         office = _evidence_fields(data, ("Office", "Office:app", "Office:custom"))
         if office:
             found.append(("ooxml", office))

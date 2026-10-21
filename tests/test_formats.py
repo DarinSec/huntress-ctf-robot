@@ -316,3 +316,47 @@ class MediaShortcutTextTests(unittest.TestCase):
         fields = dict(describe(b"\xef\xbb\xbfa,b\r\nc,d\r\n"))["text"]
         self.assertEqual((fields["utf8_bom_present"], fields["line_count"], fields["line_ending"]), (True, 2, "crlf"))
         self.assertIn("'true'", suggest("text.utf8_bom_present", b"\xef\xbb\xbfhello")[0])
+
+
+def tiny_axml(package="com.example.robot", min_sdk=23):
+    """Android binary XML with <manifest package=...><uses-sdk minSdkVersion=.../>."""
+    strings = ["manifest", "package", package, "uses-sdk", "minSdkVersion", "", "label"]
+    encoded = [struct.pack("<H", len(text)) + text.encode("utf-16-le") + b"\0\0" for text in strings]
+    offsets, position = [], 0
+    for item in encoded:
+        offsets.append(position)
+        position += len(item)
+    body = b"".join(encoded)
+    body += b"\0" * (-len(body) % 4)
+    header_size = 28
+    pool = struct.pack("<HHIIIIII", 1, header_size, header_size + 4 * len(strings) + len(body),
+                       len(strings), 0, 0, header_size + 4 * len(strings), 0) + struct.pack(f"<{len(strings)}I", *offsets) + body
+    resources = struct.pack("<HHI", 0x0180, 8, 8 + 4 * 7) + struct.pack("<7I", 0, 0, 0, 0, 0, 0, 0x01010001)
+
+    def element(name, attributes):
+        attrs = b"".join(struct.pack("<IIIHxBI", 0xFFFFFFFF, key, raw, 8, kind, value) for key, raw, kind, value in attributes)
+        ext = struct.pack("<IIHHHHHH", 0xFFFFFFFF, name, 20, 20, len(attributes), 0, 0, 0)
+        return struct.pack("<HHIII", 0x0102, 16, 16 + len(ext) + len(attrs), 1, 0xFFFFFFFF) + ext + attrs
+    manifest = element(0, [(1, 2, 0x03, 2), (5, 6 - 6 + 0xFFFFFFFF, 0x10, 7)])  # Unnamed attr: resource id label.
+    uses_sdk = element(3, [(4, 0xFFFFFFFF, 0x10, min_sdk)])
+    chunks = pool + resources + manifest + uses_sdk
+    return struct.pack("<HHI", 3, 8, 8 + len(chunks)) + chunks
+
+
+class ApkTests(unittest.TestCase):
+    def apk(self, manifest):
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("AndroidManifest.xml", manifest)
+            archive.writestr("classes.dex", tiny_dex())
+        return buffer.getvalue()
+
+    def test_package_name_and_sdk_from_binary_manifest(self):
+        from huntress_ctf.formats import apk
+        from huntress_ctf.solvers.metadata import apk_package_name
+        fields = apk(self.apk(tiny_axml()))
+        self.assertEqual((fields["package_name"], fields["min_sdk_version"], fields["dex_files"]),
+                         ("com.example.robot", "23", ["classes.dex"]))
+        self.assertEqual(apk_package_name(self.apk(tiny_axml("com.huntress.arena.p1"))), "com.huntress.arena.p1")
+        self.assertIsNone(apk_package_name(b"not an apk"))
+        self.assertEqual(dict(describe(self.apk(tiny_axml())))["apk"]["package_name"], "com.example.robot")
