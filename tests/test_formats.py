@@ -1,6 +1,7 @@
 """Executable format fields and property suggestions: synthetic files built byte by byte."""
 
 import hashlib
+import json
 from pathlib import Path
 from io import BytesIO
 import struct
@@ -381,6 +382,12 @@ class MobilePuzzleTests(unittest.TestCase):
         self.assertEqual(answer_code(self.apk("base64", base64.b64encode(code.encode()).decode())), code)
         self.assertEqual(answer_code(self.apk("hex", code.encode().hex())), code)
         self.assertEqual(answer_code(self.apk("dynamic", "assets/payload.dex", {"assets/payload.dex": b"\0\x14" + code.encode() + b"\0"})), code)
+        self.assertEqual(answer_code(self.apk("reflection", code)), code)
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("assets/huntress_puzzle.json", json.dumps(
+                {"codec": "split", "data": "", "parts": ["09EA4B497", "ANS-B", "200528"], "order": [2, 0, 1]}))
+        self.assertEqual(answer_code(buffer.getvalue()), "ANS-B20052809EA4B497")
         self.assertIsNone(answer_code(self.apk("reverse", "not-an-answer")))
         self.assertIsNone(answer_code(b"not an apk"))
 

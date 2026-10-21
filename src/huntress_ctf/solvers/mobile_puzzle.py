@@ -2,8 +2,10 @@
 
 Day 20 and 21 apps carry {"schema": "huntress.mobile.puzzle.v1", "codec": ..., "data": ...};
 the backend answer code is the data decoded by the codec ("reverse" on day 21:
-"FEDCBA9876543210-SNA" -> "ANS-0123456789ABCDEF", CORRECT live). "dynamic" names a
-payload DEX that holds the code. Unknown codecs get one strict layer from decoders.py.
+"FEDCBA9876543210-SNA" -> "ANS-0123456789ABCDEF", CORRECT live). Mastery bundles earlier
+days' codecs: "split" puts parts[i] at position order[i], "reflection" carries the code
+as is, "dynamic" names a payload DEX that holds it. Unknown codecs get the value as is,
+reversed, and one strict layer from decoders.py.
 Only a value that is exactly an answer code ("ANS-" + 16 uppercase hex) is returned.
 """
 
@@ -24,13 +26,25 @@ ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
 _IN_TEXT = re.compile(rb"ANS-[0-9A-F]{16}")
 
 
-def _decoded(codec: str, data: str, apk: zipfile.ZipFile) -> set[str]:
+def _split(puzzle: dict) -> set[str]:
+    parts, order = puzzle.get("parts"), puzzle.get("order")
+    if not (isinstance(parts, list) and isinstance(order, list) and sorted(order) == list(range(len(parts)))):
+        return set()
+    placed = [""] * len(parts)
+    for part, position in zip(parts, order):
+        placed[position] = str(part)
+    return {"".join(placed), "".join(str(parts[index]) for index in order)}  # Both readings of "order".
+
+
+def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[str]:
     codec = codec.lower()
     found: set[str] = set()
-    if codec == "reverse":
-        found.add(data[::-1])
-    elif codec in ("plain", "none", "identity"):
+    if codec == "split":
+        found |= _split(puzzle)
+    elif codec in ("reflection", "plain", "none", "identity"):
         found.add(data)
+    elif codec == "reverse":
+        found.add(data[::-1])
     elif codec == "rot13":
         found.add(codecs.decode(data, "rot13"))
     elif codec in ("hex", "base16"):
@@ -55,7 +69,7 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile) -> set[str]:
             decoded = layer(data.encode())
             if decoded:
                 found.add(decoded.decode("utf-8", "replace"))
-        found.add(data[::-1])
+        found |= {data, data[::-1]} | _split(puzzle)
     return {value.strip() for value in found}
 
 
@@ -69,7 +83,7 @@ def answer_code(apk_bytes: bytes) -> str | None:
             puzzle = json.loads(apk.read(names[0]))
             if not isinstance(puzzle, dict) or not isinstance(puzzle.get("data"), str):
                 return None
-            codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk)
+            codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
                      if ANSWER.fullmatch(value)}
     except (zipfile.BadZipFile, ValueError, KeyError, UnicodeDecodeError):
         return None
