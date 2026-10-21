@@ -1,6 +1,7 @@
 """Executable format fields and property suggestions: synthetic files built byte by byte."""
 
 import hashlib
+from pathlib import Path
 from io import BytesIO
 import struct
 import unittest
@@ -184,3 +185,79 @@ class AutoPropertyTests(unittest.TestCase):
     def test_known_or_unclear_properties_are_left_alone(self):
         self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.cpu_type_set"), [])  # Has a parser.
         self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.weird_unrelated_thing"), [])
+
+
+class OtherFormatTests(unittest.TestCase):
+    def fields(self, data, label):
+        found = dict(describe(data))
+        self.assertIn(label, found)
+        self.assertNotIn("damaged", found[label])
+        return found[label]
+
+    def test_archives(self):
+        import gzip
+        import tarfile
+        buffer = BytesIO()
+        with gzip.GzipFile(filename="report.txt", mode="wb", fileobj=buffer, mtime=1_700_000_000) as stream:
+            stream.write(b"hello")
+        fields = self.fields(buffer.getvalue(), "gzip")
+        self.assertEqual((fields["original_name"], fields["mtime"], fields["isize"]), ("report.txt", 1_700_000_000, 5))
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            info = tarfile.TarInfo("notes/a.txt")
+            info.size, info.uid, info.uname, info.mtime = 3, 1001, "analyst", 1_700_000_000
+            archive.addfile(info, BytesIO(b"abc"))
+        fields = self.fields(buffer.getvalue(), "tar")
+        self.assertEqual((fields["first_name"], fields["uid"], fields["uname"], fields["names"]),
+                         ("notes/a.txt", 1001, "analyst", ["notes/a.txt"]))
+        self.assertEqual(dict(describe(b"7z\xbc\xaf\x27\x1c\x00\x04" + b"\0" * 24))["sevenzip"]["version"], "0.4")
+        self.assertEqual(dict(describe(b"Rar!\x1a\x07\x01\x00" + b"\0" * 8))["rar"]["version"], 5)
+
+    def test_sqlite_and_captures(self):
+        import os
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "db.sqlite")
+            connection = sqlite3.connect(path)
+            connection.execute("PRAGMA user_version = 42")
+            connection.execute("PRAGMA application_id = 1234")
+            connection.execute("CREATE TABLE t (x)")
+            connection.commit()
+            connection.close()
+            fields = self.fields(Path(path).read_bytes(), "sqlite")
+        self.assertEqual((fields["user_version"], fields["application_id"], fields["text_encoding"]), (42, 1234, "UTF-8"))
+        packet = struct.pack("<IIII", 1, 0, 4, 4) + b"abcd"
+        pcap = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1) + packet * 3
+        fields = self.fields(pcap, "pcap")
+        self.assertEqual((fields["version"], fields["linktype_name"], fields["packet_count"]), ("2.4", "ETHERNET", 3))
+        shb = struct.pack("<IIIHHq", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1) + struct.pack("<I", 28)
+        idb = struct.pack("<IIHHI", 1, 20, 101, 0, 262144) + struct.pack("<I", 20)
+        epb = struct.pack("<IIIIIII", 6, 36, 0, 0, 0, 4, 4) + b"abcd" + struct.pack("<I", 36)
+        fields = self.fields(shb + idb + epb + epb, "pcapng")
+        self.assertEqual((fields["version"], fields["linktype_name"], fields["packet_count"]), ("1.0", "RAW", 2))
+
+    def test_images_and_iso(self):
+        frame = b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00" + b"\x02\x02\x44\x01\x00"
+        gif = (b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0x80, 0, 0) + b"\0\0\0\xff\xff\xff"
+               + b"\x21\xfe\x05hello\x00" + b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x05\x00\x00" + frame + frame + b"\x3b")
+        fields = self.fields(gif, "gif")
+        self.assertEqual((fields["frames"], fields["comments"], fields["loop_count"], fields["dimensions"]),
+                         (2, ["hello"], 5, "1x1"))
+        bmp = b"BM" + struct.pack("<I4xII", 70, 54, 40) + struct.pack("<iiHHI", 3, -2, 1, 24, 0) + b"\0" * 32
+        fields = self.fields(bmp, "bmp")
+        self.assertEqual((fields["dimensions"], fields["bits_per_pixel"], fields["top_down"]), ("3x2", 24, True))
+        ico = struct.pack("<HHH", 0, 1, 2) + struct.pack("<BBBBHHII", 16, 16, 0, 0, 1, 32, 0, 0) * 2
+        self.assertEqual(self.fields(ico, "ico")["images"], ["16x16@32", "16x16@32"])
+        iso = bytearray(0x8000 + 2048)
+        iso[0x8001:0x8006] = b"CD001"
+        iso[0x8028:0x8028 + 32] = b"EVIDENCE_DISK".ljust(32)
+        iso[0x8050:0x8054] = struct.pack("<I", 1234)
+        self.assertEqual(self.fields(bytes(iso), "iso")["volume_id"], "EVIDENCE_DISK")
+
+    def test_new_formats_feed_suggestions(self):
+        import gzip
+        buffer = BytesIO()
+        with gzip.GzipFile(filename="report.txt", mode="wb", fileobj=buffer, mtime=0) as stream:
+            stream.write(b"x")
+        self.assertIn("'report.txt'", suggest("gzip.original_name", buffer.getvalue())[0])

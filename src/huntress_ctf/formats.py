@@ -360,6 +360,171 @@ def dex(data: bytes) -> dict | None:
     return _guarded(_dex, data) if data.startswith(b"dex\n") and len(data) >= 112 else None
 
 
+# --- Archives, databases, captures and images --------------------------------------------
+
+GZIP_OS = {0: "FAT", 1: "Amiga", 2: "VMS", 3: "Unix", 4: "VM/CMS", 5: "Atari", 6: "HPFS", 7: "Macintosh",
+           8: "Z-System", 9: "CP/M", 10: "TOPS-20", 11: "NTFS", 12: "QDOS", 13: "Acorn", 255: "unknown"}
+PCAP_LINKTYPES = {0: "NULL", 1: "ETHERNET", 101: "RAW", 105: "IEEE802_11", 113: "LINUX_SLL",
+                  127: "IEEE802_11_RADIOTAP", 228: "IPV4", 229: "IPV6", 276: "LINUX_SLL2"}
+
+
+def _gzip(data: bytes, f: dict) -> None:
+    flags = data[3]
+    f.update(method=data[2], flags=flags, mtime=struct.unpack_from("<I", data, 4)[0],
+             extra_flags=data[8], os=data[9], os_name=GZIP_OS.get(data[9], "unknown"))
+    if f["mtime"]:
+        f["mtime_utc"] = datetime.fromtimestamp(f["mtime"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    at = 10
+    if flags & 4:
+        at += 2 + struct.unpack_from("<H", data, at)[0]
+    if flags & 8:
+        f["original_name"] = _cstring(data, at)
+        at += len(data[at:].split(b"\0", 1)[0]) + 1
+    if flags & 16:
+        f["comment"] = _cstring(data, at)
+    f["isize"] = struct.unpack_from("<I", data, len(data) - 4)[0]  # Uncompressed size mod 2^32.
+
+
+def _tar(data: bytes, f: dict) -> None:
+    octal = lambda raw: int(raw.split(b"\0", 1)[0].strip() or b"0", 8)
+    f.update(first_name=_cstring(data[:100], 0), mode=octal(data[100:108]), uid=octal(data[108:116]),
+             gid=octal(data[116:124]), size=octal(data[124:136]), mtime=octal(data[136:148]),
+             typeflag=chr(data[156]) if data[156] else "0", linkname=_cstring(data[157:257], 0),
+             magic=data[257:263].decode("ascii", "replace").strip("\0 "), uname=_cstring(data[265:297], 0),
+             gname=_cstring(data[297:329], 0))
+    names, at = [], 0
+    while at + 512 <= len(data) and len(names) < 4096 and data[at:at + 1] != b"\0":
+        names.append(_cstring(data[at:at + 100], 0))
+        at += 512 + ((octal(data[at + 124:at + 136]) + 511) // 512) * 512
+    f["names"] = names
+
+
+def _sqlite(data: bytes, f: dict) -> None:
+    page = struct.unpack_from(">H", data, 16)[0]
+    f.update(page_size=65536 if page == 1 else page, write_version=data[18], read_version=data[19],
+             file_change_counter=struct.unpack_from(">I", data, 24)[0],
+             database_size_pages=struct.unpack_from(">I", data, 28)[0],
+             schema_cookie=struct.unpack_from(">I", data, 40)[0], schema_format=struct.unpack_from(">I", data, 44)[0],
+             text_encoding={1: "UTF-8", 2: "UTF-16le", 3: "UTF-16be"}.get(struct.unpack_from(">I", data, 56)[0], "unknown"),
+             user_version=struct.unpack_from(">I", data, 60)[0], application_id=struct.unpack_from(">I", data, 68)[0],
+             sqlite_version_number=struct.unpack_from(">I", data, 96)[0])
+
+
+def _pcap(data: bytes, f: dict) -> None:
+    order = "<" if data[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
+    major, minor, zone, sigfigs, snaplen, network = struct.unpack_from(order + "HHiIII", data, 4)
+    f.update(version=f"{major}.{minor}", nanosecond=data[:4] in (b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"),
+             thiszone=zone, snaplen=snaplen, linktype=network, linktype_name=PCAP_LINKTYPES.get(network, "unknown"))
+    count, at = 0, 24
+    while at + 16 <= len(data) and count < 1_000_000:
+        at += 16 + struct.unpack_from(order + "I", data, at + 8)[0]
+        count += 1
+    f["packet_count"] = count
+
+
+def _pcapng(data: bytes, f: dict) -> None:
+    order = "<" if data[8:12] == b"\x4d\x3c\x2b\x1a" else ">"
+    major, minor = struct.unpack_from(order + "HH", data, 12)
+    f["version"] = f"{major}.{minor}"
+    linktypes, packets, at = [], 0, 0
+    while at + 12 <= len(data) and packets < 1_000_000:
+        kind, length = struct.unpack_from(order + "II", data, at)
+        if length < 12:
+            break
+        if kind == 1:
+            linktype, _, snaplen = struct.unpack_from(order + "HHI", data, at + 8)
+            linktypes.append(linktype)
+            f.setdefault("snaplen", snaplen)
+        elif kind in (2, 3, 6):
+            packets += 1
+        at += length
+    f.update(interfaces=len(linktypes), linktype=linktypes[0] if linktypes else None,
+             linktype_name=PCAP_LINKTYPES.get(linktypes[0], "unknown") if linktypes else None, packet_count=packets)
+
+
+def _sub_blocks(data: bytes, at: int) -> tuple[bytes, int]:
+    out = bytearray()
+    while data[at]:
+        out += data[at + 1:at + 1 + data[at]]
+        at += 1 + data[at]
+    return bytes(out), at + 1
+
+
+def _gif(data: bytes, f: dict) -> None:
+    width, height, packed = struct.unpack_from("<HHB", data, 6)
+    f.update(version=data[3:6].decode("ascii"), width=width, height=height, dimensions=f"{width}x{height}",
+             global_color_table=bool(packed & 0x80))
+    at = 13 + (3 * 2 ** ((packed & 7) + 1) if packed & 0x80 else 0)
+    frames, comments = 0, []
+    while at < len(data) and frames < 100_000:
+        block = data[at]
+        if block == 0x3B:  # Trailer
+            break
+        if block == 0x21:
+            label = data[at + 1]
+            body, at = _sub_blocks(data, at + 2)
+            if label == 0xFE:
+                comments.append(body.decode("utf-8", "replace"))
+            elif label == 0xFF and body.startswith(b"NETSCAPE2.0") and len(body) >= 14:
+                f["loop_count"] = struct.unpack_from("<H", body, 12)[0]
+        elif block == 0x2C:
+            frames += 1
+            local = data[at + 9]
+            at += 10 + (3 * 2 ** ((local & 7) + 1) if local & 0x80 else 0)
+            _, at = _sub_blocks(data, at + 1)  # LZW minimum code size, then the image data.
+        else:
+            raise ValueError(f"GIF block 0x{block:02x}")
+    f.update(frames=frames, comments=comments)
+
+
+def _bmp(data: bytes, f: dict) -> None:
+    size, offset, header = struct.unpack_from("<I4xII", data, 2)
+    width, height, planes, bpp, compression = struct.unpack_from("<iiHHI", data, 18)
+    f.update(file_size=size, pixel_offset=offset, dib_header_size=header, width=width, height=abs(height),
+             dimensions=f"{width}x{abs(height)}", top_down=height < 0, planes=planes, bits_per_pixel=bpp,
+             compression=compression)
+
+
+def _ico(data: bytes, f: dict) -> None:
+    kind, count = struct.unpack_from("<HH", data, 2)
+    images = []
+    for index in range(min(count, 256)):
+        width, height, _, _, _, bpp = struct.unpack_from("<BBBBHH", data, 6 + 16 * index)
+        images.append(f"{width or 256}x{height or 256}@{bpp}")
+    f.update(type="cursor" if kind == 2 else "icon", image_count=count, images=images)
+
+
+def _iso(data: bytes, f: dict) -> None:
+    base = 0x8000
+    text = lambda start, length: data[base + start:base + start + length].decode("ascii", "replace").strip()
+    f.update(system_id=text(8, 32), volume_id=text(40, 32),
+             volume_space_size=struct.unpack_from("<I", data, base + 80)[0],
+             logical_block_size=struct.unpack_from("<H", data, base + 128)[0],
+             volume_set_id=text(190, 128), publisher_id=text(318, 128), preparer_id=text(446, 128),
+             application_id=text(574, 128), creation_date=text(813, 16), modification_date=text(830, 16))
+
+
+def other_formats(data: bytes) -> list[tuple[str, dict]]:
+    checks = (
+        ("gzip", data.startswith(b"\x1f\x8b") and len(data) >= 18, _gzip),
+        ("tar", len(data) >= 512 and data[257:262] == b"ustar", _tar),
+        ("sqlite", data.startswith(b"SQLite format 3\0") and len(data) >= 100, _sqlite),
+        ("pcap", data[:4] in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d")
+         and len(data) >= 24, _pcap),
+        ("pcapng", data.startswith(b"\x0a\x0d\x0d\x0a") and len(data) >= 28, _pcapng),
+        ("gif", data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 13, _gif),
+        ("bmp", data.startswith(b"BM") and len(data) >= 30, _bmp),
+        ("ico", data[:4] in (b"\0\0\x01\0", b"\0\0\x02\0") and len(data) >= 22, _ico),
+        ("iso", len(data) >= 0x8000 + 881 and data[0x8001:0x8006] == b"CD001", _iso),
+    )
+    found = [(label, _guarded(parse, data)) for label, match, parse in checks if match]
+    if data.startswith(b"7z\xbc\xaf\x27\x1c") and len(data) >= 8:
+        found.append(("sevenzip", {"version": f"{data[6]}.{data[7]}"}))
+    if data.startswith(b"Rar!\x1a\x07"):
+        found.append(("rar", {"version": 5 if data[6:8] == b"\x01\x00" else 4}))
+    return found
+
+
 def macho_fields(data: bytes) -> dict | None:
     """Fields of the first thin Mach-O image (a fat file's first slice), like elf() and pe()."""
     image = next(macho.images(data), None)
@@ -377,4 +542,4 @@ def describe(data: bytes) -> list[tuple[str, dict]]:
         fields = parse(data)
         if fields is not None:
             return [(label, fields)]
-    return []
+    return other_formats(data)

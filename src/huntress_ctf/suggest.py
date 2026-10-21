@@ -30,7 +30,10 @@ _SUFFIXES = (
 )
 _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm": "wasm",
                "webassembly": "wasm", "java": "java_class", "class": "java_class", "jar": "java_class",
-               "dex": "dex", "android": "dex"}
+               "dex": "dex", "android": "dex", "gzip": "gzip", "gz": "gzip", "tar": "tar",
+               "sqlite": "sqlite", "pcap": "pcap", "pcapng": "pcapng", "gif": "gif", "bmp": "bmp",
+               "ico": "ico", "icon": "ico", "7z": "sevenzip", "sevenzip": "sevenzip", "rar": "rar",
+               "iso": "iso", "iso9660": "iso"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 
 
