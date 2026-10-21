@@ -300,3 +300,18 @@ class DocumentFormatTests(unittest.TestCase):
                 b"Message-ID: <abc@example.test>\r\nX-Mailer: Synthetic 1.0\r\n\r\nbody\r\n")
         fields = self.fields(mail, "email")
         self.assertEqual((fields["message_id"], fields["x_mailer"], fields["subject"]), ("<abc@example.test>", "Synthetic 1.0", "Invoice"))
+
+
+class MediaShortcutTextTests(unittest.TestCase):
+    def test_wav_lnk_text(self):
+        fmt = struct.pack("<HHIIHH", 1, 2, 44100, 176400, 4, 16)
+        wav = b"RIFF" + struct.pack("<I", 36 + 8) + b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + struct.pack("<I", 8) + b"\0" * 8
+        fields = dict(describe(wav))["media_wav"]
+        self.assertEqual((fields["codec_name"], fields["channels"], fields["sample_rate"]), ("pcm_s16le", 2, 44100))
+        from test_metadata import tiny_lnk
+        fields = dict(describe(tiny_lnk()))["lnk"]
+        self.assertEqual(fields["target_path"], "C:\\Tools\\collector.exe")
+        self.assertIn("'C:\\\\Tools\\\\collector.exe'", suggest("lnk.target_path_windows", tiny_lnk())[0])
+        fields = dict(describe(b"\xef\xbb\xbfa,b\r\nc,d\r\n"))["text"]
+        self.assertEqual((fields["utf8_bom_present"], fields["line_count"], fields["line_ending"]), (True, 2, "crlf"))
+        self.assertIn("'true'", suggest("text.utf8_bom_present", b"\xef\xbb\xbfhello")[0])

@@ -637,6 +637,79 @@ def _email(data: bytes, f: dict) -> None:
              attachments=[part.get_filename() for part in message.walk() if part.get_filename()])
 
 
+WAVE_CODECS = {6: "pcm_alaw", 7: "pcm_mulaw", 0x11: "adpcm_ima_wav", 2: "adpcm_ms", 0x31: "gsm_ms", 0x55: "mp3"}
+
+
+def _wav(data: bytes, f: dict) -> None:
+    at = 12
+    while at + 8 <= len(data):
+        kind, size = struct.unpack_from("<4sI", data, at)
+        if kind == b"fmt ":
+            audio, channels, rate, byte_rate, align, bits = struct.unpack_from("<HHIIHH", data, at + 8)
+            if audio == 0xFFFE and size >= 40:  # WAVE_FORMAT_EXTENSIBLE: the GUID starts with the format.
+                audio = struct.unpack_from("<H", data, at + 32)[0]
+            if audio == 1:
+                codec = "pcm_u8" if bits == 8 else f"pcm_s{bits}le"
+            elif audio == 3:
+                codec = f"pcm_f{bits}le"
+            else:
+                codec = WAVE_CODECS.get(audio, f"0x{audio:04x}")
+            f.update(audio_format=audio, codec_name=codec, channels=channels, sample_rate=rate,
+                     byte_rate=byte_rate, block_align=align, bits_per_sample=bits)
+        elif kind == b"data":
+            f["data_size"] = size
+            if f.get("byte_rate"):
+                f["duration_seconds"] = round(size / f["byte_rate"], 6)
+        at += 8 + size + (size & 1)
+
+
+def _filetime(value: int) -> str | None:
+    if not value:
+        return None
+    return datetime.fromtimestamp((value - 116444736000000000) / 10_000_000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _lnk(data: bytes, f: dict) -> None:
+    flags, attributes, created, accessed, written, size, icon, show, hotkey = struct.unpack_from("<IIQQQIiIH", data, 20)
+    f.update(link_flags=flags, file_attributes=attributes, creation_time=_filetime(created),
+             access_time=_filetime(accessed), write_time=_filetime(written), target_file_size=size,
+             icon_index=icon, show_command=show, hotkey=hotkey)
+    at = 76
+    if flags & 0x1:  # HasLinkTargetIDList
+        at += 2 + struct.unpack_from("<H", data, at)[0]
+    if flags & 0x2:  # HasLinkInfo
+        info_size, header_size, info_flags, volume, local, network, suffix = struct.unpack_from("<IIIIIII", data, at)
+        if info_flags & 1:
+            f["local_base_path"] = data[at + local:].split(b"\0", 1)[0].decode("cp1252", "replace")
+            f["common_path_suffix"] = data[at + suffix:].split(b"\0", 1)[0].decode("cp1252", "replace")
+            f["target_path"] = f["local_base_path"] + f["common_path_suffix"]
+            if volume:
+                drive_type, serial = struct.unpack_from("<II", data, at + volume + 4)
+                f.update(drive_type=drive_type, drive_serial_number=f"{serial:08X}")
+        at += info_size
+    unicode = bool(flags & 0x80)
+    for bit, name in ((0x4, "name"), (0x8, "relative_path"), (0x10, "working_directory"),
+                      (0x20, "arguments"), (0x40, "icon_location")):
+        if flags & bit:
+            count = struct.unpack_from("<H", data, at)[0]
+            width = 2 if unicode else 1
+            raw = data[at + 2:at + 2 + count * width]
+            f[name] = raw.decode("utf-16-le" if unicode else "cp1252", "replace")
+            at += 2 + count * width
+
+
+def _text(data: bytes, f: dict) -> None:
+    bom = data.startswith(b"\xef\xbb\xbf")
+    text = data.decode("utf-8-sig")
+    endings = {"crlf": text.count("\r\n"), "lf": text.count("\n") - text.count("\r\n"),
+               "cr": text.count("\r") - text.count("\r\n")}
+    used = [name for name, count in endings.items() if count]
+    f.update(utf8_bom_present=bom, encoding="utf-8-sig" if bom else "utf-8", byte_count=len(data),
+             char_count=len(text), line_count=len(text.splitlines()),
+             line_ending=used[0] if len(used) == 1 else ("mixed" if used else "none"),
+             trailing_newline=text.endswith(("\n", "\r")))
+
+
 def document_formats(data: bytes) -> list[tuple[str, dict]]:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return [("png", _guarded(_png, data))]
@@ -650,9 +723,19 @@ def document_formats(data: bytes) -> list[tuple[str, dict]]:
         if office:
             found.append(("ooxml", office))
         return found
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return [("media_wav", _guarded(_wav, data))]
+    if data[:4] == b"\x4c\0\0\0" and data[4:20] == bytes.fromhex("0114020000000000c000000000000046"):
+        return [("lnk", _guarded(_lnk, data))]
     head = data[:4096]
     if re.search(rb"(?im)^from:", head) and re.search(rb"(?im)^(subject|message-id|received):", head):
         return [("email", _guarded(_email, data))]
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return []
+    if text and sum(char.isprintable() or char in "\r\n\t" for char in text[:4096]) >= 0.95 * min(len(text), 4096):
+        return [("text", _guarded(_text, data))]
     return []
 
 

@@ -36,7 +36,8 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "iso": "iso", "iso9660": "iso", "png": "png", "jpeg": "jpeg", "jpg": "jpeg",
                "exif": "jpeg", "pdf": "pdf", "zip": "zip", "ooxml": "ooxml", "docx": "ooxml",
                "xlsx": "ooxml", "pptx": "ooxml", "office": "ooxml", "email": "email", "eml": "email",
-               "mail": "email"}
+               "mail": "email", "media": "media", "wav": "media_wav", "audio": "media", "lnk": "lnk",
+               "shortcut": "lnk", "text": "text", "txt": "text", "csv": "text"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 
 
