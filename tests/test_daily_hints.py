@@ -211,8 +211,10 @@ class ReleaseDayTests(unittest.TestCase):
         client = DayClient(released_after=1)
         with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
             _, output = self.run_daily(client, day=21, lanes=("warmups", "metadata-forensics"), wait_release=60)
-        # The release probe lists the first lane; the others are listed once; never the whole day.
-        self.assertEqual(client.lists, [(21, "warmups"), (21, "warmups"), (21, "metadata-forensics")])
+        # The probes alternate between our lanes; a lane the probe did not list is listed once
+        # more after the release (this day has no Metadata); never the whole day.
+        self.assertEqual(client.lists, [(21, "warmups"), (21, "metadata-forensics"), (21, "warmups"),
+                                        (21, "metadata-forensics")])
         self.assertEqual(sorted(call.args[1] for call in fast.call_args_list),
                          ["warmups-day-21", "warmups-day-21/time_trial"])
         self.assertNotIn("binary-day-21", output.split("===== Summary =====")[1])
@@ -223,6 +225,18 @@ class ReleaseDayTests(unittest.TestCase):
             _, output = self.run_daily(client, day=21, wait_release=60)
         self.assertEqual(client.lists, [(21, "warmups")] * 4 + [(21, None)])
         self.assertIn("Day 21 is released", output)
+
+    def test_release_probes_each_of_several_lanes(self):
+        class NoWarmups(DayClient):
+            def list_challenges(self, day=None, lane=None):
+                self.lists.append((day, lane))
+                records = [c for c in DAY["challenges"] if c["lane"] == lane and lane != "warmups"]
+                return {"challenges": records}
+        client = NoWarmups()
+        with redirect_stdout(StringIO()):
+            found = wait_for_release(client, 21, ("warmups", "binary"), 5, sleep=lambda seconds: None)
+        self.assertEqual(client.lists, [(21, "warmups"), (21, "binary")])
+        self.assertTrue(found["challenges"])
 
     def test_release_wait_gives_up(self):
         ticks = iter(range(100))

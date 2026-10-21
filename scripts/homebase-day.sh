@@ -55,5 +55,13 @@ echo "== Day $day: timed races, $(date)"
 # day.lock and the robot lock that a parser deployed minutes after the release needs.
 robot daily --day "$day" --lanes "$lanes" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-timed.log"
+# A transport or server error in our lanes (an overloaded release) gets another sweep next
+# minute, at most 10 times; unresolved and incorrect do not, so a guess is never repeated.
+retries="$state/day$day.retries"
+if grep -q '"outcome": "error"' "$log-untimed.log" && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
+  echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
+  echo "== Day $day: errors in the sweep; trying again next minute, $(date)"
+  exit 0
+fi
 version > "$swept"  # After the races, which add to hints.json themselves.
 echo "== Day $day swept, $(date)"

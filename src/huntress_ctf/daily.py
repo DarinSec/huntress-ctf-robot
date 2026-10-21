@@ -134,19 +134,23 @@ class _FamilyOutput:
 
 
 def wait_for_release(
-    client: GameMasterClient, day: int, lane: str | None, wait: float, *,
+    client: GameMasterClient, day: int, lane: str | tuple[str, ...] | None, wait: float, *,
     clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
 ) -> Any:
-    """Poll one lane of `day` until its challenges are listed; returns that list.
+    """Poll `day` until its challenges are listed; returns that list.
 
     Started just before 15:00 Swedish time (09:00 New York), this begins the day at the
-    release instead of minutes later. Errors count as "not yet" until the deadline.
+    release instead of minutes later. Several lanes are probed in turn, so a day without
+    one of them is still seen. Errors count as "not yet" until the deadline.
     """
     tag = f"-day-{day:02d}"
-    probe = lane or RELEASE_PROBE_LANE
+    probes = (lane,) if isinstance(lane, str) else tuple(lane or ()) or (RELEASE_PROBE_LANE,)
     began = clock()
     errors = 0
+    polls = 0
     while True:
+        probe = probes[polls % len(probes)]
+        polls += 1
         try:
             response = client.list_challenges(day, probe)
             if any(tag in str(_id(record)) for record in _records(response)):
@@ -189,9 +193,13 @@ def run_daily(
     elif lanes and day is not None:
         # One list per lane (~1 s each) instead of the whole day (~4 s); the release probe's
         # list is the first lane's.
-        found = _records(wait_for_release(client, day, lanes[0], wait_release, sleep=sleep)) if wait_release else []
-        for name in lanes[1:] if wait_release else lanes:
-            found += _records(client.list_challenges(day, name))
+        found: list[dict[str, Any]] = []
+        if wait_release:
+            found = _records(wait_for_release(client, day, lanes, wait_release, sleep=sleep))
+        listed = {lane_of(record, str(_id(record))) for record in found}
+        for name in lanes:
+            if name not in listed:
+                found += _records(client.list_challenges(day, name))
         listing = {"challenges": found}
     elif wait_release and day is not None:
         released = wait_for_release(client, day, lane, wait_release, sleep=sleep)
