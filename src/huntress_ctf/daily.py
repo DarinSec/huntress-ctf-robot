@@ -25,8 +25,9 @@ from .hints import load_hints, record_race
 from .state import AttemptState, mode_name
 
 # Lanes whose solver answers every variant of a day once its Single Solve scored
-# (warmups learns the day's line chain from that hint; metadata parses any variant).
-COURSE_LANES = {"warmups", "metadata-forensics"}
+# (warmups learns the day's line chain from that hint; metadata parses any variant;
+# mobile-android decodes each app's puzzle asset).
+COURSE_LANES = {"warmups", "metadata-forensics", "mobile-android"}
 WORKERS = 6
 # One lane is enough to see a release: ~1 s per list instead of ~4 s for a whole day.
 RELEASE_PROBE_LANE = "warmups"

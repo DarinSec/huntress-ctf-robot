@@ -42,9 +42,10 @@ if [ "$now" -lt "$release" ]; then
 fi
 cd "$HOME"
 robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
-# Darin's lanes only: teammates share attempts, and an untimed start of their Time Trial
-# would block their timed race. Add a lane here once the robot has its solver.
-lanes="warmups,metadata-forensics"
+# The robot's lanes only: teammates share attempts, and an untimed start of their Time
+# Trial would block their timed race. Add a lane here once the robot has its solver.
+# Android since day 22 (the puzzle-asset solver took all of day 21's variants).
+lanes="warmups,metadata-forensics,mobile-android"
 log="$HOME/day$day-$(date +%H%M)"
 echo "== Day $day: untimed sweep, $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1

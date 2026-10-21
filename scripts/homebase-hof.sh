@@ -18,7 +18,7 @@ day=$(TZ=America/New_York date +%-d); hour=$(TZ=America/New_York date +%-H)
 last=$(( hour >= 9 ? day : day - 1 ))
 [ "$last" -ge 1 ] || exit 0
 cd "$HOME"
-for lane in warmups metadata-forensics; do
+for lane in warmups metadata-forensics mobile-android; do
   log="$HOME/hof-$(date +%m%d-%H%M)-$lane.log"
   echo "== Hall of Fame $lane, days 1-$last, $(date)"
   python3 -m huntress_ctf --lock-wait 900 daily --days "1-$last" --lane "$lane" --timed --rerace \
