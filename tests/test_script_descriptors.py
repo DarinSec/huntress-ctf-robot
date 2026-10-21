@@ -51,5 +51,20 @@ class DescriptorTests(unittest.TestCase):
                                    "url": "https://php-1234.example.invalid/stage", "count": "2", "host": "standalone"})
 
 
+class MasteryBundleTests(unittest.TestCase):
+    def test_sets_sharing_specimen_names_stay_apart(self):
+        other = header("B64").replace(base64.b64encode(PLAN.encode()).decode(),
+                                      base64.b64encode(PLAN.replace("PHP-1234abcd", "PHP-9999ffff").encode()).decode())
+        members = (Member("evidence-01.zip/polyglot-php-stager.php", header("HEX").encode()),
+                   Member("evidence-02.zip/polyglot-php-stager.php", other.encode()))
+        questions = [{"id": f"set{n}.campaign", "question": "Recover the exact synthetic campaign identifier.",
+                      "artifact": f"evidence-0{n}.zip -> polyglot-php-stager.php"} for n in (1, 2)]
+        ids = tuple(q["id"] for q in questions)
+        context = SolveContext("script-analysis-day-21-x/mastery", {"lane": "script-analysis"},
+                               {"answer_ids": list(ids), "questions": questions}, b"zip", None, ids, members=members)
+        answers = {c.answer_id: c.answer for c in ScriptDescriptorSolver().solve(context)}
+        self.assertEqual(answers, {"set1.campaign": "PHP-1234abcd", "set2.campaign": "PHP-9999ffff"})
+
+
 if __name__ == "__main__":
     unittest.main()

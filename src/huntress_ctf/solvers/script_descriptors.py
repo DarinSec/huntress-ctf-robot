@@ -78,6 +78,21 @@ def answer(question: str, fields: dict[str, str]) -> str | None:
     return None
 
 
+def _lookup(described: dict[str, dict[str, str]], artifact: str) -> dict[str, str] | None:
+    """The descriptor of the file a question names: "evidence-03.zip -> x.php" in a Mastery
+    bundle is the member "evidence-03.zip/x.php"; in a single solve the archive named
+    first is the artifact itself. Five sets share specimen names, so a base name alone
+    is used only when it is unique."""
+    parts = [part.strip() for part in artifact.split("->") if part.strip()]
+    if not parts:
+        return None
+    for key in ("/".join(parts), "/".join(parts[1:])):
+        if key in described:
+            return described[key]
+    same = [key for key in described if key.rsplit("/", 1)[-1] == parts[-1]]
+    return described[same[0]] if len(same) == 1 else None
+
+
 class ScriptDescriptorSolver:
     name = "script-descriptors"
     lanes = frozenset({"script-analysis"})
@@ -94,11 +109,11 @@ class ScriptDescriptorSolver:
             text = member.data[:1_000_000].decode("utf-8", "replace")
             fields = descriptor(text)
             if fields:
-                described[member.name.rsplit("/", 1)[-1]] = fields
+                described[member.name] = fields
         candidates = []
         for question in items:
-            name = (question.artifact or "").rsplit("->", 1)[-1].strip().rsplit("/", 1)[-1]
-            fields = described.get(name)
+            name = (question.artifact or "").rsplit("->", 1)[-1].strip()
+            fields = _lookup(described, question.artifact or "")
             if fields is None:
                 continue
             value = answer(question.text, fields)
