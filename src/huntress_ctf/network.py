@@ -13,6 +13,7 @@ from pathlib import Path
 import socket
 import struct
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -20,6 +21,7 @@ from .hints import default_path as _hints_path
 
 
 NTP_SERVER = "time.cloudflare.com"
+_WRITING = threading.Lock()  # Parallel `daily` families may record at once.
 _NTP_EPOCH = 2208988800
 
 
@@ -89,15 +91,16 @@ def pipelining_ok(base_url: str | None, path: Path | None = None) -> bool:
 def record(base_url: str, path: Path | None = None, **fields: Any) -> str | None:
     """Merge fields into the route's entry; returns an error note instead of raising."""
     path = path or default_path()
-    state = load(path)
-    entry = state.get(base_url) if isinstance(state.get(base_url), dict) else {}
-    entry.update(fields, recorded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    state[base_url] = entry
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(path)
-    except OSError as exc:
-        return f"Could not save the network facts: {exc}"
+    with _WRITING:
+        state = load(path)
+        entry = state.get(base_url) if isinstance(state.get(base_url), dict) else {}
+        entry.update(fields, recorded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        state[base_url] = entry
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+            temporary.replace(path)
+        except OSError as exc:
+            return f"Could not save the network facts: {exc}"
     return None

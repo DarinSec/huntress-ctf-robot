@@ -61,11 +61,13 @@ def lookup_challenge(client: Any, challenge_id: str) -> tuple[dict[str, Any], An
     day, lane = list_filters(challenge_id)
     tries = [{"day": day, "lane": lane}, {"day": day}] if day is not None else [{}]
     for filters in tries[:-1]:
-        listing = client.list_challenges(**filters)
         try:
+            listing = client.list_challenges(**filters)
             return find_challenge(listing, challenge_id), listing
         except GameMasterError:
-            continue  # A lane named differently from the ID: widen to the whole day.
+            # A lane named differently from the ID ("binary-reverse-engineering" lists as
+            # "binary"; the server answers HTTP 400 invalid_lane): widen to the whole day.
+            continue
     listing = client.list_challenges(**tries[-1])
     return find_challenge(listing, challenge_id), listing
 

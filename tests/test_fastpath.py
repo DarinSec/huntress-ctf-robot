@@ -242,6 +242,35 @@ class FastPathTests(unittest.TestCase):
         self.assertFalse([call for call in client.calls if call[0] == "submit_many"])
         self.assertIn("clock keeps running", self.output.getvalue())
 
+    def test_questions_are_printed_once(self):
+        client = FakeClient(self.output)
+        questions = [{"id": "a", "question": "Decode the Base64 text, question %d." % n} for n in range(3)]
+        client.assignment["questions"] = questions
+        client.status_response = {"attempt": {**client.assignment, "result": "CORRECT"}}
+        client.status_response["attempt"].pop("deadline")
+        self.run_fast(client)
+        output = self.output.getvalue()
+        self.assertEqual(output.count("question 2."), 1)
+        self.assertIn("[3 questions, as in the assignment]", output)
+
+    def test_web_targets_are_reported_without_a_download(self):
+        client = self.pipelining_client()
+        client.assignment = {
+            "answer_ids": ["flag"], "attempt_id": "w", "state": "active",
+            "targets": [{"name": "shop", "url": "http://10.1.2.3:8080/"}],
+        }
+        record = {"id": "c", "lane": "web-exploitation", "run_for_time_supported": True}
+        root = Path(self.directory.name)
+        with redirect_stdout(self.output):
+            code = run_fast(client, "c", challenge=record, artifact_dir=root, work_dir=root / "work",
+                            hints_path=root / "hints.json", ntp=lambda: None)
+        self.assertEqual(code, UNRESOLVED)
+        # No artifact GET and no pipelined pair, so pipelining stays on for the route.
+        self.assertEqual(client.calls, [("start", False), "status"])
+        self.assertIn('"pipelining": true', self.network_state())
+        self.assertIn("http://10.1.2.3:8080/", self.output.getvalue())
+        self.assertIn("need a Web solver", self.output.getvalue())
+
     def test_conflicting_candidates_are_not_submitted(self):
         class DisagreeingSolver:
             def solve(self, context):
@@ -299,6 +328,18 @@ class FastPathTests(unittest.TestCase):
         self.assertIn(("retry", True), client.calls)
         self.assertNotIn(("start", True), client.calls)
         self.assertIn("Route: retry", self.output.getvalue())
+
+    def test_reserve_keeps_the_last_variants(self):
+        for remaining, raced in ((9, True), (8, False), (None, False)):
+            with self.subTest(remaining=remaining):
+                client = FakeClient(self.output)
+                client.status_response = {"answer_ids": ["a"], "result": "CORRECT"}
+                if remaining is not None:
+                    client.status_response["ranked_attempts_remaining"] = remaining
+                code = self.run_fast(client, reserve=8)
+                self.assertEqual(("retry", True) in client.calls, raced)
+                self.assertEqual(code, COMPLETE if raced else UNRESOLVED)
+        self.assertIn("kept in reserve", self.output.getvalue())
 
     def test_routes_that_must_not_start_a_timer(self):
         for status, expected, reason in (

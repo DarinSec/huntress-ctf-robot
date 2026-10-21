@@ -9,6 +9,9 @@ import zipfile
 from huntress_ctf.artifacts import artifact_kind, artifact_summary, save_artifact
 from huntress_ctf.cli import main
 from huntress_ctf.client import GameMasterError
+from huntress_ctf.containers import unwrap
+from huntress_ctf.lock import robot_lock
+from huntress_ctf.workspace import render_triage
 
 
 class CliTests(unittest.TestCase):
@@ -17,6 +20,13 @@ class CliTests(unittest.TestCase):
         patcher = patch("huntress_ctf.cli.load_env")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The robot lock lives in a temp directory, never in the developer's home.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.lock = Path(directory.name) / "robot.lock"
+        environment = patch.dict("os.environ", {"HUNTRESS_LOCK": str(self.lock)})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_triage_is_offline_and_reports_members(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -28,6 +38,16 @@ class CliTests(unittest.TestCase):
                 client.assert_not_called()
         self.assertIn("Unpacked members", stdout.getvalue())
         self.assertIn("notes.txt", stdout.getvalue())
+
+    def test_suggest_is_offline_and_names_the_field(self):
+        from test_formats import macho_with_commands
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "macos-001.bin"
+            path.write_bytes(macho_with_commands())
+            with patch("huntress_ctf.cli.GameMasterClient") as client, redirect_stdout(StringIO()) as stdout:
+                self.assertEqual(main(["suggest", "macho.uuid", str(path)]), 0)
+            client.assert_not_called()
+        self.assertIn("uuid = '385DB3EB-80F9-2D37-68A1-01BF9A83EA22'", stdout.getvalue())
 
     def test_triage_time_reports_solver_costs_offline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,6 +100,19 @@ class CliTests(unittest.TestCase):
                         self.assertEqual(main(["submit", "c", "a", "value"]), code)
                     self.assertNotIn("secret-token", stdout.getvalue())
                     self.assertNotIn('"hidden"', stdout.getvalue())
+
+    def test_second_robot_stops_before_any_request(self):
+        client = Mock(token=None)
+        client.status.return_value = {"state": "active"}
+        with robot_lock("daily --day 20", path=self.lock):
+            with patch("huntress_ctf.cli.GameMasterClient", return_value=client):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as stderr:
+                    self.assertEqual(main(["submit", "c", "a", "value"]), 1)
+                    # Reading never needs the lock.
+                    self.assertEqual(main(["status", "c"]), 0)
+        self.assertIn("daily --day 20", stderr.getvalue())
+        client.submit.assert_not_called()
+        client.status.assert_called_once()
 
 
 class ArtifactTests(unittest.TestCase):
@@ -141,6 +174,22 @@ class TriageTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, artifact_kind(artifact))
+
+    def test_triage_lists_questions_and_missing_parsers(self):
+        artifact = zipped("macos-001.bin", "doc.pdf")
+        questions = [
+            {"id": "a", "question": "Determine pdf.header_version for doc.pdf.", "artifact": "e.zip -> doc.pdf",
+             "answer_format": {"kind": "pattern"}},
+            {"id": "b", "question": "Determine macho.uuid for macos-001.bin.", "artifact": "e.zip -> macos-001.bin"},
+            {"id": "c", "question": "Recover the exact synthetic campaign identifier."},
+            {"id": "d", "question": "Recover the exact synthetic campaign identifier."},
+        ]
+        report = render_triage(artifact, unwrap(artifact).members, questions=questions)
+        self.assertIn("## Questions (4, 3 distinct)", report)
+        self.assertIn("2 x `c`", report)
+        self.assertIn("pdf.header_version for doc.pdf.\" **(parser exists)**", report)
+        self.assertIn("macho.uuid for macos-001.bin.\" **(NO PARSER", report)
+        self.assertIn('{\\"kind\\": \\"pattern\\"}', report)
 
     def test_binary_summary_includes_utf16_strings(self):
         artifact = b"\x00\xfe" + "http://wide.example/x".encode("utf-16-le") + b"\xff\x00plain-ascii\x00"

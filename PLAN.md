@@ -65,21 +65,30 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
 1. **En robot per lag, även för hand.** Låset i `day.sh` gäller bara skriptet. Lägg
    låset i Python (`~/.huntress/robot.lock`) runt allt som anropar start, retry och
    submit, så att en körning för hand väntar eller avbryts med ett tydligt besked.
+   **Klart (`lock.py`):** andra roboten stoppas och får veta vem som håller låset,
+   eller väntar med `--lock-wait`; `day.sh` väntar upp till en timme.
 2. **Kör lanes parallellt.** `daily` kör uppgifterna en i taget (`daily.py`, rad 76).
    Kör varje uppgiftsfamilj (Single Solve, Time Trial, Mastery i den ordningen) i en
    egen tråd med egen anslutning. Idag tog den otidsatta delen 37 s; parallellt blir det
    ungefär den längsta kedjan (Binary, cirka 13 s).
+   **Klart:** sex familjer åt gången (`--workers`), utskriften hålls ihop per familj.
 3. **Börja exakt 15:00:00.** `day.sh` sover till 15:02. Fråga i stället `list --day N
    --lane <lane>` (~1 s per anrop) från 15:00:00 tills den nya dagen syns, och starta
    sedan direkt.
+   **Klart:** `day.sh` vaknar 14:59:30; `daily --wait-release` frågar Warmups varje sekund.
 4. **Fortsätt efter första svepet.** Byt markeringen "dagen klar" mot en ny körning var
    15:e minut så länge dagen har olösta uppgifter. Då löser roboten själv Single Solve
    och kör loppet när någon pushar en ny lösare och driftsätter den. Tidsatta lopp får
    bara köras en gång per rutt och dag. Spara bästa tid i `hints.json`, så att varje
    körning inte förbrukar en tidsatt variant (32 för dagens Metadata-rutter, 256 för
    Warmups).
+   **Klart:** cron var 15:e minut; ett nytt svep bara när `~/src` eller `hints.json`
+   ändrats (`~/.huntress/dayNN.swept`). Varje rutt körs tidsatt en gång (`--rerace`
+   kör om); `hints.json` sparar `races` och `best_on_clock_ms`.
 5. **Web: hoppa över filhämtningen** när start-svaret har `targets[]`. Då rapporteras
    rutten som olöst i stället för som fel, och ett meningslöst anrop försvinner.
+   **Klart:** ingen hämtning och ingen pipelining; `daily` startar Web bara med
+   `--lane web-exploitation`, så svepen inte väcker mål i onödan.
 6. **Mach-O i `metadata.py` och `artifacts.py`** (`macho.cpu_type_set`): triage kallade
    filen "unrecognized binary data". Fat-header `0xCAFEBABE`, thin
    `0xFEEDFACE`/`0xFEEDFACF`. Ordning och namnformat för CPU-typerna är okända;
@@ -96,10 +105,17 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
    proxyn och om HTTP Range går att dela upp på flera anslutningar. Ta reda på om
    servern kompenserar (`ranked_reference_bytes_per_second` = 1 MiB/s,
    `ranked_transfer_allowance_ms` 600 för TT och 3 000 för Mastery).
+   **Mätt 21 okt 00:20 (Homebase → proxyn, Binary dag 20):** Range stöds inte (svaret
+   är 200 med hela filen), så uppdelad hämtning går inte. Utanför rusningen tog filen
+   3,0–3,6 s (~9 MB/s), mot 8,4 s vid släppet. Datan går inte att komprimera (gzip ger
+   samma storlek och 4,8 s), och roboten skickar redan `Accept-Encoding: identity`.
+   Kvar att ta reda på: om servern kompenserar för storleken.
 10. **Kortare utskrift.** Loggen blev 2,2 MB eftersom uppgiften skrivs ut två gånger
     (16 000 rader för Script). Skriv ut den en gång och sammanfatta när frågorna är fler
     än ~50. Hela listan finns redan i `work/<id>/assignment.json`, så kravet på full
     insyn i `AGENTS.md` uppfylls ändå.
+    **Klart:** frågelistan skrivs ut en gång, med uppdraget; status före och efter
+    hänvisar till den.
 
 ### P2: när P0 och P1 är klara
 
@@ -108,6 +124,50 @@ alltså en gammal typ. **Varje gammal typ vi kodar gäller därför också framt
     på 1,9 s, och då lönar det sig att dela upp Mastery-inlämningen.
 12. **Gemensam hints-källa.** `hints.json` finns på PC:n och på Homebase och glider
     isär. Den Homebase som spelar är sanningen.
+
+## Läget 21 okt: alla dag 1–20 lösta; tiden och Hall of Fame avgör
+
+`list` visar att laget har löst alla 6 lanes × 3 lägen för dag 1–20. Poäng för gamla
+dagar finns alltså inte kvar. Kvar finns dag 21–31 och Hall of Fame (varje ny tidsatt
+variant kan sänka lagets bästa tid per rutt).
+
+Lagets sista flagga per dag, i minuter efter släppet (`scripts/homebase.sh times`):
+
+| Dag | 15 | 16 | 17 | 18 | 19 | 20 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sista flagga | 52,6 | 13,6 | 83,6 | 65,0 | 49,3 | 14,9 |
+| Lane | Metadata M | Metadata M | Script M | Script M | Web M | Metadata M |
+
+- **Metadata Mastery var sist tre av sex dagar.** En ny typ löses för hand och kodas
+  sedan. Körschemat i `CLAUDE.md` ("Release day: a new question type") siktar på cirka
+  6 min: `homebase.sh pull`, parser, `deploy`, `sweep`. Cron varje minut tar upp ny kod
+  inom 60 s.
+- **Script Mastery dag 17–18 och Web Mastery dag 19:** Ilses, Parsas och Davids lösare
+  bör ligga i den gemensamma roboten, så att de körs automatiskt från 15:00.
+- **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter varannan
+  timme 00:30–10:30 UTC, med `--reserve 8` och `--gate-ms 250` (median 208 ms uppmätt).
+
+## Grenen `work-in-progress` (Codex, 21 okt): inte inslagen
+
+Provad 21 okt 14:10 på dag 20:s riktiga uppgifter (kopia på Homebase, ingen inlämning):
+
+| Lösare | Besvarade frågor |
+| --- | --- |
+| Script | 456 av 1 329 (34 %, korrektheten okänd) |
+| Binary | 0 av 240 |
+| Android | 0 av 1 |
+
+Ingen ger alltså en flagga, eftersom Single Solve kräver alla svar. Dessutom:
+
+- Grenens `macho_cpu_type_set` svarar med namn (`["ARM64"]`), men servern godkände
+  hex (`["0x0100000c"]`, `learn` 20 okt).
+- Lås, `daily`, `fastpath`, `hints` och `day.sh` dubblerar det som redan körs på
+  `release/p0`.
+- Grenen tar bort `.env.example`.
+
+Idén med ett `lanes`-attribut per lösare är bra (punkt 8) och kan tas in separat.
+Script-lösaren är värd att bygga vidare på för Ilses lane, testad mot riktiga frågor
+med `learn`.
 
 ## Arbetssätt i laget
 

@@ -38,6 +38,12 @@ from .workspace import write_workspace
 
 KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
 REMAINING_FIELDS = ("ranked_attempts_remaining", "unique_attempts_remaining")
+# Lanes whose start returns live `targets[]` instead of a file to download.
+TARGET_LANES = {"web-exploitation"}
+
+
+def lane_of(challenge: dict[str, Any], challenge_id: str) -> str:
+    return challenge.get("lane") or challenge_id.split("-day-")[0]
 
 
 @dataclass
@@ -71,19 +77,22 @@ class Run:
     conflict: bool = False
     submitted: dict[str, str] = field(default_factory=dict)
     result: Any = None
+    targets: list[Any] = field(default_factory=list)  # Web: live sites, no artifact.
 
 
-def plan_route(before: Any, challenge: dict[str, Any]) -> tuple[str, str | None]:
+def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tuple[str, str | None]:
     """Choose 'start' or 'retry', or 'pending'/'stop' with a reason, before the clock starts.
 
     `start` only reconnects to the current attempt and never changes its mode, so a new
     timed run after a completed or expired attempt needs `retry` with run_for_time.
+    `reserve` keeps that many fresh timed variants unspent (Hall of Fame re-races); with
+    a reserve, an unknown remaining count stops the run too.
     """
     try:
         state = AttemptState.parse(before)
         fields = current_fields(before)
     except GameMasterError:
-        return "start", None
+        return ("stop", "The remaining timed variants are unknown, and a reserve is set.") if reserve else ("start", None)
     remaining = next((
         source[name] for source in (fields, challenge) for name in REMAINING_FIELDS
         if type(source.get(name)) is int
@@ -93,6 +102,8 @@ def plan_route(before: Any, challenge: dict[str, Any]) -> tuple[str, str | None]
     if state.complete or state.expired:
         if remaining == 0:
             return "stop", "No fresh timed variant remains for this challenge."
+        if reserve and (remaining is None or remaining <= reserve):
+            return "stop", f"{remaining} fresh timed variants remain; {reserve} are kept in reserve."
         return "retry", None
     active = not state.inactive and (state.attempt_id is not None or bool(state.answer_ids))
     if active and not state.deadline:
@@ -298,9 +309,14 @@ def _race(
     run.marks["start received"] = clock()
     run.wall["start received"] = time.time()
     run.started = AttemptState.parse(run.attempt)
+    listed = deliveries(run.attempt)
+    targets = current_fields(run.attempt).get("targets")
+    if isinstance(targets, list) and targets and not listed:
+        # Web: there is no file, and a GET would only be HTTP 400 invalid_delivery.
+        run.targets = targets
+        return
     if not _workable(run.started):
         return
-    listed = deliveries(run.attempt)
     if len(listed) > 1:
         # Separate deliveries (Warmups Mastery Days 2-6): each question names one.
         run.deliveries = _fetch_deliveries(client, challenge_id, listed, run.helpers)
@@ -407,6 +423,33 @@ def _server_clock(run: Run) -> dict[str, float] | None:
     return clock
 
 
+def _without_repeats(value: Any, printed: set[str]) -> Any:
+    """`value` with every question list already printed replaced by a short note.
+
+    A Script Analysis Mastery holds up to 6,245 questions; printing them with the
+    assignment and again with the status made a 2.2 MB log (20 Oct 2026).
+    """
+    if isinstance(value, dict):
+        return {
+            key: f"[{len(item)} questions, as in the assignment]"
+            if key == "questions" and isinstance(item, list) and json.dumps(item, sort_keys=True) in printed
+            else _without_repeats(item, printed)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_without_repeats(item, printed) for item in value]
+    return value
+
+
+def _question_lists(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        found = {json.dumps(value["questions"], sort_keys=True)} if isinstance(value.get("questions"), list) else set()
+        return found.union(*(_question_lists(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_question_lists(item) for item in value))
+    return set()
+
+
 def _report(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
     before: Any, run: Run, hint: dict[str, Any] | None, artifact_dir: Path,
@@ -414,9 +457,10 @@ def _report(
 ) -> None:
     print("Challenge:")
     print_result(challenge, secrets)
+    printed = _question_lists(run.attempt)
     if before is not None:
         print("Status before start:")
-        print_result(before, secrets)
+        print_result(_without_repeats(before, printed), secrets)
     if not run.timed:
         print("Route: start (untimed request; reconnects to the current attempt)")
     else:
@@ -436,6 +480,9 @@ def _report(
         )
         if challenge.get("run_for_time_supported") is not True:
             print("This route does not advertise run_for_time_supported; it may be timed by default.")
+    if run.targets:
+        print("Live targets (no artifact to download):")
+        print_result(run.targets, secrets)
     if run.artifact is not None:
         try:
             path, digest = save_artifact(run.artifact, challenge_id, artifact_dir)
@@ -477,7 +524,7 @@ def _report(
         try:
             responses["after"] = current = client.status(challenge_id)
             print("Current status:")
-            print_result(current, secrets)
+            print_result(_without_repeats(current, printed), secrets)
         except GameMasterError as exc:
             print(f"Status after the run is unavailable: {exc}")
     print_result({"timings_ms": _timings(run)})
@@ -490,6 +537,9 @@ def _outcome(run: Run, challenge_id: str, hints_path: Path | None) -> int:
     terminal = terminal_result(started)
     if terminal is not None:
         return terminal
+    if run.targets:
+        print("Web route: its live targets need a Web solver, and there is none yet. Nothing was submitted.")
+        return UNRESOLVED
     answer_ids = started.answer_ids
     if not answer_ids:
         print("No answer_ids were issued by start. This route needs additional instructions or a CourseStack submission.")
@@ -542,6 +592,7 @@ def run_fast(
     ntp: Callable[[], float | None] = network.clock_offset,
     gate_ms: float | None = None, gate_wait: float = 600.0,
     sleep: Callable[[float], None] = time.sleep, report: dict[str, Any] | None = None,
+    reserve: int = 0,
 ) -> int:
     """Solve one challenge. `challenge` is its record from a list the caller already has.
 
@@ -550,6 +601,7 @@ def run_fast(
     `pipeline=False` keeps one request at a time even where the probe passed.
     `gate_ms` (timed) waits up to `gate_wait` s for the server to answer status that fast
     before spending a variant. `report`, when given, receives the run's timings.
+    `reserve` (timed) never spends the last that many fresh timed variants.
     """
     secrets = (client.token,) if client.token else ()
     responses: dict[str, Any] = {}
@@ -559,7 +611,9 @@ def run_fast(
     base_url = getattr(client, "base_url", None)
     run = Run(
         timed=timed, run_for_time=timed and challenge.get("run_for_time_supported") is True,
-        pipelined=pipeline and network.pipelining_ok(base_url, network_path),
+        # A Web start has no artifact to pair with, and its failed GET would turn pipelining off.
+        pipelined=pipeline and lane_of(challenge, challenge_id) not in TARGET_LANES
+        and network.pipelining_ok(base_url, network_path),
     )
     before = None
     if timed:
@@ -568,7 +622,7 @@ def run_fast(
             responses["before"] = before = client.status(challenge_id)
         except GameMasterError as exc:
             before = {"unavailable": str(exc)}
-        run.route, reason = plan_route(before, challenge)
+        run.route, reason = plan_route(before, challenge, reserve)
         if run.route in ("pending", "stop"):
             print("Challenge:")
             print_result(challenge, secrets)
@@ -595,8 +649,11 @@ def run_fast(
         run.clock_offset = ntp()
     hint = get_hint(challenge_id, hints_path)
     warm_up(SOLVERS)
-    collecting = gc.isenabled()
-    gc.disable()  # No collector pauses on the clock; the race allocates little.
+    # No collector pauses on the clock; the race allocates little. Untimed runs leave the
+    # collector alone: `daily` runs them in parallel threads, and gc is process-wide.
+    collecting = timed and gc.isenabled()
+    if collecting:
+        gc.disable()
     try:
         _race(client, challenge_id, challenge, run, artifact_dir, hint, clock)
     finally:

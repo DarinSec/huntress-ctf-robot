@@ -33,7 +33,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
 - Unpacks ZIP (incl. ZipCrypto with the lesson password, default `infected`), gzip and tar
   in memory (`containers.py`); solvers see them as `context.members`. Encrypted entries of
   32 KiB or more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
-  in pure Python), CRC-checked against the ZIP itself.
+  in pure Python), CRC-checked against the ZIP itself. Where none reads AES (the playing
+  Homebase has only Info-ZIP unzip), the `cryptography` package decrypts it in Python with
+  the HMAC checked (day 20 Script: 145 members in 356 ms).
 - Peels stacked encodings until text states an answer (`decoders.py`, `LayeredDecodeSolver`).
 - Extracts metadata (EXIF/GPS, PNG text, PDF Info/XMP, Office docProps), IOCs, and decoded
   PowerShell/Base64/char-code blobs (`evidence.py`); `FactSolver` answers "what is the
@@ -54,6 +56,16 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   until status answers that fast (skips without spending a variant after `--gate-wait`);
   `--repeat N` races N fresh variants, Hall of Fame keeps the best. `daily` reports
   `on_clock_ms`/`best_on_clock_ms`; `wall_seconds` is the whole command.
+- One robot per machine: `start`, `retry`, `solve`, `learn`, `daily` and `submit` hold
+  `~/.huntress/robot.lock` (`HUNTRESS_LOCK` overrides); a second robot stops with the
+  holder's command, or queues with `--lock-wait SECONDS`. Read-only commands never lock.
+- `daily` untimed runs each challenge family (Single Solve, then Time Trial, then
+  Mastery) in its own thread and connection; the timed routes of an unsolved Single
+  Solve are skipped (HTTP 409). Races stay one at a time, each route once: hints.json
+  keeps `raced_at`, `races` and `best_on_clock_ms`; `--rerace` races again.
+  `--wait-release S` (with `--day`) polls one lane until the day is listed.
+- Web routes return `targets[]` and no file: nothing is downloaded, and `daily` skips
+  them unless asked with `--lane web-exploitation`.
 
 ## Lane status
 
@@ -63,6 +75,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   offline; 34 Time Trial/Mastery routes scored CORRECT live (19 Oct 2026); four have no
   fresh variants left. A new day's line chain is learned from its proven single-solve
   hint; if its encoding is new, add a strict layer (or a weak step) to `decoders.py`.
+  Strict layers for formats no day used yet are ready: ascii85 (`<~ ~>`), base85, qp,
+  uu, zlib/gzip, braille, nato, unicode (`U+XXXX`), and `\116`-style octal escapes;
+  the 79 saved warmup artifacts decode exactly as before with them.
 - **Metadata Forensics: done.** `solvers/metadata.py` (`metadata-facts`): references
   "[delivery N: ]archive -> member", file facts, filename by role, digest-ordered JSON,
   and one stdlib parser per `Determine <property>` (incl. OLE2/MSI, .NET metadata, LNK,
@@ -76,9 +91,18 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   "incorrect" with nothing accepted. To learn a new lane's conventions run
   `learn <id>` (spends one variant): the robot's answers go per question kind, and the
   report names the kinds that fail. Fix those, then race normally (one request).
-- Next: Mobile Android (109), then Binary (11.7k) and Script Analysis (73k; Mastery up
-  to 6,245 questions). Their samples look like malware: analyse on Homebase over SSH
-  (`~/.ssh/huntress_homebase`), not on the player's PC with Bitdefender.
+- **Mobile Android: done (day 21).** `solvers/mobile_puzzle.py` decodes each app's
+  `assets/huntress_puzzle.json` by its codec (reverse, base64, hex, split, reflection,
+  dynamic payload DEX, ...) into the `ANS-` answer code; all three day 21 modes CORRECT.
+- **Script Analysis: partial.** `solvers/script_descriptors.py` answers every question of
+  the specimens with a `HUNTRESS_ANALYSIS_V1` header (B64/HEX/HB64/FRAG): ~54% of a day,
+  accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
+  families declare their own codec in the file (`<material>|<transform>|<key>`, e.g.
+  `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
+- **Binary** (owner David) and **Web Exploitation** (owner Parsa, live targets): manual.
+  Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
+- Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
+  new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
 
 ## Live service facts (19 Oct 2026)
 
@@ -159,7 +183,40 @@ Never read, print, or copy that file.
 .\scripts\huntress.ps1 daily --timed                       # only on request; proven only
 ```
 
-On the Homebase that plays, `scripts/homebase-day.sh` (cron; install steps in its header)
-runs `daily` untimed at the release and then races the proven routes.
+On the Homebase that plays, `scripts/homebase-day.sh` (cron every minute; install steps in
+its header) runs `daily` untimed from the release and then races the proven routes; it
+sweeps again within a minute whenever `~/src` or hints.json changes.
+`scripts/homebase-hof.sh` (cron every two hours 00:30-10:30 UTC) re-races every proven Warmups and
+Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
+
+## Release day: a new question type
+
+`solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
+parser knows, a Single Solve answers once with the field `suggest.confident()` finds
+clearly (named like the property, e.g. `macho.uuid` -> `uuid`), formatted by the suffix
+convention. A CORRECT single stores the mapping as the hint's chain
+(`["autoprop", "macho.uuid=macho:uuid"]`); Time Trial, Mastery and later days use only
+confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
+
+The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
+one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
+last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
+
+1. `scripts/homebase.sh report`: every route's outcome, and for each unresolved Warmups or
+   Metadata route its questions with the field suggestions (`log` shows the raw tail).
+2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format,
+   marks a `Determine <property>` without a parser and, under it, suggests the matching
+   field and a candidate answer in the suffix convention (`_u16_hex` -> `0x%04x`, `_set`
+   -> sorted JSON). "## Format fields" lists every header field of each executable
+   (`formats.py`: Mach-O load commands, ELF, PE, WebAssembly, Java class, DEX).
+   Offline on any file: `python -m huntress_ctf suggest <property> <file>`.
+3. Add the parser to `PROPERTIES` in `solvers/metadata.py`, usually one line on top of
+   `formats.py` (e.g. `formats.macho_fields(data)["uuid"]`, `formats.elf(data)`), or a layer in
+   `decoders.py`, with a synthetic test; run the tests.
+4. `scripts/homebase.sh deploy` (tests on the VM, then swaps `~/src`), then
+   `scripts/homebase.sh sweep`: Single Solve, Time Trial and Mastery score untimed, then
+   race once.
+5. `scripts/homebase.sh times`: minutes after the release per route; the last flag of the
+   day is the team's finish.
 
 Tests must pass temp paths for `work_dir` and `hints_path` so nothing lands in the repo.

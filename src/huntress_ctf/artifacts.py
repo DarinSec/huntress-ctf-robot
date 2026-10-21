@@ -11,6 +11,7 @@ import re
 import zipfile
 
 from .client import GameMasterError
+from .macho import kind as macho_kind
 
 
 def artifact_path(challenge_id: str, digest: str, directory: Path = Path("artifacts")) -> Path:
@@ -65,6 +66,9 @@ def artifact_kind(artifact: bytes) -> str:
     for magic, kind in _SIGNATURES:
         if artifact.startswith(magic):
             return kind
+    macho = macho_kind(artifact)
+    if macho:
+        return macho
     if artifact.startswith(_ZIP_MAGIC):
         try:
             with zipfile.ZipFile(BytesIO(artifact)) as archive:

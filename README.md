@@ -1,5 +1,7 @@
 # Huntress CTF Robot
 
+**Teammates: start with [TEAM.md](TEAM.md)** (roles, setup, how to add your lane).
+
 A Python client and autonomous solver pipeline for Huntress CTF 2026. It can fetch an assignment, analyze its assigned artifact, submit supported answers, and interpret the Game Master's result. The client has no third-party runtime dependencies.
 
 The current solver library supports explicit Base64, ROT13, hexadecimal, and 8-bit binary decoding tasks, assignments explicitly requesting a JSON answer map, and stacked encodings (Morse, binary, hex, decimal, Base32, Base64, ROT13/ROT47 in any order, e.g. Morse → hex → text) whose decoded text explicitly states the answer. It does **not yet solve arbitrary CTF challenges**, investigate live targets, or run the whole contest unattended.

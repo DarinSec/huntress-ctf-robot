@@ -201,6 +201,63 @@ def _external_unzip(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def _aes_member(blob: bytes, info: zipfile.ZipInfo, passwords: tuple[str, ...]) -> bytes | None:
+    """A WinZip AES (AE-1/AE-2) member in Python, when no external tool could read it.
+
+    The playing Homebase has only Info-ZIP unzip, which cannot do AES, so the day 20
+    Script Analysis archive unpacked to nothing. Needs the `cryptography` package
+    (imported here, so a machine without it only loses this path). The HMAC-SHA1
+    authentication code is checked like a CRC; nothing unverified is returned.
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        return None
+    import hashlib
+    import hmac
+    import struct
+
+    start = info.header_offset
+    if blob[start:start + 4] != b"PK\x03\x04":
+        return None
+    name_length, extra_length = struct.unpack_from("<HH", blob, start + 26)
+    extra = info.extra or blob[start + 30 + name_length:start + 30 + name_length + extra_length]
+    strength = method = None
+    position = 0
+    while position + 4 <= len(extra):
+        tag, size = struct.unpack_from("<HH", extra, position)
+        if tag == 0x9901 and size >= 7:
+            strength, method = extra[position + 8], struct.unpack_from("<H", extra, position + 9)[0]
+        position += 4 + size
+    key_length = {1: 16, 2: 24, 3: 32}.get(strength)
+    if key_length is None or method not in (0, 8):
+        return None
+    body_start = start + 30 + name_length + extra_length
+    data = blob[body_start:body_start + info.compress_size]
+    salt_length = key_length // 2
+    salt, verifier = data[:salt_length], data[salt_length:salt_length + 2]
+    cipher_text, code = data[salt_length + 2:-10], data[-10:]
+    for password in passwords:
+        keys = hashlib.pbkdf2_hmac("sha1", password.encode(), salt, 1000, 2 * key_length + 2)
+        if keys[-2:] != verifier:
+            continue
+        if not hmac.compare_digest(hmac.new(keys[key_length:-2], cipher_text, hashlib.sha1).digest()[:10], code):
+            return None
+        # WinZip counts the CTR blocks little-endian from 1; one ECB call makes the stream.
+        blocks = b"".join(number.to_bytes(16, "little") for number in range(1, len(cipher_text) // 16 + 2))
+        stream = Cipher(algorithms.AES(keys[:key_length]), modes.ECB()).encryptor().update(blocks)
+        size = len(cipher_text)
+        plain = (int.from_bytes(cipher_text, "big") ^ int.from_bytes(stream[:size], "big")).to_bytes(size, "big")
+        try:
+            content = zlib.decompress(plain, -15) if method == 8 else plain
+        except zlib.error:
+            return None
+        if info.CRC and zlib.crc32(content) != info.CRC:  # AE-1 keeps the CRC too.
+            return None
+        return content
+    return None
+
+
 def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwrapped:
     """Leaf files inside ZIP (incl. ZipCrypto), gzip, and tar containers, nested to MAX_DEPTH."""
     members: list[Member] = []
@@ -249,7 +306,12 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
                             keep(inner, fast[index], depth)
                         continue
                     if info.flag_bits & 0x1 and info.compress_type == _ZIP_AES:
-                        notes.append(f"{inner}: AES-encrypted entry needs bsdtar, 7-Zip, or unzip with a known password")
+                        content = _aes_member(blob, info, passwords)
+                        if content is None:
+                            notes.append(f"{inner}: AES-encrypted entry needs bsdtar, 7-Zip, unzip or the "
+                                         "cryptography package, and a known password")
+                        elif take(len(content), inner):
+                            keep(inner, content, depth)
                         continue
                     content = None
                     for password in ((None,) if not info.flag_bits & 0x1 else passwords):
