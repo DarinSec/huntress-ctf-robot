@@ -360,3 +360,36 @@ class ApkTests(unittest.TestCase):
         self.assertEqual(apk_package_name(self.apk(tiny_axml("com.huntress.arena.p1"))), "com.huntress.arena.p1")
         self.assertIsNone(apk_package_name(b"not an apk"))
         self.assertEqual(dict(describe(self.apk(tiny_axml())))["apk"]["package_name"], "com.example.robot")
+
+
+class MobilePuzzleTests(unittest.TestCase):
+    def apk(self, codec, data, extra=None):
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("AndroidManifest.xml", tiny_axml())
+            archive.writestr("assets/huntress_puzzle.json",
+                             '{"schema":"huntress.mobile.puzzle.v1","codec":"%s","data":"%s"}' % (codec, data))
+            for name, content in (extra or {}).items():
+                archive.writestr(name, content)
+        return buffer.getvalue()
+
+    def test_codecs_and_the_answer_shape(self):
+        import base64
+        from huntress_ctf.solvers.mobile_puzzle import answer_code
+        code = "ANS-0123456789ABCDEF"
+        self.assertEqual(answer_code(self.apk("reverse", code[::-1])), code)
+        self.assertEqual(answer_code(self.apk("base64", base64.b64encode(code.encode()).decode())), code)
+        self.assertEqual(answer_code(self.apk("hex", code.encode().hex())), code)
+        self.assertEqual(answer_code(self.apk("dynamic", "assets/payload.dex", {"assets/payload.dex": b"\0\x14" + code.encode() + b"\0"})), code)
+        self.assertIsNone(answer_code(self.apk("reverse", "not-an-answer")))
+        self.assertIsNone(answer_code(b"not an apk"))
+
+    def test_solver_answers_each_question_from_its_apk(self):
+        from huntress_ctf.solvers import SolveContext
+        from huntress_ctf.solvers.mobile_puzzle import MobilePuzzleSolver
+        apk = self.apk("reverse", "ANS-0123456789ABCDEF"[::-1])
+        question = {"id": "answer", "question": "Submit only the exact backend answer code.", "artifact": "x.apk",
+                    "answer_format": {"kind": "pattern", "syntax": "ANS- followed by exactly 16 uppercase hexadecimal characters"}}
+        context = SolveContext("mobile-android-day-21-x", {"lane": "mobile-android"},
+                               {"answer_ids": ["answer"], "questions": [question]}, apk, None, ("answer",))
+        self.assertEqual([c.answer for c in MobilePuzzleSolver().solve(context)], ["ANS-0123456789ABCDEF"])
