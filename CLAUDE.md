@@ -91,9 +91,18 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   "incorrect" with nothing accepted. To learn a new lane's conventions run
   `learn <id>` (spends one variant): the robot's answers go per question kind, and the
   report names the kinds that fail. Fix those, then race normally (one request).
-- Next: Mobile Android (109), then Binary (11.7k) and Script Analysis (73k; Mastery up
-  to 6,245 questions). Their samples look like malware: analyse on Homebase over SSH
-  (`~/.ssh/huntress_homebase`), not on the player's PC with Bitdefender.
+- **Mobile Android: done (day 21).** `solvers/mobile_puzzle.py` decodes each app's
+  `assets/huntress_puzzle.json` by its codec (reverse, base64, hex, split, reflection,
+  dynamic payload DEX, ...) into the `ANS-` answer code; all three day 21 modes CORRECT.
+- **Script Analysis: partial.** `solvers/script_descriptors.py` answers every question of
+  the specimens with a `HUNTRESS_ANALYSIS_V1` header (B64/HEX/HB64/FRAG): ~54% of a day,
+  accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
+  families declare their own codec in the file (`<material>|<transform>|<key>`, e.g.
+  `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
+- **Binary** (owner David) and **Web Exploitation** (owner Parsa, live targets): manual.
+  Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
+- Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
+  new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
 
 ## Live service facts (19 Oct 2026)
 
