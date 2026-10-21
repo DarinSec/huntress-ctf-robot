@@ -186,7 +186,8 @@ The robot answers every known type at 15:00 (Swedish time). A new type (Metadata
 one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
 
-1. `scripts/homebase.sh log`: which routes are `unresolved`.
+1. `scripts/homebase.sh report`: every route's outcome, and for each unresolved Warmups or
+   Metadata route its questions with the field suggestions (`log` shows the raw tail).
 2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format,
    marks a `Determine <property>` without a parser and, under it, suggests the matching
    field and a candidate answer in the suffix convention (`_u16_hex` -> `0x%04x`, `_set`

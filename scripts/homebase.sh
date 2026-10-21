@@ -12,6 +12,8 @@
 #   scripts/homebase.sh log          the latest day and Hall of Fame summaries
 #   scripts/homebase.sh pull <id>    copy work/<id>/ to artifacts/work/ (git-ignored), show triage.md
 #   scripts/homebase.sh times [day]  minutes after the release at which each route was solved
+#   scripts/homebase.sh report [day] the release at a glance: outcomes, then the questions and
+#                                    field suggestions of each unresolved Warmups/Metadata route
 #
 # HB_HOST and HB_KEY override the host and key.
 set -euo pipefail
@@ -80,8 +82,11 @@ case "${1:-}" in
   times)
     remote "python3 -I - ${2:-1}" < "$root/scripts/solvetimes.py"
     ;;
+  report)
+    remote "python3 -I - ${2:-}" < "$root/scripts/release_report.py"
+    ;;
   *)
-    sed -n '2,19p' "$0"
+    sed -n '2,21p' "$0"
     exit 2
     ;;
 esac
