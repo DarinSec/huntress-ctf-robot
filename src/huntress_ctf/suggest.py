@@ -62,8 +62,8 @@ def formatted(prop: str, value: Any) -> str:
     return str(value)
 
 
-def suggest(prop: str, data: bytes, limit: int = 4) -> list[str]:
-    """Lines such as `macho.uuid -> uuid = 385DB3EB-... (answer as "385db3eb-...")`."""
+def ranked(prop: str, data: bytes) -> list[tuple[int, str, str, Any]]:
+    """(score, format label, field, value), best first, for the fields matching `prop`."""
     namespace, _, name = prop.partition(".")
     wanted = _words(name)
     label_kind = _NAMESPACES.get(namespace)
@@ -79,8 +79,29 @@ def suggest(prop: str, data: bytes, limit: int = 4) -> list[str]:
             if score:
                 scored.append((score, len(key), label, key, value))
     scored.sort(key=lambda item: (-item[0], item[1]))
+    return [(score, label, key, value) for score, _, label, key, value in scored]
+
+
+def confident(prop: str, data: bytes) -> tuple[str, str, str] | None:
+    """(format label, field, formatted answer) when one field clearly is the property.
+
+    Clear means a score of 3 or more (the field is named like the property, or shares
+    several of its words), or 2 with no other field reaching 2.
+    """
+    found = ranked(prop, data)
+    if not found:
+        return None
+    score, label, key, value = found[0]
+    rivals = [item for item in found[1:] if item[0] >= 2 and item[2] != key]
+    if score >= 3 or (score == 2 and not rivals):
+        return label.split()[0], key, formatted(prop, value)
+    return None
+
+
+def suggest(prop: str, data: bytes, limit: int = 4) -> list[str]:
+    """Lines such as `macho: uuid = '385DB3EB-...' -> candidate answer '385DB3EB-...'`."""
     lines = []
-    for score, _, label, key, value in scored[:limit]:
+    for score, label, key, value in ranked(prop, data)[:limit]:
         shown = value[:8] if isinstance(value, list) else value
         lines.append(f"{label}: {key} = {shown!r} -> candidate answer {formatted(prop, value)!r}")
     return lines

@@ -135,3 +135,52 @@ class SuggestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoPropertyTests(unittest.TestCase):
+    """A new Metadata property answered without a human (solvers/autoprop.py)."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = directory.name
+        patcher = patch.dict(os.environ, {"HUNTRESS_STATE_DIR": self.state})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("macos-001.bin", macho_with_commands())
+        self.bundle = buffer.getvalue()
+
+    def solve(self, challenge_id, prop):
+        from huntress_ctf.solvers import SolveContext
+        from huntress_ctf.solvers.autoprop import AutoPropertySolver
+        question = {"id": "q", "question": f"Determine {prop} for macos-001.bin.",
+                    "artifact": "metadata-day-21-evidence.zip -> macos-001.bin"}
+        bundle = BytesIO()
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("metadata-day-21-evidence.zip", self.bundle)
+        context = SolveContext(challenge_id, {"lane": "metadata-forensics"},
+                               {"answer_ids": ["q"], "questions": [question]}, bundle.getvalue(), None, ("q",))
+        return AutoPropertySolver().solve(context)
+
+    def test_single_solve_answers_a_clear_new_property_and_records_the_mapping(self):
+        found = self.solve("metadata-forensics-day-21-x", "macho.uuid")
+        self.assertEqual([(c.answer, c.chain) for c in found],
+                         [("385DB3EB-80F9-2D37-68A1-01BF9A83EA22", ("autoprop", "macho.uuid=macho:uuid"))])
+        self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.flags_u32_hex")[0].answer, "0x00200085")
+
+    def test_timed_routes_use_only_confirmed_mappings(self):
+        from huntress_ctf.hints import record_hint
+        self.assertEqual(self.solve("metadata-forensics-day-21-x/time_trial", "macho.uuid"), [])
+        record_hint("metadata-forensics-day-21-x", self.solve("metadata-forensics-day-21-x", "macho.uuid"))
+        found = self.solve("metadata-forensics-day-21-x/mastery", "macho.uuid")
+        self.assertEqual([c.answer for c in found], ["385DB3EB-80F9-2D37-68A1-01BF9A83EA22"])
+        self.assertIn("confirmed", found[0].evidence)
+
+    def test_known_or_unclear_properties_are_left_alone(self):
+        self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.cpu_type_set"), [])  # Has a parser.
+        self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.weird_unrelated_thing"), [])

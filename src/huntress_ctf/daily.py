@@ -186,6 +186,13 @@ def run_daily(
         listing = {"challenges": [
             record for number in days for record in _records(client.list_challenges(number, lane))
         ]}
+    elif lanes and day is not None:
+        # One list per lane (~1 s each) instead of the whole day (~4 s); the release probe's
+        # list is the first lane's.
+        found = _records(wait_for_release(client, day, lanes[0], wait_release, sleep=sleep)) if wait_release else []
+        for name in lanes[1:] if wait_release else lanes:
+            found += _records(client.list_challenges(day, name))
+        listing = {"challenges": found}
     elif wait_release and day is not None:
         released = wait_for_release(client, day, lane, wait_release, sleep=sleep)
         listing = released if lane else client.list_challenges(day, lane)

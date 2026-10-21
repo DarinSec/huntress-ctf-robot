@@ -208,8 +208,11 @@ class ReleaseDayTests(unittest.TestCase):
         self.assertEqual(fast.call_args_list[0].kwargs["reserve"], 8)
 
     def test_lanes_keep_the_run_to_our_own(self):
+        client = DayClient(released_after=1)
         with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
-            _, output = self.run_daily(DayClient(), day=21, lanes=("warmups",))
+            _, output = self.run_daily(client, day=21, lanes=("warmups", "metadata-forensics"), wait_release=60)
+        # The release probe lists the first lane; the others are listed once; never the whole day.
+        self.assertEqual(client.lists, [(21, "warmups"), (21, "warmups"), (21, "metadata-forensics")])
         self.assertEqual(sorted(call.args[1] for call in fast.call_args_list),
                          ["warmups-day-21", "warmups-day-21/time_trial"])
         self.assertNotIn("binary-day-21", output.split("===== Summary =====")[1])

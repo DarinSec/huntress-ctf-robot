@@ -182,6 +182,13 @@ Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants 
 
 ## Release day: a new question type
 
+`solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
+parser knows, a Single Solve answers once with the field `suggest.confident()` finds
+clearly (named like the property, e.g. `macho.uuid` -> `uuid`), formatted by the suffix
+convention. A CORRECT single stores the mapping as the hint's chain
+(`["autoprop", "macho.uuid=macho:uuid"]`); Time Trial, Mastery and later days use only
+confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
+
 The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
 one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
