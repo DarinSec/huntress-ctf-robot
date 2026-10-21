@@ -147,6 +147,28 @@ Lagets sista flagga per dag, i minuter efter släppet (`scripts/homebase.sh time
 - **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter varannan
   timme 00:30–10:30 UTC, med `--reserve 8` och `--gate-ms 250` (median 208 ms uppmätt).
 
+## Grenen `work-in-progress` (Codex, 21 okt): inte inslagen
+
+Provad 21 okt 14:10 på dag 20:s riktiga uppgifter (kopia på Homebase, ingen inlämning):
+
+| Lösare | Besvarade frågor |
+| --- | --- |
+| Script | 456 av 1 329 (34 %, korrektheten okänd) |
+| Binary | 0 av 240 |
+| Android | 0 av 1 |
+
+Ingen ger alltså en flagga, eftersom Single Solve kräver alla svar. Dessutom:
+
+- Grenens `macho_cpu_type_set` svarar med namn (`["ARM64"]`), men servern godkände
+  hex (`["0x0100000c"]`, `learn` 20 okt).
+- Lås, `daily`, `fastpath`, `hints` och `day.sh` dubblerar det som redan körs på
+  `release/p0`.
+- Grenen tar bort `.env.example`.
+
+Idén med ett `lanes`-attribut per lösare är bra (punkt 8) och kan tas in separat.
+Script-lösaren är värd att bygga vidare på för Ilses lane, testad mot riktiga frågor
+med `learn`.
+
 ## Arbetssätt i laget
 
 - **Gren per lane**, till exempel `lane/script-analysis`, och PR till `main`. Alla
