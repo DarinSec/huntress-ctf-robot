@@ -725,7 +725,7 @@ def document_formats(data: bytes) -> list[tuple[str, dict]]:
         return found
     if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         return [("media_wav", _guarded(_wav, data))]
-    if data[:4] == b"\x4c\0\0\0" and data[4:20] == bytes.fromhex("0114020000000000c000000000000046"):
+    if data[:4] == b"\x4c\0\0\0" and len(data) >= 76:  # HeaderSize 0x4C, as metadata.py's LNK parser.
         return [("lnk", _guarded(_lnk, data))]
     head = data[:4096]
     if re.search(rb"(?im)^from:", head) and re.search(rb"(?im)^(subject|message-id|received):", head):

@@ -107,7 +107,8 @@ class FormatTests(unittest.TestCase):
 
     def test_damaged_and_unknown_bytes_never_raise(self):
         self.assertIn("damaged", elf(tiny_elf()[:70]))
-        self.assertEqual(describe(b"just text"), [])
+        self.assertEqual(describe(b"\x00\x01\x02\xff\xfe"), [])
+        self.assertEqual(dict(describe(b"just text"))["text"]["line_count"], 1)
         self.assertEqual(describe(macho_with_commands()[:40])[0][1].get("damaged")[:12], "load command")
 
 
