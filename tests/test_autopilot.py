@@ -217,3 +217,16 @@ class UntimedSolveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LookupTests(unittest.TestCase):
+    def test_a_lane_the_server_rejects_widens_to_the_day(self):
+        from huntress_ctf.autopilot import lookup_challenge
+        record = {"id": "binary-reverse-engineering-day-21-x", "lane": "binary-reverse-engineering"}
+
+        class Client:
+            def list_challenges(self, day=None, lane=None):
+                if lane:
+                    raise GameMasterError("Game Master returned HTTP 400. invalid_lane")
+                return {"challenges": [record]}
+        self.assertEqual(lookup_challenge(Client(), record["id"])[0], record)
