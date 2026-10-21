@@ -44,8 +44,10 @@ cd "$HOME"
 robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
 # The robot's lanes only: teammates share attempts, and an untimed start of their Time
 # Trial would block their timed race. Add a lane here once the robot has its solver.
-# Android since day 22 (the puzzle-asset solver took all of day 21's variants).
-lanes="warmups,metadata-forensics,mobile-android"
+# Android since day 22 (the puzzle-asset solver took all of day 21's variants). Script
+# since day 22 too: its descriptor answers (54% of a day, all accepted on days 20 and
+# 21) give the teammate who finishes Script a head start; a partial solve stays open.
+lanes="warmups,metadata-forensics,mobile-android,script-analysis"
 log="$HOME/day$day-$(date +%H%M)"
 echo "== Day $day: untimed sweep, $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1
