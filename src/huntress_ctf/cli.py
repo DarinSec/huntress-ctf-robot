@@ -121,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     daily_days.add_argument("--day", type=_day)
     daily_days.add_argument("--days", type=_days, help="Several days, e.g. 1-20 (Hall of Fame re-races)")
     daily.add_argument("--lane")
+    daily.add_argument("--lanes", type=lambda value: tuple(part.strip() for part in value.split(",") if part.strip()),
+                       default=(), help="Only these lanes, comma-separated (leave teammates' lanes alone)")
     daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
     daily.add_argument("--rerace", action="store_true", help="With --timed: also race routes that were raced before (spends variants)")
     daily.add_argument("--wait-release", type=_seconds, default=0, metavar="SECONDS",
@@ -295,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_dir=CAPTURE_DIR if args.capture else None, pipeline=not args.no_pipeline,
                 repeat=args.repeat, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
                 rerace=args.rerace, wait_release=args.wait_release, workers=args.workers,
-                days=args.days, reserve=args.reserve,
+                days=args.days, reserve=args.reserve, lanes=args.lanes,
             )
         elif args.command == "bench":
             print_result(_bench(client, args, token), secrets)

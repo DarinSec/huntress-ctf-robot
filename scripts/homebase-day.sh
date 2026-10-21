@@ -42,15 +42,18 @@ if [ "$now" -lt "$release" ]; then
 fi
 cd "$HOME"
 robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
+# Darin's lanes only: teammates share attempts, and an untimed start of their Time Trial
+# would block their timed race. Add a lane here once the robot has its solver.
+lanes="warmups,metadata-forensics"
 log="$HOME/day$day-$(date +%H%M)"
 echo "== Day $day: untimed sweep, $(date)"
-robot daily --day "$day" --wait-release 1800 > "$log-untimed.log" 2>&1
+robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-untimed.log"
 echo "== Day $day: timed races, $(date)"
 # A short gate: these races only set a first Hall of Fame time (flags came from the
 # untimed sweep, and hof.sh improves times at night), and while they run they hold
 # day.lock and the robot lock that a parser deployed minutes after the release needs.
-robot daily --day "$day" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
+robot daily --day "$day" --lanes "$lanes" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-timed.log"
 version > "$swept"  # After the races, which add to hints.json themselves.
 echo "== Day $day swept, $(date)"

@@ -169,7 +169,7 @@ def run_daily(
     repeat: int = 1, gate_ms: float | None = None, gate_wait: float = 600.0,
     rerace: bool = False, wait_release: float = 0.0, workers: int = WORKERS,
     sleep: Callable[[float], None] = time.sleep, days: list[int] | None = None,
-    reserve: int = 0,
+    reserve: int = 0, lanes: tuple[str, ...] = (),
 ) -> int:
     """`repeat` (timed) races each challenge that many times: Hall of Fame keeps the best.
 
@@ -178,6 +178,8 @@ def run_daily(
     `wait_release` (needs `day`) polls for the day's release for up to that many seconds.
     `days` runs several days in one go (one list per day: ~1 s with a lane, ~4 s without);
     `reserve` (timed) keeps that many fresh variants per route unspent.
+    `lanes` keeps the run to those lanes: teammates share attempts, and an untimed start
+    of their Time Trial would block their timed race until it ends.
     """
     began_all = clock()
     if days:
@@ -190,6 +192,8 @@ def run_daily(
     else:
         listing = client.list_challenges(day, lane)
     records = _records(listing)
+    if lanes:
+        records = [record for record in records if lane_of(record, str(_id(record))) in lanes]
     hints = load_hints(hints_path)
 
     def run_one(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
