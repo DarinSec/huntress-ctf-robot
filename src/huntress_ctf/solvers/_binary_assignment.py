@@ -222,6 +222,12 @@ class AssignedArchive:
                 explicit = [word for word in ("plugin.cmxs", "loader.elf", "stripped.elf", "symbolized.elf", "compact.wasm", "direct.wasm") if word in q]
                 if len(explicit) == 1:
                     chosen = [(i, x) for i, x in chosen if x.filename.endswith(explicit[0])]
+            if len(chosen) > 1 and "primary managed assembly" in family_text:
+                # The primary assembly has its own .runtimeconfig.json, a dependency DLL has
+                # none (day 22: d22--sample.dll beside d22--FSharp.Core.dll).
+                configs = {PurePosixPath(x.filename).name for x in infos if x.filename.endswith(".runtimeconfig.json")}
+                chosen = [(i, x) for i, x in chosen
+                          if PurePosixPath(x.filename).name.rsplit(".", 1)[0] + ".runtimeconfig.json" in configs]
         if len(chosen) != 1:
             return None
         index, info = chosen[0]
