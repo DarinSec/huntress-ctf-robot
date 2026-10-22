@@ -254,6 +254,18 @@ class BinarySolverTests(unittest.TestCase):
                                "7": '["demo_export","#2"]', "8": '["10/1/1033"]', "9": "0x00000a00"})
         self.assertEqual(solve(pe_fixture(), 'Submit section names in section-table entry order as JSON.'), {'0':'[".rdata"]'})
 
+    def test_machine_field_answers_the_decimal_code_for_any_architecture(self):
+        # The accepted machine-label spelling is grader-defined (Day 22 rejected "x86" for a
+        # managed i386 DLL), but the equivalent decimal machine code is accepted for every
+        # machine-field question -- so answer the decimal code for any architecture, not just i386.
+        machine = "Report the processor architecture identified by its executable-header machine field."
+        self.assertEqual(solve(pe_fixture(32), machine), {"0": "332"})       # 0x14c
+        self.assertEqual(solve(pe_fixture(64), machine), {"0": "34404"})     # 0x8664
+        self.assertEqual(solve(elf_fixture(64), machine), {"0": "62"})       # EM_X86_64
+        self.assertEqual(solve(elf_fixture(32, ">", 20), machine), {"0": "20"})  # a PowerPC ELF
+        # A plain architecture question (no "machine field") still returns the readable label.
+        self.assertEqual(solve(pe_fixture(32), "What is the architecture?"), {"0": "x86"})
+
     def test_ambiguous_pe_entry_point_and_function_types_are_skipped(self):
         self.assertEqual(solve(pe_fixture(), "What is the entry point?"), {})
         self.assertEqual(solve(elf_fixture(), "List imported function names."), {})

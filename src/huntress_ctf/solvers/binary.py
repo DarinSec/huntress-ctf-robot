@@ -304,12 +304,15 @@ def _structured(question: Question, analysis: Analysis) -> str | None:
     if "architect" in q:
         if re.search(r"\b(?:offset|address|size|length|hash|digest)\b", q):
             return None
+        if "machine field" in q and len(images) == 1 and getattr(images[0], "machine", None) is not None:
+            # Day 22 rejected the "x86" label for a managed i386 DLL but accepted the decimal
+            # machine code, which every machine-field question's format allows. The accepted
+            # label spelling is not derivable from the bytes, so for a single image we answer
+            # the machine field with its decimal code for ANY architecture -- not just i386, and
+            # even when its arch label is unmapped (so this must run before the arch-None guard).
+            return str(images[0].machine)
         if any(i.arch is None for i in images):
             return None
-        if "machine field" in q.lower() and len(images) == 1 and isinstance(images[0], PE) and images[0].machine == 0x14c:
-            # Day 22 rejected "x86" for a managed i386 DLL and accepted the decimal code,
-            # which every machine-field question allows.
-            return "332"
         values = sorted({i.arch for i in images})
         if re.search(r"\b(?:count|how many|number of)\b", q):
             return str(len(values))
