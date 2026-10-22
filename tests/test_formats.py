@@ -388,6 +388,12 @@ class MobilePuzzleTests(unittest.TestCase):
             archive.writestr("assets/huntress_puzzle.json", json.dumps(
                 {"codec": "split", "data": "", "parts": ["09EA4B497", "ANS-B", "200528"], "order": [2, 0, 1]}))
         self.assertEqual(answer_code(buffer.getvalue()), "ANS-B20052809EA4B497")
+        for puzzle in ({"codec": "caesar", "key": 15, "data": "".join(chr(ord(c) + 15) for c in code)},
+                       {"codec": "indexed", "data": code[10:] + code[:10], "order": list(range(10, 20)) + list(range(10))}):
+            buffer = BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("assets/huntress_puzzle.json", json.dumps(puzzle))
+            self.assertEqual(answer_code(buffer.getvalue()), code, puzzle["codec"])
         self.assertIsNone(answer_code(self.apk("reverse", "not-an-answer")))
         self.assertIsNone(answer_code(b"not an apk"))
 

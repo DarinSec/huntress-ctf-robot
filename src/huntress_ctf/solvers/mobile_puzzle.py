@@ -62,6 +62,19 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
             found.add(base64.b32decode(data + "=" * (-len(data) % 8)).decode("utf-8", "replace"))
         except (binascii.Error, ValueError):
             pass
+    elif codec == "caesar" and isinstance(puzzle.get("key"), int):
+        # Every character moved by key code points (day 7, key 15: "P]b<" -> "ANS-").
+        for shift in (-puzzle["key"], puzzle["key"]):
+            if all(0 <= ord(char) + shift < 0x110000 for char in data):
+                found.add("".join(chr(ord(char) + shift) for char in data))
+    elif codec == "indexed":
+        # data[i] belongs at position order[i] (day 17); both readings, as for "split".
+        order = puzzle.get("order")
+        if isinstance(order, list) and sorted(order) == list(range(len(data))):
+            placed = [""] * len(data)
+            for char, position in zip(data, order):
+                placed[position] = char
+            found |= {"".join(placed), "".join(data[index] for index in order)}
     elif codec == "dynamic" and data in apk.namelist():
         found.update(match.decode() for match in _IN_TEXT.findall(apk.read(data)))
     else:
