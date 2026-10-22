@@ -170,13 +170,16 @@ class ReleaseDayTests(unittest.TestCase):
         self.assertEqual(summary["binary-day-21-x"]["outcome"], "unresolved")
         for blocked in ("binary-day-21-x/time_trial", "binary-day-21-x/mastery"):
             self.assertEqual(summary[blocked]["reason"], "its Single Solve is not solved yet")
-        self.assertIn("no Web solver yet", summary["web-exploitation-day-21-y"]["reason"])
+        self.assertIn("live targets[]", summary["web-exploitation-day-21-y"]["reason"])
         self.assertEqual(code, UNRESOLVED)
 
     def test_web_routes_start_only_when_asked_for(self):
         web = DAY["challenges"][-1]
         self.assertIsNotNone(eligibility(web, False, {}))
         self.assertIsNone(eligibility(web, False, {}, lane="web-exploitation"))
+        # The cron sweep asks with --lanes (plural); web in that set is an explicit request.
+        self.assertIsNone(eligibility(web, False, {}, requested_lanes=("warmups", "web-exploitation")))
+        self.assertIsNotNone(eligibility(web, False, {}, requested_lanes=("warmups",)))
 
     def test_a_route_races_once_and_its_best_time_is_kept(self):
         record_hint("warmups-day-21/time_trial", [AnswerCandidate("a", "x", "s", "e")], self.hints)

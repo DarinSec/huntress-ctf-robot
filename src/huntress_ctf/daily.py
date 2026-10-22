@@ -67,17 +67,20 @@ def _id(record: dict[str, Any]) -> Any:
 
 def eligibility(
     record: dict[str, Any], timed: bool, hints: dict[str, Any], *,
-    lane: str | None = None, rerace: bool = False,
+    lane: str | None = None, requested_lanes: tuple[str, ...] = (), rerace: bool = False,
 ) -> str | None:
     """None when the challenge may run; otherwise the reason it is skipped.
 
-    `lane` is the lane the caller asked for: only an explicit request starts Web routes.
+    Only an explicit request starts a Web route (it reaches the network): the lane named by
+    `--lane`, or present in the `--lanes` set (`requested_lanes`). A bare sweep skips it.
     """
     challenge_id = _id(record)
     if not isinstance(challenge_id, str) or not challenge_id.strip():
         return "no usable challenge ID"
-    if lane_of(record, challenge_id) in TARGET_LANES and lane not in TARGET_LANES:
-        return "live targets[] and no Web solver yet; `daily --lane web-exploitation` starts them anyway"
+    record_lane = lane_of(record, challenge_id)
+    web_requested = lane in TARGET_LANES or record_lane in requested_lanes
+    if record_lane in TARGET_LANES and not web_requested:
+        return "live targets[]; `daily --lane web-exploitation` (or `--lanes ...,web-exploitation`) starts them"
     supports_timed = record.get("run_for_time_supported") is True
     mode = mode_name(record, AttemptState())
     if timed:
@@ -230,7 +233,7 @@ def run_daily(
 
     def run_one(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
         challenge_id = _id(record)
-        reason = eligibility(record, timed, hints, lane=lane, rerace=rerace)
+        reason = eligibility(record, timed, hints, lane=lane, requested_lanes=lanes, rerace=rerace)
         if reason is not None:
             return {"challenge": challenge_id, "outcome": "skipped", "reason": reason}
         began = clock()
