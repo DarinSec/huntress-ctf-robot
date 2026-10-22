@@ -10,6 +10,7 @@ import zipfile
 import zlib
 from io import BytesIO
 
+from ..containers import winzip_counter_blocks
 from ._binary_formats import ParseError
 
 CHUNK = 64 * 1024
@@ -88,7 +89,7 @@ def aes_member(blob, info, password, limit, cipher_types=None):
         for at in range(0, len(encrypted), CHUNK):
             chunk = encrypted[at:at + CHUNK]
             blocks = (len(chunk) + 15) // 16
-            counters = b"".join(n.to_bytes(16, "little") for n in range(counter, counter + blocks))
+            counters = winzip_counter_blocks(counter, blocks)
             stream = encryptor.update(counters)[:len(chunk)]
             counter += blocks
             plain = (int.from_bytes(chunk, "little") ^ int.from_bytes(stream, "little")).to_bytes(len(chunk), "little")

@@ -12,7 +12,10 @@ from unittest.mock import patch
 from tests.test_binary import pe_fixture
 
 
-AUDIT = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts" / "audit-binary.py"))
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "audit-binary.py"
+if not SCRIPT.exists():  # A Homebase deploy copies src/ and tests/ only.
+    raise unittest.SkipTest("scripts/audit-binary.py is not deployed here")
+AUDIT = runpy.run_path(str(SCRIPT))
 
 
 class BinaryAuditTests(unittest.TestCase):

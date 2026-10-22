@@ -218,3 +218,10 @@ class AesZipTests(unittest.TestCase):
             result = unwrap(archive)
             self.assertEqual(result.members, ())
             self.assertIn("AES-encrypted entry", result.notes[0])
+
+
+class CounterBlockTests(unittest.TestCase):
+    def test_counter_blocks_match_packing_each_block(self):
+        for first, count in ((1, 0), (1, 1), (1, 4097), (65537, 300), ((1 << 64) - 2, 4)):
+            expected = b"".join(n.to_bytes(16, "little") for n in range(first, first + count))
+            self.assertEqual(containers.winzip_counter_blocks(first, count), expected)
