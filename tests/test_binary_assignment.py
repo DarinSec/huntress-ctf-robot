@@ -12,7 +12,7 @@ import zipfile
 
 from huntress_ctf.solvers.binary import BinarySolver
 from huntress_ctf.solvers._binary_assignment import config_at
-from huntress_ctf.solvers._binary_formats import PE
+from huntress_ctf.solvers._binary_formats import Neko, ParseError, PE
 from huntress_ctf.solvers._binary_managed import JavaClass, Jar, clr_version
 from tests.test_binary import pe_fixture, elf_fixture, bundle, context
 
@@ -65,6 +65,22 @@ class AssignedBinaryTests(unittest.TestCase):
         self.assertEqual(got, {'unit_analysis_format':'PE_CLI','unit_analysis_version':'v4.0.30319'})
         struct.pack_into("<I", data, 0x95c, 0xffff)
         self.assertEqual(BinarySolver().solve(archive_context({'unit--managed.dll':bytes(data)},qs)), [])
+
+    def test_neko_bytecode_is_classified_by_magic(self):
+        module = b"NEKO" + struct.pack("<iii", 3, 5, 128) + b"\0" * 32
+        reader = Neko(module)
+        self.assertEqual((reader.globals, reader.fields, reader.code_size), (3, 5, 128))
+        prefix = "Use all unit-- members in ZIP central-directory order. "
+        prompt = prefix + ("Classify final bytes by magic and parsed container: elf for ELF, pe for "
+                           "native PE, pe_cli for PE with a valid CLR/CLI header and metadata root, "
+                           "jar for a ZIP/JAR with classfiles, wasm for a valid WebAssembly module, or "
+                           "neko_bytecode for NEKO bytecode. Submit exactly one listed lowercase token.")
+        got = {c.answer_id: c.answer for c in BinarySolver().solve(
+            archive_context({"unit--module.n": module}, [("unit_analysis_format", prompt)]))}
+        self.assertEqual(got, {"unit_analysis_format": "neko_bytecode"})
+        # A truncated NEKO header is rejected (fail safe), never misclassified.
+        with self.assertRaises(ParseError):
+            Neko(b"NEKO\x01")
 
     def test_jar_manifest_classfile_and_hcfg_constant(self):
         blob = BytesIO()

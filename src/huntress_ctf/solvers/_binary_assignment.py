@@ -17,7 +17,7 @@ import zipfile
 import zlib
 
 from ..state import deliveries
-from ._binary_formats import ELF, PE, ParseError, parse_images
+from ._binary_formats import ELF, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
 from ._binary_files import BinaryFiles, MAX_BINARY_MEMBER_BYTES
 from ._binary_managed import Jar, clr_version
@@ -366,6 +366,9 @@ class AssignedArchive:
             if data.startswith(b"PK"):
                 self.jar(data).main
                 return True, "jar"
+            if data.startswith(b"NEKO"):
+                Neko(data)                      # validate the header; malformed -> ParseError -> skipped
+                return True, "neko_bytecode"
             image = self.image(data)
             if isinstance(image, ELF):
                 return True, "elf"

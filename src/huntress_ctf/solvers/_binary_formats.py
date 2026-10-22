@@ -619,6 +619,22 @@ class MachO(Reader):
         return imports, exports
 
 
+class Neko(Reader):
+    """Neko VM bytecode module (.n). Header per NekoVM's loader (vm/load.c): magic 'NEKO', then
+    three int32 LE counts -- globals, fields and code size. We validate the header only; no opcode
+    decode, so deeper questions stay unanswered rather than guessed. Added so a Neko module is
+    classified (neko_bytecode) instead of being reported as an unparsable/other container."""
+    format = "neko_bytecode"
+
+    def __init__(self, data: bytes):
+        super().__init__(data, "<")
+        if self.take(0, 4) != b"NEKO":
+            raise ParseError("Invalid Neko magic")
+        self.globals, self.fields, self.code_size = self.unpack("iii", 4)
+        if self.globals < 0 or self.fields < 0 or self.code_size < 0:
+            raise ParseError("Invalid Neko header counts")
+
+
 Image = PE | ELF | MachO
 
 
