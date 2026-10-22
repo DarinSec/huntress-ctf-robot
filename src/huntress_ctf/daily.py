@@ -198,9 +198,17 @@ def run_daily(
         if wait_release:
             found = _records(wait_for_release(client, day, lanes, wait_release, sleep=sleep))
         listed = {lane_of(record, str(_id(record))) for record in found}
+        whole: list[dict[str, Any]] | None = None
         for name in lanes:
             if name not in listed:
-                found += _records(client.list_challenges(day, name))
+                try:
+                    found += _records(client.list_challenges(day, name))
+                except GameMasterError:
+                    # "binary-reverse-engineering" is not a lane filter (HTTP 400 invalid_lane,
+                    # and "binary" lists nothing): keep that lane's records of the whole day.
+                    if whole is None:
+                        whole = _records(client.list_challenges(day, None))
+                    found += [record for record in whole if lane_of(record, str(_id(record))) == name]
         listing = {"challenges": found}
     elif wait_release and day is not None:
         released = wait_for_release(client, day, lane, wait_release, sleep=sleep)

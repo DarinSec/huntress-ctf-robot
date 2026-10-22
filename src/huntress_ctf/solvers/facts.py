@@ -64,7 +64,9 @@ def _values(facts, category: str) -> list[str]:
 
 # Lanes with structured questions and their own solvers: "What is its SHA-256 digest?"
 # there means compute it from the named file, not find one written in the text.
-DEDICATED_LANES = {"warmups", "metadata-forensics"}
+DEDICATED_LANES = {
+    "warmups", "metadata-forensics", "script-analysis", "binary", "binary-reverse-engineering",
+}
 
 
 class FactSolver:

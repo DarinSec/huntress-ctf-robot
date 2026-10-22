@@ -27,10 +27,10 @@ mkdir -p "$state"
 exec 9>"$state/day.lock"
 flock -n 9 || exit 0  # A sweep is already running or waiting for the release.
 export PYTHONPATH="$HOME/src" HUNTRESS_GM_URL="http://10.0.0.219/huntress-ctf-proxy"
-# What a sweep depends on: the solver code and the proven solvers.
+# What a sweep depends on: the solver code, the proven solvers and this script (its lanes).
 version() {
   { find "$HOME/src" -name '*.py' -type f -print0 | sort -z | xargs -0 sha1sum
-    cat "$state/hints.json" 2>/dev/null; } | sha1sum | cut -c1-16
+    cat "$state/hints.json" "$0" 2>/dev/null; } | sha1sum | cut -c1-16
 }
 swept="$state/day$day.swept"
 [ -e "$swept" ] && [ "$(cat "$swept")" = "$(version)" ] && exit 0  # Nothing new to try.
@@ -47,7 +47,9 @@ robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
 # Android since day 22 (the puzzle-asset solver took all of day 21's variants). Script
 # since day 22 too: its descriptor answers (54% of a day, all accepted on days 20 and
 # 21) give the teammate who finishes Script a head start; a partial solve stays open.
-lanes="warmups,metadata-forensics,mobile-android,script-analysis"
+# Since day 22 Script has script-rules (Ilse) and Binary binary-static-facts (David):
+# both answered every question of the day 20 and 21 Single Solves offline.
+lanes="warmups,metadata-forensics,mobile-android,script-analysis,binary-reverse-engineering"
 log="$HOME/day$day-$(date +%H%M)"
 echo "== Day $day: untimed sweep, $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1
@@ -58,10 +60,12 @@ echo "== Day $day: timed races, $(date)"
 # day.lock and the robot lock that a parser deployed minutes after the release needs.
 robot daily --day "$day" --lanes "$lanes" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-timed.log"
-# A transport or server error in our lanes (an overloaded release) gets another sweep next
-# minute, at most 10 times; unresolved and incorrect do not, so a guess is never repeated.
+# A transport or server error in our lanes (an overloaded release), or a sweep that died
+# before its summary (a failed list), gets another sweep next minute, at most 10 times;
+# unresolved and incorrect do not, so a guess is never repeated.
 retries="$state/day$day.retries"
-if grep -q '"outcome": "error"' "$log-untimed.log" && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
+if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary =====' "$log-untimed.log"; } \
+    && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
   echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
   echo "== Day $day: errors in the sweep; trying again next minute, $(date)"
   exit 0

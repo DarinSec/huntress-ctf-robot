@@ -99,7 +99,15 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
   families declare their own codec in the file (`<material>|<transform>|<key>`, e.g.
   `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
-- **Binary** (owner David) and **Web Exploitation** (owner Parsa, live targets): manual.
+  `solvers/script.py` (`script-rules`, Ilse, on `analysis/scriptrules.py`) decodes those
+  families too: 1329/1329 (day 20) and 1373/1373 (day 21) offline, agreeing with every
+  descriptor answer; ~1.3 s per day. In the robot from day 22.
+- **Binary** (owner David): `solvers/binary.py` (`binary-static-facts`, stdlib only; reads
+  only the members the questions name) answers per question property: 240/240 (day 20) and
+  252/252 (day 21) offline in ~1.9 s and ~210 MB, agreeing in substance with Ilse's
+  independent solver (the rest are spellings the formats allow: ELF/ELF64, x86_64/x86-64).
+  In the robot from day 22. The lane lists only through the whole day (`lane=` is HTTP 400).
+- **Web Exploitation** (owner Parsa, live targets): manual.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
   new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).

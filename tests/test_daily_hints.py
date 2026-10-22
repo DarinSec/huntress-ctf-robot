@@ -219,6 +219,20 @@ class ReleaseDayTests(unittest.TestCase):
                          ["warmups-day-21", "warmups-day-21/time_trial"])
         self.assertNotIn("binary-day-21", output.split("===== Summary =====")[1])
 
+    def test_a_lane_the_server_cannot_filter_comes_from_the_day_list(self):
+        class NoBinaryFilter(DayClient):
+            def list_challenges(self, day=None, lane=None):
+                if lane == "binary":
+                    self.lists.append((day, lane))
+                    raise GameMasterError("HTTP 400 invalid_lane")
+                return super().list_challenges(day, lane)
+        client = NoBinaryFilter()
+        with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
+            _, output = self.run_daily(client, day=21, lanes=("warmups", "binary"))
+        self.assertEqual(client.lists, [(21, "warmups"), (21, "binary"), (21, None)])
+        self.assertIn("binary-day-21-x", [call.args[1] for call in fast.call_args_list])
+        self.assertNotIn("web-exploitation-day-21-y", output.split("===== Summary =====")[1])
+
     def test_waiting_for_the_release_polls_one_lane(self):
         client = DayClient(released_after=3)
         with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE):
