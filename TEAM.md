@@ -24,7 +24,7 @@ on the same challenge collide. Build and test on your own machine; Darin deploys
 | Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`) |
 | Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min |
 | Binary | David | Automatic (`solvers/binary.py`); new types still need code: day 22's primary DLL and machine field |
-| Web Exploitation | Parsa | Manual (live targets); goal: scripts for repeat types (LFI, XSS, sessions) |
+| Web Exploitation | Parsa | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP and keep-alive reuse |
 
 ## Set up (Windows, macOS or Linux)
 
