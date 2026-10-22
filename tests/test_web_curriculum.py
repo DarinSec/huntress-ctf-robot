@@ -11,13 +11,16 @@ sequence.
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from huntress_ctf.solvers.web import HostNotAllowed, TargetContext, scoped_http
 from huntress_ctf.solvers.web import WEB_SOLVERS
+from huntress_ctf.solvers.web import handlers
 from huntress_ctf.solvers.web.curriculum import CurriculumWebSolver, _ScopedTransport
 
 PROOF = "proof_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"  # proof_<32 hex>, the shape handlers return
@@ -131,6 +134,26 @@ class AdapterTests(unittest.TestCase):
             candidates = CurriculumWebSolver().solve(_context(server.url))
         self.assertEqual(candidates, [])
 
+    def test_curriculum_day_falls_back_to_the_challenge_id(self):
+        # Metadata omits curriculum_day; the day-01 ID still dispatches straight to the
+        # day-1 handler (robots.txt first), never fingerprinting "/" on the clock.
+        with _RoutedServer(_day1_routes(), http11=True) as server:
+            context = _context(server.url, curriculum_day=None)
+            self.assertEqual(context.curriculum_day, 1)
+            candidates = CurriculumWebSolver().solve(context)
+        self.assertEqual(candidates[0].answer, PROOF)
+        self.assertNotIn("/", server.hits)
+        self.assertEqual(server.hits[0], "/robots.txt")
+
+    def test_curriculum_day_id_fallback_leaves_later_days_to_fingerprint(self):
+        # A day > 10 is no known handler, so the property reports it but detect_and_solve
+        # still fingerprints (unchanged behaviour); confirm the property, not a regression.
+        context = TargetContext(
+            challenge_id="web-exploitation-day-19-x/mastery", challenge={}, attempt={},
+            answer_ids=("flag",), targets=(), http=scoped_http(()),
+        )
+        self.assertEqual(context.curriculum_day, 19)
+
 
 class ScopeGuardTests(unittest.TestCase):
     def test_shim_rejects_an_off_scope_host(self):
@@ -197,6 +220,87 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(candidates[0].answer, PROOF)
         self.assertEqual(len(server.hits), 3)
         self.assertEqual(server.connections, 3)
+
+
+class _XssServer:
+    """Stands in for the Day-7 stored-XSS target: GET /api/clues, POST the feedback route
+    (init then payload), and GET the receipt view, which shows the proof only once the
+    out-of-band moderator has "visited" -- i.e. after `proof_after_polls` view GETs.
+    """
+
+    def __init__(self, *, proof_after_polls: int = 0):
+        self.proof_after_polls = proof_after_polls
+        self.view_gets = 0
+        server_self = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _send(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/api/clues":
+                    self._send(200, json.dumps({
+                        "feature_route": "/feedback",
+                        "moderator_data_route": "/internal/secret",
+                        "receipt_route_template": "/api/receipt/{id}",
+                    }).encode())
+                elif self.path == "/feedback/1":
+                    server_self.view_gets += 1
+                    if server_self.view_gets > server_self.proof_after_polls:
+                        self._send(200, f"receipt: {PROOF}".encode())
+                    else:
+                        self._send(200, b"pending")
+                else:
+                    self._send(404, b"not found")
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self._send(200, json.dumps({"id": 0}).encode())  # actual_id = 0 + 1 = 1
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self._handler = _Handler
+
+    def __enter__(self) -> "_XssServer":
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class StoredXssPollTests(unittest.TestCase):
+    def test_receipt_already_present_returns_without_sleeping(self):
+        # Check-first: the proof is there on the first view GET, so the handler returns at
+        # once -- no leading sleep, well under the old 1.5 s-per-attempt interval.
+        with _XssServer(proof_after_polls=0) as server:
+            started = time.monotonic()
+            proof = handlers.solve_stored_xss(server.url)
+            elapsed = time.monotonic() - started
+        self.assertEqual(proof, PROOF)
+        self.assertLess(elapsed, 1.0)
+
+    def test_poll_stops_at_the_wall_budget(self):
+        # The moderator never posts a receipt: the handler gives up at the budget rather
+        # than running the full attempt count, so a slow bot cannot blow the race deadline.
+        with _XssServer(proof_after_polls=10_000) as server:
+            started = time.monotonic()
+            with self.assertRaises(handlers.WebHandlerError):
+                handlers.solve_stored_xss(server.url, poll_attempts=10_000,
+                                          poll_interval=0.02, poll_budget_s=0.3)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0)
 
 
 if __name__ == "__main__":

@@ -248,7 +248,8 @@ def solve_reflection(target_url: str) -> str:
 # ---------------------------------------------------------------------------
 # Curriculum Day 7: Stored XSS (FastAPI feedback queue & reviewer trigger)
 # ---------------------------------------------------------------------------
-def solve_stored_xss(target_url: str, poll_attempts: int = 12) -> str:
+def solve_stored_xss(target_url: str, poll_attempts: int = 45,
+                     poll_interval: float = 0.4, poll_budget_s: float = 18.0) -> str:
     """Submit payload to feedback API and poll for automated moderator receipt."""
     base = target_url.rstrip("/")
     status, clues_body, _ = _request(f"{base}/api/clues")
@@ -285,12 +286,19 @@ def solve_stored_xss(target_url: str, poll_attempts: int = 12) -> str:
         raise WebHandlerError(f"Failed to submit stored feedback (status {status})")
 
     view_url = f"{base}{feat_route}/{actual_id}"
+    # The moderator bot visits out of band, so the receipt lands at a time the server owns.
+    # Poll responsively (check first -- it may already be in -- then a short interval) and
+    # stop at a wall-clock budget, so a slow bot never blows the race deadline while a quick
+    # one is picked up at once. Same patience as before (<= poll_budget_s), far less latency.
+    deadline = time.monotonic() + poll_budget_s
     for _ in range(poll_attempts):
-        time.sleep(1.5)
         _, view_html, _ = _request(view_url)
         proof = _extract_proof(view_html)
         if proof:
             return proof
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
 
     raise WebHandlerError(f"Moderator receipt not observed for message {actual_id}")
 

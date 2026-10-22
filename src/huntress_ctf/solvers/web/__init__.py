@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import http.cookiejar
 import importlib
 import pkgutil
+import re
 from typing import Any, Protocol, runtime_checkable
 import urllib.error
 import urllib.request
@@ -137,7 +138,16 @@ class TargetContext:
 
     @property
     def curriculum_day(self) -> Any:
-        return self.challenge.get("curriculum_day")
+        day = self.challenge.get("curriculum_day")
+        if day is not None:
+            return day
+        # Fall back to the calendar day in the challenge ID (web-exploitation-day-07-...).
+        # A single-solve route's day equals its vulnerability class (days 1-10), so when the
+        # attempt metadata omits the field the handler still dispatches directly instead of
+        # paying the fingerprint round trips on the clock. A later/compound day (> 10) is not
+        # a known handler, so detect_and_solve fingerprints as before -- no behaviour change.
+        match = re.search(r"day-0*(\d+)", self.challenge_id or "")
+        return int(match.group(1)) if match else None
 
     @property
     def url(self) -> str:
