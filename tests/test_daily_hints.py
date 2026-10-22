@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from huntress_ctf import solvers
-from huntress_ctf.autopilot import COMPLETE, UNRESOLVED
+from huntress_ctf.autopilot import COMPLETE, INCORRECT, UNRESOLVED
 from huntress_ctf.client import GameMasterError
 from huntress_ctf.daily import eligibility, families, run_daily, wait_for_release
 from huntress_ctf.hints import get_hint, record_hint
@@ -219,6 +219,22 @@ class ReleaseDayTests(unittest.TestCase):
                          ["warmups-day-21", "warmups-day-21/time_trial"])
         self.assertNotIn("binary-day-21", output.split("===== Summary =====")[1])
 
+    def test_an_untimed_incorrect_is_resent_kind_by_kind(self):
+        client = DayClient()
+        with patch("huntress_ctf.daily.run_fast", return_value=INCORRECT), \
+                patch("huntress_ctf.daily.run_learn", return_value=COMPLETE) as learn:
+            _, output = self.run_daily(client, day=21, lanes=("binary",))
+        # The Single Solve completes that way, which unlocks its Time Trial and Mastery.
+        self.assertEqual([call.args[1] for call in learn.call_args_list],
+                         ["binary-day-21-x", "binary-day-21-x/time_trial", "binary-day-21-x/mastery"])
+        self.assertTrue(all(call.kwargs["open_only"] for call in learn.call_args_list))
+        self.assertIn('"outcome": "complete"', output.split("===== Summary =====")[1])
+        record_hint("binary-day-21-x/time_trial", [AnswerCandidate("a", "x", "s", "e")], self.hints)
+        with patch("huntress_ctf.daily.run_fast", return_value=INCORRECT), \
+                patch("huntress_ctf.daily.run_learn") as learn:
+            self.run_daily(client, day=21, lanes=("binary",), timed=True)
+        learn.assert_not_called()  # A race is never resent.
+
     def test_a_lane_the_server_cannot_filter_comes_from_the_day_list(self):
         class NoBinaryFilter(DayClient):
             def list_challenges(self, day=None, lane=None):
@@ -257,6 +273,18 @@ class ReleaseDayTests(unittest.TestCase):
             found = wait_for_release(client, 21, ("warmups", "binary"), 5, sleep=lambda seconds: None)
         self.assertEqual(client.lists, [(21, "warmups"), (21, "binary")])
         self.assertTrue(found["challenges"])
+
+    def test_a_lane_that_fails_to_list_stops_being_a_release_probe(self):
+        class BinaryFails(DayClient):
+            def list_challenges(self, day=None, lane=None):
+                if lane == "binary":
+                    self.lists.append((day, lane))
+                    raise GameMasterError("HTTP 400 invalid_lane")
+                return super().list_challenges(day, lane)
+        client = BinaryFails(released_after=3)
+        with redirect_stdout(StringIO()):
+            wait_for_release(client, 21, ("binary", "warmups"), 60, sleep=lambda seconds: None)
+        self.assertEqual(client.lists, [(21, "binary")] + [(21, "warmups")] * 3)
 
     def test_release_wait_gives_up(self):
         ticks = iter(range(100))

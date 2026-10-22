@@ -69,6 +69,36 @@ class LearnTests(unittest.TestCase):
         self.assertEqual(report["kinds"]["d#-jpeg-#-dims"]["result"], "accepted")
         self.assertEqual(saved, "")
 
+    def test_open_only_never_starts_a_new_attempt(self):
+        client = Client()  # Its status is a completed attempt.
+        with redirect_stdout(StringIO()), patch("huntress_ctf.learn.SOLVERS", (Solver(),)):
+            code = run_learn(client, "metadata-forensics-day-19-x/mastery", open_only=True,
+                             challenge={"id": "metadata-forensics-day-19-x/mastery"})
+        self.assertEqual((code, client.calls, client.submits), (UNRESOLVED, [], []))
+
+    def test_questions_without_digits_are_grouped_by_field(self):
+        ids = [f"s{chr(97 + n // 26)}{chr(97 + n % 26)}-{field}" for n in range(45) for field in ("attack", "role")]
+
+        class ScriptSolver:
+            name = "fake"
+
+            def solve(self, context):
+                return [AnswerCandidate(answer_id, "value", self.name, "e") for answer_id in ids]
+
+        class OpenClient(Client):
+            def status(self, challenge_id):
+                return {"answer_ids": ids, "attempt_id": "a"}
+
+            def start(self, challenge_id, timed=False):
+                self.calls.append(("start", timed))
+                return {"answer_ids": ids, "attempt_id": "a"}
+
+        client = OpenClient(wrong_kind="never")
+        with redirect_stdout(StringIO()), patch("huntress_ctf.learn.SOLVERS", (ScriptSolver(),)):
+            run_learn(client, "script-analysis-day-22-x", open_only=True, challenge={"id": "script-analysis-day-22-x"})
+        self.assertEqual(client.calls, [("start", False)])  # Reconnects only.
+        self.assertEqual(sorted(len(batch) for batch in client.submits), [45, 45])  # attack, role.
+
     def test_all_kinds_accepted_records_a_proven_solver(self):
         client = Client()
         code, _, saved = self.run_learn(client)

@@ -27,13 +27,12 @@ mkdir -p "$state"
 exec 9>"$state/day.lock"
 flock -n 9 || exit 0  # A sweep is already running or waiting for the release.
 export PYTHONPATH="$HOME/src" HUNTRESS_GM_URL="http://10.0.0.219/huntress-ctf-proxy"
-# What a sweep depends on: the solver code, the proven solvers and this script (its lanes).
-version() {
-  { find "$HOME/src" -name '*.py' -type f -print0 | sort -z | xargs -0 sha1sum
-    cat "$state/hints.json" "$0" 2>/dev/null; } | sha1sum | cut -c1-16
-}
+# What a sweep depends on: the solver code and this script (its lanes), then the proven
+# solvers. The code is taken as the sweep starts, so a deploy during a sweep sweeps again.
+code() { { find "$HOME/src" -name '*.py' -type f -print0 | sort -z | xargs -0 sha1sum; cat "$0"; } | sha1sum; }
+version() { { echo "$1"; cat "$state/hints.json" 2>/dev/null; } | sha1sum | cut -c1-16; }
 swept="$state/day$day.swept"
-[ -e "$swept" ] && [ "$(cat "$swept")" = "$(version)" ] && exit 0  # Nothing new to try.
+[ -e "$swept" ] && [ "$(cat "$swept")" = "$(version "$(code)")" ] && exit 0  # Nothing new to try.
 release=$(TZ=America/New_York date -d "08:59:30" +%s)
 now=$(date +%s)
 if [ "$now" -lt "$release" ]; then
@@ -51,6 +50,7 @@ robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
 # both answered every question of the day 20 and 21 Single Solves offline.
 lanes="warmups,metadata-forensics,mobile-android,script-analysis,binary-reverse-engineering"
 log="$HOME/day$day-$(date +%H%M)"
+started_code=$(code)  # After the release wait: deploys while waiting are this sweep's code.
 echo "== Day $day: untimed sweep, $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-untimed.log"
@@ -70,5 +70,5 @@ if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary
   echo "== Day $day: errors in the sweep; trying again next minute, $(date)"
   exit 0
 fi
-version > "$swept"  # After the races, which add to hints.json themselves.
+version "$started_code" > "$swept"  # After the races, which add to hints.json themselves.
 echo "== Day $day swept, $(date)"

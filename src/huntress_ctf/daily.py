@@ -22,6 +22,7 @@ from .client import GameMasterClient, GameMasterError
 from .display import print_result
 from .fastpath import TARGET_LANES, lane_of, run_fast
 from .hints import load_hints, record_race
+from .learn import run_learn
 from .state import AttemptState, mode_name
 
 # Lanes whose solver answers every variant of a day once its Single Solve scored
@@ -174,6 +175,10 @@ def wait_for_release(
             errors += 1
             if errors in (1, 10, 100):
                 print(f"Waiting for day {day}: the list failed ({exc}); trying again.", flush=True)
+            if len(probes) > 1:
+                # Every lane is released at once, and one the server cannot filter
+                # (binary-reverse-engineering: HTTP 400) would cost each round a probe.
+                probes = tuple(name for name in probes if name != probe)
         if clock() - began >= wait:
             raise GameMasterError(f"Day {day} was not released within {wait:.0f} s.")
         sleep(RELEASE_POLL_SECONDS)
@@ -250,6 +255,12 @@ def run_daily(
                         print(note)
                 if code != COMPLETE:
                     break
+            if code == INCORRECT and not timed:
+                # One wrong answer of a new type rejects every right one: send them again kind
+                # by kind on the same open attempt, so the right kinds are accepted and the
+                # report names the new one (day 22 Binary: found in under a minute).
+                print(f"\n===== {challenge_id} (incorrect: resending kind by kind) =====")
+                code = run_learn(target, challenge_id, hints_path=hints_path, challenge=record, open_only=True)
             entry = {"challenge": challenge_id, "outcome": OUTCOMES.get(code, str(code))}
         except GameMasterError as exc:
             entry = {"challenge": challenge_id, "outcome": "error", "reason": str(exc)}

@@ -29,11 +29,30 @@ def kind_of(answer_id: str) -> str:
     return re.sub(r"\d+", "#", re.sub(r"^set\d+\.", "", answer_id))
 
 
-def run_learn(client: GameMasterClient, challenge_id: str, *, hints_path: Path | None = None) -> int:
-    challenge, _ = lookup_challenge(client, challenge_id)
+def field_of(answer_id: str) -> str:
+    """A coarser kind for IDs that name one question each: "resource-attack" -> "attack"."""
+    base = re.sub(r"^set\d+\.", "", answer_id)
+    return re.sub(r"\d+", "#", base.rsplit("-", 1)[-1])
+
+
+# Script Analysis IDs carry no digits ("resource-attack"), so kind_of makes one kind per
+# question: 1,373 requests on day 21. Past this many kinds, group by field instead.
+MAX_KIND_REQUESTS = 80
+
+
+def run_learn(
+    client: GameMasterClient, challenge_id: str, *, hints_path: Path | None = None,
+    challenge: dict[str, Any] | None = None, open_only: bool = False,
+) -> int:
+    """`open_only` (after an untimed "incorrect"): only the open attempt, never a new one."""
+    if challenge is None:
+        challenge, _ = lookup_challenge(client, challenge_id)
     before = AttemptState.parse(client.status(challenge_id))
     if before.pending:
         print("CourseStack scoring is pending; nothing was started.")
+        return UNRESOLVED
+    if open_only and (before.complete or before.expired):
+        print("The attempt is no longer open; nothing was resent.")
         return UNRESOLVED
     if before.complete or before.expired:
         attempt = client.retry(challenge_id, timed=challenge.get("run_for_time_supported") is True)
@@ -60,11 +79,17 @@ def run_learn(client: GameMasterClient, challenge_id: str, *, hints_path: Path |
         [candidate for solver in SOLVERS for candidate in solver.solve(context)], state.answer_ids, [],
     )
     open_ids = set(state.answer_ids) - state.accepted_ids
+    kind = kind_of
+    if len({kind_of(c.answer_id) for c in selected if c.answer_id in open_ids}) > MAX_KIND_REQUESTS:
+        kind = field_of
     groups: dict[str, dict[str, str]] = defaultdict(dict)
     for candidate in selected:
         if candidate.answer_id in open_ids:
-            groups[kind_of(candidate.answer_id)][candidate.answer_id] = candidate.answer
-    unanswered = sorted({kind_of(answer_id) for answer_id in open_ids} - set(groups))
+            groups[kind(candidate.answer_id)][candidate.answer_id] = candidate.answer
+    if open_only and len(groups) < 2:
+        print("One kind only: splitting would resend the rejected answers unchanged.")
+        return UNRESOLVED
+    unanswered = sorted({kind(answer_id) for answer_id in open_ids} - set(groups))
     report: dict[str, Any] = {"deadline": state.deadline, "conflict": conflict, "kinds": {}}
     final = None
     for kind in sorted(groups):
