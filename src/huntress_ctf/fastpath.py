@@ -257,6 +257,7 @@ def _hedged_download(
 GATE_SAMPLES = 3
 GATE_PAUSE_SECONDS = 30.0
 HEDGE_MAX_BYTES = 4 * 1024 * 1024
+GATE_BYTES_PER_MS = 4000  # ~4 MB/s through the Homebase proxy.
 
 
 def _gate(
@@ -267,22 +268,27 @@ def _gate(
 
     The race time is almost all server answer time, and it swings by seconds within
     minutes. A variant spent while the server is slow is a wasted Hall of Fame chance.
-    Returns (ready, median ms of the last probe).
+    Returns (ready, median ms of the last probe). A large status body is transfer, not a
+    slow server: the limit grows by its size at GATE_BYTES_PER_MS (day 22 Script Mastery's
+    ~4.5 MB status took 1.3 s, so the 600 ms gate never let it race).
     """
     waited = 0.0
+    limit = None
     while True:
         samples = []
         for _ in range(GATE_SAMPLES):
             began = clock()
-            client.status(challenge_id)
+            response = client.status(challenge_id)
             samples.append((clock() - began) * 1000)
+        if limit is None:
+            limit = gate_ms + len(json.dumps(response, separators=(",", ":"))) / GATE_BYTES_PER_MS
         median = sorted(samples)[len(samples) // 2]
-        if median <= gate_ms:
-            print(f"Gate: status answered in {median:.0f} ms (median of {GATE_SAMPLES}); racing.")
+        if median <= limit:
+            print(f"Gate: status answered in {median:.0f} ms (median of {GATE_SAMPLES}, limit {limit:.0f} ms); racing.")
             return True, median
         if waited >= max_wait:
             return False, median
-        print(f"Gate: status answered in {median:.0f} ms, over {gate_ms:.0f} ms; waiting {GATE_PAUSE_SECONDS:.0f} s.")
+        print(f"Gate: status answered in {median:.0f} ms, over {limit:.0f} ms; waiting {GATE_PAUSE_SECONDS:.0f} s.")
         sleep(GATE_PAUSE_SECONDS)
         waited += GATE_PAUSE_SECONDS
 

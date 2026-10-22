@@ -135,6 +135,15 @@ class FastPathTests(unittest.TestCase):
         fast = FakeClient(StringIO())
         self.assertEqual(self.run_fast(fast, StringIO(), gate_ms=100), COMPLETE)  # 1 ms per probe
 
+    def test_gate_allows_for_the_transfer_of_a_large_status(self):
+        slow = count()
+        client = FakeClient(self.output)  # 500 ms per status, over a 100 ms gate.
+        client.status_response = {**client.assignment, "state": "active", "padding": "x" * 2_000_000}
+        code = self.run_fast(client, clock=lambda: next(slow) * 0.5, gate_ms=100, gate_wait=0,
+                             sleep=lambda seconds: None)
+        self.assertEqual(code, COMPLETE)  # 2 MB at 4 MB/s: a 600 ms limit.
+        self.assertIn("racing", self.output.getvalue())
+
     def test_hedged_download_lets_the_faster_connection_win_and_submit(self):
         import threading
         import time as real_time
