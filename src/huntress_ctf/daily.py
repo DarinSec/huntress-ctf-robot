@@ -47,6 +47,19 @@ def _records(response: Any) -> list[dict[str, Any]]:
     return [record for record in records if isinstance(record, dict)]
 
 
+def _lane_records(client: GameMasterClient, day: int | None, lane: str | None) -> list[dict[str, Any]]:
+    """One day's records of one lane (~1 s instead of ~4 s for the whole day)."""
+    try:
+        return _records(client.list_challenges(day, lane))
+    except GameMasterError:
+        if lane is None:
+            raise
+        # "binary-reverse-engineering" is not a lane filter (HTTP 400 invalid_lane, and
+        # "binary" lists nothing): keep that lane's records of the whole day.
+        whole = _records(client.list_challenges(day, None))
+        return [record for record in whole if lane_of(record, str(_id(record))) == lane]
+
+
 def _id(record: dict[str, Any]) -> Any:
     return record.get("id", record.get("challenge_id"))
 
@@ -188,9 +201,7 @@ def run_daily(
     """
     began_all = clock()
     if days:
-        listing = {"challenges": [
-            record for number in days for record in _records(client.list_challenges(number, lane))
-        ]}
+        listing = {"challenges": [record for number in days for record in _lane_records(client, number, lane)]}
     elif lanes and day is not None:
         # One list per lane (~1 s each) instead of the whole day (~4 s); the release probe's
         # list is the first lane's.
@@ -198,17 +209,9 @@ def run_daily(
         if wait_release:
             found = _records(wait_for_release(client, day, lanes, wait_release, sleep=sleep))
         listed = {lane_of(record, str(_id(record))) for record in found}
-        whole: list[dict[str, Any]] | None = None
         for name in lanes:
             if name not in listed:
-                try:
-                    found += _records(client.list_challenges(day, name))
-                except GameMasterError:
-                    # "binary-reverse-engineering" is not a lane filter (HTTP 400 invalid_lane,
-                    # and "binary" lists nothing): keep that lane's records of the whole day.
-                    if whole is None:
-                        whole = _records(client.list_challenges(day, None))
-                    found += [record for record in whole if lane_of(record, str(_id(record))) == name]
+                found += _lane_records(client, day, name)
         listing = {"challenges": found}
     elif wait_release and day is not None:
         released = wait_for_release(client, day, lane, wait_release, sleep=sleep)

@@ -68,6 +68,7 @@ def deliveries(response: Any) -> list[dict[str, Any]]:
             "filename": item.get("filename") if isinstance(item.get("filename"), str) else "artifact",
             "capability": capability,
             "sha256": item["sha256"].lower() if isinstance(item.get("sha256"), str) else None,
+            "size": item["size"] if isinstance(item.get("size"), int) else None,
         })
     return found
 

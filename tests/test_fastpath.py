@@ -172,6 +172,27 @@ class FastPathTests(unittest.TestCase):
         self.assertFalse([c for c in client.calls if c[0] == "submit_many"])
         self.assertEqual(client.calls[-1], "status")  # The report waited for the slow GET.
 
+    def test_a_large_artifact_downloads_once(self):
+        class Primary(FakeClient):
+            def warm(self):
+                pass
+
+            def close(self):
+                pass
+
+            def clone(self):
+                helper = Primary(self.stdout)
+                helper.calls = self.helper_calls
+                return helper
+
+        client = Primary(self.output)
+        client.helper_calls = []
+        client.assignment["artifacts"] = [{"filename": "bundle.zip", "size": 33_000_000,
+                                           "sha256": client.assignment["artifact_sha256"]}]
+        self.assertEqual(self.run_fast(client), COMPLETE)
+        self.assertEqual(client.calls.count("artifact"), 1)
+        self.assertNotIn("artifact", client.helper_calls)  # Two copies would share the link.
+
     def test_server_clock_is_placed_with_the_ntp_offset(self):
         from huntress_ctf.fastpath import Run, _server_clock
         run = Run(timed=True, clock_offset=5.0)  # The local clock runs 5 s fast.

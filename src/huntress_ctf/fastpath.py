@@ -256,6 +256,7 @@ def _hedged_download(
 
 GATE_SAMPLES = 3
 GATE_PAUSE_SECONDS = 30.0
+HEDGE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _gate(
@@ -337,8 +338,10 @@ def _race(
             run.pipeline_failure = "the start response has no artifact_sha256 to verify pipelined bytes"
     if run.artifact is None:
         # The start response's own link skips the challenge lookup (~200 ms faster than
-        # op=artifact from Sweden); timed runs hedge it on a second warm connection.
-        workers = [client, *run.helpers[:1]] if run.timed else [client]
+        # op=artifact from Sweden); timed runs hedge it on a second warm connection. Not a
+        # large file: two copies share the link (day 21 Binary, 33 MB: 8.9 s hedged, 7.2 s not).
+        large = len(listed) == 1 and (listed[0]["size"] or 0) > HEDGE_MAX_BYTES
+        workers = [client, *run.helpers[:1]] if run.timed and not large else [client]
         capability = listed[0]["capability"] if len(listed) == 1 else None
         run.artifact, run.submitter, run.straggler = _hedged_download(workers, challenge_id, capability)
     run.marks["artifact received"] = clock()

@@ -232,6 +232,12 @@ class ReleaseDayTests(unittest.TestCase):
         self.assertEqual(client.lists, [(21, "warmups"), (21, "binary"), (21, None)])
         self.assertIn("binary-day-21-x", [call.args[1] for call in fast.call_args_list])
         self.assertNotIn("web-exploitation-day-21-y", output.split("===== Summary =====")[1])
+        # The night's Hall of Fame lists by day and lane too.
+        client = NoBinaryFilter()
+        with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE):
+            _, output = self.run_daily(client, days=[21], lane="binary", timed=True)
+        self.assertEqual(client.lists, [(21, "binary"), (21, None)])
+        self.assertIn("binary-day-21-x/time_trial", output.split("===== Summary =====")[1])
 
     def test_waiting_for_the_release_polls_one_lane(self):
         client = DayClient(released_after=3)
