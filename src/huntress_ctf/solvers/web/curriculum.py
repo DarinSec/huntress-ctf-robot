@@ -31,6 +31,7 @@ from urllib.parse import urljoin, urlsplit
 
 from ..base import AnswerCandidate
 from . import HostNotAllowed, ScopedHttp
+from . import sessions
 
 try:  # handlers.py is third-party within the repo; a broken import must not kill discovery.
     from . import handlers
@@ -63,6 +64,9 @@ class _ScopedTransport:
     def __init__(self, http: ScopedHttp) -> None:
         self._http = http
         self._conns: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
+        # Cookie values the target set during the run, so the adapter can read a proof the
+        # server stashed in a (signed, not encrypted) session cookie -- no extra request.
+        self.seen_cookies: list[str] = []
 
     # -- connection pool ---------------------------------------------------------------
     def _connection(self, scheme: str, host: str, port: int,
@@ -146,6 +150,11 @@ class _ScopedTransport:
             oversize = len(raw) > self._http.max_bytes
             body = raw[: self._http.max_bytes].decode("utf-8", "replace")
             resp_headers = {name.lower(): value for name, value in response.getheaders()}
+            for hname, hvalue in response.getheaders():
+                if hname.lower() == "set-cookie":
+                    pair = hvalue.split(";", 1)[0]
+                    if "=" in pair:
+                        self.seen_cookies.append(pair.split("=", 1)[1])
             if oversize or response.version < 11 or resp_headers.get("connection", "").lower() == "close":
                 self._drop(key)  # not safely reusable: a fresh socket next time
             return response.status, body, resp_headers
@@ -153,14 +162,17 @@ class _ScopedTransport:
 
 
 @contextlib.contextmanager
-def _scope(http: ScopedHttp) -> Iterator[None]:
-    """Confine `handlers`' network to `http`'s allowlist, over one pooled connection."""
+def _scope(http: ScopedHttp) -> Iterator["_ScopedTransport"]:
+    """Confine `handlers`' network to `http`'s allowlist, over one pooled connection.
+
+    Yields the transport so the caller can read the cookies the target set during the run.
+    """
     with _PATCH_LOCK:
         transport = _ScopedTransport(http)
         original = handlers._request
         handlers._request = transport.request
         try:
-            yield
+            yield transport
         finally:
             handlers._request = original
             transport.close()
@@ -182,17 +194,27 @@ class CurriculumWebSolver:
             day_int: int | None = int(day)
         except (TypeError, ValueError):
             day_int = None
-        try:
-            with _scope(context.http):
-                proof = handlers.detect_and_solve(url, day_int)
-        except Exception:
-            # WebHandlerError, HostNotAllowed, transport errors: a web route with no proof
-            # is left UNRESOLVED, never guessed. Ported handlers must not break the race.
-            return []
-        if not isinstance(proof, str) or not handlers.PROOF_PATTERN.fullmatch(proof):
+        proof: str | None = None
+        chain: tuple[str, ...] = ()
+        with _scope(context.http) as transport:
+            try:
+                result = handlers.detect_and_solve(url, day_int)
+            except Exception:
+                # WebHandlerError, HostNotAllowed, transport errors: never guessed.
+                result = None
+            if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
+                proof = result
+                chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+            else:
+                # No handler recovered a proof: the server may have stashed it in a signed
+                # (readable) session cookie it set during the run. Read it -- no new request.
+                for found in sessions.proofs_in_cookies(transport.seen_cookies, handlers.PROOF_PATTERN):
+                    if handlers.PROOF_PATTERN.fullmatch(found):
+                        proof, chain = found, ("web-cookie",)
+                        break
+        if proof is None:
             return []  # Only a real proof string is real evidence (solver rules).
         evidence = f"proof read from assigned target {url}"
-        chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
         return [
             AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
                             evidence=evidence, chain=chain)

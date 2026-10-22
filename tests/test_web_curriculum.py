@@ -20,7 +20,7 @@ from typing import Any
 
 from huntress_ctf.solvers.web import HostNotAllowed, TargetContext, scoped_http
 from huntress_ctf.solvers.web import WEB_SOLVERS
-from huntress_ctf.solvers.web import handlers
+from huntress_ctf.solvers.web import handlers, sessions
 from huntress_ctf.solvers.web.curriculum import CurriculumWebSolver, _ScopedTransport
 
 PROOF = "proof_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"  # proof_<32 hex>, the shape handlers return
@@ -278,6 +278,26 @@ class _XssServer:
     def __exit__(self, *exc: Any) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+
+class CookieProofFallbackTests(unittest.TestCase):
+    def test_proof_in_a_signed_session_cookie_is_recovered(self):
+        # The handler finds no proof (robots.txt has no Disallow), but the target set a
+        # signed session cookie carrying it. The adapter reads the cookie it already saw.
+        cookie = sessions.sign({"proof": PROOF, "u": "guest"}, "server-secret")
+        routes = {"/robots.txt": (200, {"Set-Cookie": f"session={cookie}"},
+                                  b"User-agent: *\n")}
+        with _RoutedServer(routes, http11=True) as server:
+            candidates = CurriculumWebSolver().solve(_context(server.url))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].answer, PROOF)
+        self.assertEqual(candidates[0].chain, ("web-cookie",))
+
+    def test_no_proof_anywhere_still_yields_nothing(self):
+        cookie = sessions.sign({"u": "guest"}, "server-secret")
+        routes = {"/robots.txt": (200, {"Set-Cookie": f"session={cookie}"}, b"User-agent: *\n")}
+        with _RoutedServer(routes, http11=True) as server:
+            self.assertEqual(CurriculumWebSolver().solve(_context(server.url)), [])
 
 
 class StoredXssPollTests(unittest.TestCase):
