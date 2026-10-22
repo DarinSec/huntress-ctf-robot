@@ -389,6 +389,7 @@ class MobilePuzzleTests(unittest.TestCase):
                 {"codec": "split", "data": "", "parts": ["09EA4B497", "ANS-B", "200528"], "order": [2, 0, 1]}))
         self.assertEqual(answer_code(buffer.getvalue()), "ANS-B20052809EA4B497")
         for puzzle in ({"codec": "caesar", "key": 15, "data": "".join(chr(ord(c) + 15) for c in code)},
+                       {"codec": "xor", "key": 29, "data": base64.b64encode(bytes(b ^ 29 for b in code.encode())).decode()},
                        {"codec": "indexed", "data": code[10:] + code[:10], "order": list(range(10, 20)) + list(range(10))}):
             buffer = BytesIO()
             with zipfile.ZipFile(buffer, "w") as archive:

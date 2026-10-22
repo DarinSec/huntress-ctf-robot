@@ -67,6 +67,13 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
         for shift in (-puzzle["key"], puzzle["key"]):
             if all(0 <= ord(char) + shift < 0x110000 for char in data):
                 found.add("".join(chr(ord(char) + shift) for char in data))
+    elif codec == "xor" and isinstance(puzzle.get("key"), int):
+        # Base64 of the code's bytes XORed with one key byte (days 4, 11 and 18).
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raw = b""
+        found.add(bytes(byte ^ (puzzle["key"] & 0xFF) for byte in raw).decode("latin-1"))
     elif codec == "indexed":
         # data[i] belongs at position order[i] (day 17); both readings, as for "split".
         order = puzzle.get("order")
