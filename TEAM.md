@@ -22,8 +22,8 @@ on the same challenge collide. Build and test on your own machine; Darin deploys
 | Warmups | Darin | Automatic: 3/3 flags 12 s after the release |
 | Metadata Forensics | Darin | Automatic; most new property types too (`solvers/autoprop.py`) |
 | Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`) |
-| Script Analysis | Ilse | Robot pre-fills ~54% at 15:00 (`solvers/script_descriptors.py`); goal 100% |
-| Binary | David | Manual; goal: solver in the repo |
+| Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min |
+| Binary | David | Automatic (`solvers/binary.py`); new types still need code: day 22's primary DLL and machine field |
 | Web Exploitation | Parsa | Manual (live targets); goal: scripts for repeat types (LFI, XSS, sessions) |
 
 ## Set up (Windows, macOS or Linux)

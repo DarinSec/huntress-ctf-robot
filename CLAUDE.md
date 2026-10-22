@@ -64,6 +64,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   Solve are skipped (HTTP 409). Races stay one at a time, each route once: hints.json
   keeps `raced_at`, `races` and `best_on_clock_ms`; `--rerace` races again.
   `--wait-release S` (with `--day`) polls one lane until the day is listed.
+- An untimed "incorrect" (one wrong answer rejects the whole request) is resent kind by
+  kind on the same open attempt (`learn.run_learn(open_only=True)`): the right kinds are
+  accepted and the report names the new one. IDs without digits (Script) group by field.
 - Web routes return `targets[]` and no file: nothing is downloaded, and `daily` skips
   them unless asked with `--lane web-exploitation`.
 
@@ -126,6 +129,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   Most Day 1 timed routes lack `run_for_time_supported`, so an ordinary start is timed.
 - Older timed routes reject `run_for_time`; the robot sends it only where the route
   advertises support (a plain retry is timed there anyway).
+- A JSON response can pass 4 MiB (day 22 Script Mastery's start); the client allows 32 MiB.
+  Binary: "x86" was rejected for a managed i386 DLL's machine field on day 22, its decimal
+  code 332 accepted; the primary managed assembly is the DLL with its own runtimeconfig.
 - Some bundles are separate deliveries: `artifacts[]` lists several and questions name
   them `"delivery N: <filename>"`. Fetch each with `op=artifact&delivery=<N-1>` (0-based;
   out of range is HTTP 400): the Homebase proxy lists no download links, so the direct
