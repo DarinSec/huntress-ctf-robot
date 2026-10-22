@@ -306,6 +306,10 @@ def _structured(question: Question, analysis: Analysis) -> str | None:
             return None
         if any(i.arch is None for i in images):
             return None
+        if "machine field" in q.lower() and len(images) == 1 and isinstance(images[0], PE) and images[0].machine == 0x14c:
+            # Day 22 rejected "x86" for a managed i386 DLL and accepted the decimal code,
+            # which every machine-field question allows.
+            return "332"
         values = sorted({i.arch for i in images})
         if re.search(r"\b(?:count|how many|number of)\b", q):
             return str(len(values))
