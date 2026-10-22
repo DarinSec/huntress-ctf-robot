@@ -610,6 +610,25 @@ def macho_cpu_type_set(data: bytes) -> str | None:
     return macho_field("cpu_type_set", macho_slices(data))
 
 
+def jar_main_class(data: bytes) -> str | None:
+    """Main-Class of META-INF/MANIFEST.MF's main section (Day 22); "none" when absent."""
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            names = [name for name in archive.namelist() if name.upper() == "META-INF/MANIFEST.MF"]
+            if not names:
+                return "none"
+            manifest = archive.read(names[0])
+    except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, zlib.error):
+        return None
+    text = manifest.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    main = text.replace("\n ", "").split("\n\n", 1)[0]  # A line continues after "\n ".
+    for line in main.split("\n"):
+        name, colon, value = line.partition(":")
+        if colon and name.strip().casefold() == "main-class":
+            return value.strip() or "none"
+    return "none"
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -630,6 +649,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "elf.e_machine_u16_hex": elf_e_machine_u16_hex,
     "macho.cpu_type_set": macho_cpu_type_set,
     "apk.package_name": apk_package_name,
+    "jar.main_class": jar_main_class,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [

@@ -97,6 +97,24 @@ class FileFactTests(unittest.TestCase):
         self.assertEqual(MetadataSolver().solve(context), [])
 
 
+class JarManifestTests(unittest.TestCase):
+    def jar(self, manifest):
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            if manifest is not None:
+                archive.writestr("META-INF/MANIFEST.MF", manifest)
+            archive.writestr("app/Main.class", b"\xca\xfe\xba\xbe")
+        return buffer.getvalue()
+
+    def test_main_class_from_the_main_section(self):
+        manifest = ("Manifest-Version: 1.0\r\nMain-Class: fixture.example.VeryLongPackageName.Ap\r\n p\r\n"
+                    "\r\nName: other/\r\nMain-Class: not.This\r\n")
+        self.assertEqual(m.PROPERTIES["jar.main_class"](self.jar(manifest)), "fixture.example.VeryLongPackageName.App")
+        self.assertEqual(m.PROPERTIES["jar.main_class"](self.jar("Manifest-Version: 1.0\n")), "none")
+        self.assertEqual(m.PROPERTIES["jar.main_class"](self.jar(None)), "none")
+        self.assertIsNone(m.PROPERTIES["jar.main_class"](b"not a zip"))
+
+
 class PropertyTests(unittest.TestCase):
     def test_images_documents_and_text(self):
         jpeg = b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0" + b"\0" * 9 + \

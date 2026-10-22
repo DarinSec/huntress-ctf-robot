@@ -17,7 +17,7 @@ from . import __version__
 DEFAULT_BASE_URL = "https://2026.huntress.ctf.games"
 PROXY_BASE_URL = "http://10.0.0.219/huntress-ctf-proxy"
 DEFAULT_TIMEOUT_SECONDS = 30
-MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_JSON_BYTES = 32 * 1024 * 1024  # Day 22 Script Mastery's start response passed 4 MiB.
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 # Servers drop idle keep-alive connections silently. A POST is never retried, so it
 # starts on a fresh connection after this much idle time instead of risking a dead one.
