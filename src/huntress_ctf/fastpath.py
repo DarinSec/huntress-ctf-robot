@@ -319,8 +319,9 @@ def _race(
     listed = deliveries(run.attempt)
     targets = current_fields(run.attempt).get("targets")
     if isinstance(targets, list) and targets and not listed:
-        # Web: there is no file, and a GET would only be HTTP 400 invalid_delivery.
+        # Web: there is no file to download. A handler reads the flag from the target.
         run.targets = targets
+        _solve_targets(client, challenge_id, challenge, run, clock)
         return
     if not _workable(run.started):
         return
@@ -376,6 +377,37 @@ def _race(
         candidate.answer_id: candidate.answer for candidate in run.selected
         if candidate.answer_id in needed
     }
+    run.marks["solved"] = clock()
+    if run.submitted:
+        run.wall["submit sent"] = time.time()
+        run.result = (run.submitter or client).submit_many(challenge_id, run.submitted)
+        run.marks["submit received"] = clock()
+        run.wall["submit received"] = time.time()
+
+
+def _solve_targets(
+    client: GameMasterClient, challenge_id: str, challenge: dict[str, Any], run: Run,
+    clock: Callable[[], float],
+) -> None:
+    """Web critical path: a handler reads the flag from the assigned target, then submit it.
+
+    No handler, no flag, or disagreeing handlers leave the attempt untouched (UNRESOLVED).
+    Network reaches only the hosts the Game Master listed (ScopedHttp).
+    """
+    from .solvers.web import WEB_SOLVERS, TargetContext, scoped_http
+
+    if run.started is None:
+        return
+    answer_ids = run.started.answer_ids
+    if not answer_ids or not WEB_SOLVERS:
+        return
+    context = TargetContext(
+        challenge_id, challenge, run.attempt, answer_ids, tuple(run.targets), scoped_http(run.targets),
+    )
+    candidates = [candidate for solver in WEB_SOLVERS for candidate in solver.solve(context)]
+    run.selected, run.conflict = select_candidates(candidates, answer_ids, run.notes)
+    needed = set(answer_ids) - run.started.accepted_ids
+    run.submitted = {c.answer_id: c.answer for c in run.selected if c.answer_id in needed}
     run.marks["solved"] = clock()
     if run.submitted:
         run.wall["submit sent"] = time.time()
@@ -546,8 +578,11 @@ def _outcome(run: Run, challenge_id: str, hints_path: Path | None) -> int:
     terminal = terminal_result(started)
     if terminal is not None:
         return terminal
-    if run.targets:
-        print("Web route: its live targets need a Web solver, and there is none yet. Nothing was submitted.")
+    if run.targets and run.result is None:
+        if run.conflict:
+            print("Web handlers disagreed on the flag; nothing was submitted.")
+            return CONFLICT
+        print("Web route: no handler produced a flag for this target. Nothing was submitted.")
         return UNRESOLVED
     answer_ids = started.answer_ids
     if not answer_ids:

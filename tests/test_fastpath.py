@@ -299,7 +299,9 @@ class FastPathTests(unittest.TestCase):
         self.assertEqual(client.calls, [("start", False), "status"])
         self.assertIn('"pipelining": true', self.network_state())
         self.assertIn("http://10.1.2.3:8080/", self.output.getvalue())
-        self.assertIn("need a Web solver", self.output.getvalue())
+        # No handler is registered by default, so no flag and no network to the target;
+        # client.calls above already shows no submit was sent.
+        self.assertIn("no handler produced a flag", self.output.getvalue())
 
     def test_conflicting_candidates_are_not_submitted(self):
         class DisagreeingSolver:
