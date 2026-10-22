@@ -55,18 +55,30 @@ def lookup_challenge(client: Any, challenge_id: str) -> tuple[dict[str, Any], An
     """(record, listing) from the smallest list that holds the challenge.
 
     The server's list time grows with its size: about 1 s for one day and lane, 4 s for a
-    day, 80 s for every day. So ask for the ID's own day and lane first, then its day; only
-    an ID without a day needs the full list.
+    day, 80 s for every day. So ask for the ID's own day and lane first, widening only when
+    a narrower list does not hold it.
+
+    Web Exploitation challenges are not listed under their calendar `day-NN` filter (day 1
+    of the web lane comes back empty, and the day's full list has no web lane at all), yet
+    they do turn up in a lane-wide listing. So fall back lane-only, then day-only, and only
+    as a last resort the whole catalogue -- a day-ful lane the day filter hides still
+    resolves instead of failing "not uniquely found". An ID without a day needs the full
+    list straight away.
     """
     day, lane = list_filters(challenge_id)
-    tries = [{"day": day, "lane": lane}, {"day": day}] if day is not None else [{}]
+    if day is not None:
+        # Cheapest first; later entries only run when an earlier one does not hold it.
+        tries = [{"day": day, "lane": lane}, {"lane": lane}, {"day": day}, {}]
+    else:
+        tries = [{}]
     for filters in tries[:-1]:
         try:
             listing = client.list_challenges(**filters)
             return find_challenge(listing, challenge_id), listing
         except GameMasterError:
-            # A lane named differently from the ID ("binary-reverse-engineering" lists as
-            # "binary"; the server answers HTTP 400 invalid_lane): widen to the whole day.
+            # Either the filter is empty/does not hold it, or the server rejects it (a lane
+            # named differently from the ID -- "binary-reverse-engineering" lists as
+            # "binary" -- answers HTTP 400 invalid_lane). Widen and try the next listing.
             continue
     listing = client.list_challenges(**tries[-1])
     return find_challenge(listing, challenge_id), listing
