@@ -45,7 +45,11 @@ run_agent() {  # <challenge-id> [--push] [--from <work folder>]
   echo "== $id: before"; (cd "$dir" && PYTHONPATH=src python3 scripts/solve_offline.py "$work" | sed -n '/answered/,$p' | head -30)
   prompt=$(sed -e "s|{ID}|$id|g" -e "s|{WORK}|$work|g" "$repo/scripts/release-agent.md")
   echo "== $id: agent on $branch ($dir), log agent.log"
+  # The agent commits as "release-agent" unless the machine has a git identity (it may not).
+  name=$(git -C "$repo" config user.name || echo release-agent)
+  mail=$(git -C "$repo" config user.email || echo release-agent@localhost)
   (cd "$dir" && env -u HUNTRESS_GM_TOKEN -u HUNTRESS_GM_URL PYTHONPATH=src HUNTRESS_STATE_DIR="$state" \
+    GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$mail" GIT_COMMITTER_NAME="$name" GIT_COMMITTER_EMAIL="$mail" \
     timeout "${AGENT_TIMEOUT:-2700}" claude -p "$prompt" ${AGENT_MODEL:+--model "$AGENT_MODEL"} \
       --permission-mode acceptEdits --output-format text \
       --allowedTools "Read" "Edit" "Write" "Glob" "Grep" \
