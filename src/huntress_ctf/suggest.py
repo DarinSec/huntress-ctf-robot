@@ -37,7 +37,16 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "exif": "jpeg", "pdf": "pdf", "zip": "zip", "ooxml": "ooxml", "docx": "ooxml",
                "xlsx": "ooxml", "pptx": "ooxml", "office": "ooxml", "email": "email", "eml": "email",
                "mail": "email", "media": "media", "wav": "media_wav", "audio": "media", "lnk": "lnk",
-               "shortcut": "lnk", "text": "text", "txt": "text", "csv": "text"}
+               "shortcut": "lnk", "text": "text", "txt": "text", "csv": "text",
+               # formats_dfir.py: formats no day has asked about yet.
+               "evtx": "evtx", "eventlog": "evtx", "event_log": "evtx", "regf": "regf", "registry": "regf",
+               "hive": "regf", "prefetch": "prefetch", "pf": "prefetch", "plist": "plist", "bplist": "plist",
+               "webp": "webp", "tiff": "tiff", "tif": "tiff", "mkv": "ebml", "matroska": "ebml",
+               "webm": "ebml", "ebml": "ebml", "avi": "avi", "vhd": "vhd", "vhdx": "vhdx", "cab": "cab",
+               "xz": "xz", "bzip2": "bzip2", "bz2": "bzip2", "zstd": "zstd", "zst": "zstd", "lz4": "lz4",
+               "ar": "ar", "deb": "ar", "debian": "ar", "pyc": "pyc", "python": "pyc", "rtf": "rtf",
+               "crx": "crx", "ese": "ese", "edb": "ese", "srum": "ese", "ole": "ole", "ole2": "ole",
+               "cfb": "ole", "doc": "ole", "xls": "ole", "ppt": "ole", "msg": "ole", "msi": "ole"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 
 
@@ -47,11 +56,18 @@ def _words(text: str) -> set[str]:
     return words - _NOISE
 
 
+# Units name what a field measures, not the field: "sqlite.page_size_bytes" is the header's page_size.
+_UNITS = ("_bytes", "_pixels", "_seconds", "_ms", "_utc")
+
+
 def _bare(name: str) -> str:
-    """The property name without its format suffix: "subsystem_name" stays, "e_type_u16_hex" -> "e_type"."""
+    """The property name without its format or unit suffix: "e_type_u16_hex" -> "e_type", "page_size_bytes" -> "page_size"."""
     for suffix, _ in _SUFFIXES:
         if name.endswith(suffix):
             return name[:-len(suffix)]
+    for unit in _UNITS:
+        if name.endswith(unit):
+            return name[:-len(unit)]
     return name
 
 

@@ -147,6 +147,26 @@ class AssignedBinaryTests(unittest.TestCase):
         self.assertEqual(BinarySolver().solve(archive_context({"unit--native.exe": bytes(data)}, prompts)), [])
         self.assertIsNone(config_at(b"HCFG" + b"\0" * 20, 0))
 
+    def test_a_storage_no_rule_knows_is_discovered_when_unique(self):
+        # A new day words its carrier in a way no rule matches: every carrier is searched and
+        # only one CRC/JSON-valid record is accepted. Offsets/storage labels are not claimed.
+        public = "Use all unit-- members in ZIP central-directory order. Locate the ZZ24 vault described in the lesson. "
+        prompts = [("unit_analysis_campaign", public + "Submit the exact string value of the decoded HCFG JSON object's top-level campaign property."),
+                   ("unit_analysis_version", public + "Submit unsigned HCFG byte 4 as a base-10 integer."),
+                   ("unit_analysis_offset", public + "Submit the base-10 byte offset of the winning encoded carrier for base64. HCFG header bytes are validated.")]
+        record = config_record()
+        carriers = {
+            "zlib": pe_fixture() + b"ZZ24" + zlib.compress(record),
+            "xor": pe_fixture() + bytes(b ^ 0x5A for b in record),
+            "utf16": pe_fixture() + base64.b64encode(config_record({"campaign": "synthetic-campaign", "pad": "x" * 80})).decode().encode("utf-16-le"),
+            "nested zip": bundle(**{"inner.bin": record}),
+        }
+        for name, data in carriers.items():
+            got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context({"unit--native.exe": data}, prompts))}
+            self.assertEqual(got, {"unit_analysis_campaign": "synthetic-campaign", "unit_analysis_version": "1"}, name)
+        two = pe_fixture() + record + zlib.compress(config_record({"campaign": "other", "domain": "x.invalid"}))
+        self.assertEqual(BinarySolver().solve(archive_context({"unit--native.exe": two}, prompts)), [])
+
     def test_first_valid_literal_discards_bad_record(self):
         data = pe_fixture() + b"HCFG" + b"\xff" * 12 + config_record()
         prompt = "Use all unit-- members in ZIP central-directory order. Scan the specified member for literal HCFG magic and accept the first record whose bounds, CRC32, and decoded JSON validate. Submit the exact string value of the decoded HCFG JSON object's top-level domain property."

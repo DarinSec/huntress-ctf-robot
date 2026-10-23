@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import getpass
+import json
 import math
 from pathlib import Path
 import sys
@@ -28,6 +29,38 @@ from .workspace import render_triage
 CAPTURE_DIR = Path("integration-data")
 # Commands that can start, retry or submit: one robot per machine (lock.py).
 LOCKED_COMMANDS = {"start", "retry", "solve", "learn", "daily", "submit"}
+
+
+def _prepare(client: GameMasterClient, challenge_id: str, work_dir: Path, secrets: tuple[str, ...]) -> int:
+    """status + every delivery -> work/<id>/ as the robot leaves it for an unresolved route.
+
+    Read-only (status and artifact), so it never starts, retries or submits; a route nobody
+    started yet has no assignment to prepare.
+    """
+    from .containers import Member, passwords_from, unwrap
+    from .state import deliveries
+    from .solvers.base import instruction_text, SolveContext
+    from .workspace import write_workspace
+
+    attempt = client.status(challenge_id)
+    if not isinstance(attempt, dict) or attempt.get("error") or not attempt.get("questions"):
+        print(f"No assignment to prepare: {safe_value(json.dumps(attempt)[:300], secrets)}", file=sys.stderr)
+        return 1
+    listed = deliveries(attempt)
+    blobs = [client.artifact(challenge_id, delivery=index) for index in range(max(len(listed), 1))]
+    names = [item.get("filename") or f"delivery-{index + 1}" for index, item in enumerate(listed)] or ["artifact.bin"]
+    lane = challenge_id.split("-day-", 1)[0]
+    challenge = {"id": challenge_id, "lane": lane}
+    context = SolveContext(challenge_id, challenge, attempt, blobs[0], Path("unused"), ())
+    unpacked = unwrap(blobs[0], passwords_from(instruction_text(context)))
+    extra = tuple(Member(f"delivery {index}: {name}", blob) for index, (name, blob) in enumerate(zip(names, blobs), 1)) \
+        if len(blobs) > 1 else ()
+    directory = write_workspace(work_dir, challenge_id, challenge=challenge, attempt=attempt, artifact=blobs[0],
+                                members=unpacked.members + extra, notes=unpacked.notes, secrets=secrets)
+    for index, (name, blob) in enumerate(zip(names, blobs), 1):
+        (directory / f"delivery-{index}-{name.replace('/', '_')}").write_bytes(blob)
+    print(f"Prepared {directory} ({len(blobs)} deliveries, {len(attempt.get('questions') or [])} questions).")
+    return 0
 
 
 def _seconds(value: str) -> float:
@@ -141,6 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     hint.add_argument("path", type=Path, help="The file, or an archive whose members are checked")
     status = commands.add_parser("status", help="Read current attempt status")
     status.add_argument("challenge_id")
+    prepare = commands.add_parser(
+        "prepare", help="Read-only: write work/<id>/ (assignment, deliveries, triage.md) for a started route")
+    prepare.add_argument("challenge_id")
+    prepare.add_argument("--work-dir", type=Path, default=Path("work"))
     artifact = commands.add_parser("artifact", help="Save the current assigned artifact with SHA-256")
     artifact.add_argument("challenge_id")
     artifact.add_argument("--output", type=Path, help="Explicit destination; otherwise use a hash-named file")
@@ -268,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
             result = client.start(args.challenge_id, timed=args.timed)
         elif args.command == "retry":
             result = client.retry(args.challenge_id, timed=args.timed)
+        elif args.command == "prepare":
+            return _prepare(client, args.challenge_id, args.work_dir, secrets)
         elif args.command == "status":
             result = client.status(args.challenge_id)
         elif args.command == "solve":

@@ -31,8 +31,10 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
 ## What the robot already does for every artifact
 
 - Unpacks ZIP (incl. ZipCrypto with the lesson password, default `infected`), gzip and tar
-  in memory (`containers.py`); solvers see them as `context.members`. Encrypted entries of
-  32 KiB or more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
+  in memory (`containers.py`); solvers see them as `context.members`. Nested packages
+  (JAR/APK/Office/...) stay whole: a JAR's 3,134 classes once filled the member limit
+  before Day 23 Binary's later samples were reached. Encrypted entries of 32 KiB or
+  more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
   in pure Python), CRC-checked against the ZIP itself. Where none reads AES (the playing
   Homebase has only Info-ZIP unzip), the `cryptography` package decrypts it in Python with
   the HMAC checked (day 20 Script: 145 members in 356 ms).
@@ -107,30 +109,31 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   Conventions the service accepted: dimensions "WxH"; u16 hex "0x%04x", u32 RVA
   "0x%08x"; .NET MVID lowercase; MSI ProductCode exactly as stored "{UPPER}"; Message-ID
   with <>; ffprobe codec names; OOXML external targets sorted; central-directory names
-  in order, compact JSON. "none" only when the parsed file lacks the field.
-  Day 23's Time Trial is the exception that cost the lane two flags: 27 of its 28 kinds
-  were accepted and `zip.central_directory_member_names` was rejected for
-  `evidence-drop-001.zip`. That zip is ordinary (15 entries, central-directory order ==
-  local-header order == `zipfile`'s view, no directory entries, two entries sharing a
-  basename), and our answer is a faithful compact reading of it - what differs from
-  earlier days is only that its entries sit in directories. Which shape the grader wants
-  is not in the bytes, so `_orderings` offers the sorted paths, the basenames and the
-  sorted basenames as `alternatives`, and the next untimed sweep settles it in three
-  requests instead of a guess.
+  sorted (Day 23 rejected directory order; days 7-20 directories happened to be sorted),
+  compact JSON; Mach-O cpu_type_set sorted; SQLite page_size_bytes from header offset 16
+  (1 = 65536). "none" only when the parsed file lacks the field.
+  `formats_dfir.py` reads the forensic formats no day has used yet (EVTX, registry hive,
+  Prefetch, plist, WebP, TIFF, Matroska/WebM, AVI, VHD/VHDX, CAB, xz/bzip2/zstd/lz4,
+  ar/deb, pyc, RTF, CRX, ESE, OLE2 SummaryInformation) so `autoprop` can map a new property.
+  Which shape a collection property wants is the grader's, not the bytes': `_orderings`
+  offers the other readings (sorted paths, basenames, sorted basenames) as `alternatives`,
+  so a day that changes its mind is settled in a few untimed requests, not a guess.
 - **A Mastery request is all-or-nothing:** one wrong answer makes the whole request
   "incorrect" with nothing accepted. To learn a new lane's conventions run
   `learn <id>` (spends one variant): the robot's answers go per question kind, and the
   report names the kinds that fail. Fix those, then race normally (one request).
-- **Mobile Android: done (day 21), new mechanism on day 23.** `solvers/mobile_puzzle.py`
-  decodes each app's `assets/huntress_puzzle.json` by its codec (reverse, base64, hex,
-  split, reflection, dynamic payload DEX, ...) into the `ANS-` answer code; all three day
-  21 modes CORRECT. Day 23's asset is schema v2 and carries **no payload at all**
-  (`{"codec": "analysis", "build": ...}`): the code is computed in the app, not stored, so
-  the solver's new sweep for a code written as text in any member finds nothing and the
-  question stays unanswered. The DEX names the ingredients (`instrumentationSignals`,
-  `hook_detection`, `CONTROL`/`STRUCTURAL`, `0123456789ABCDEF`, `toHexString`, methods
-  `scanSignal61`, `sealHook1e`, `mixTrampoline79`, ...) - take the rule out of the
-  bytecode with the `ctf-android` subagent and codify it as a codec.
+- **Mobile Android: done (day 23).** `solvers/mobile_puzzle.py` decodes each app's
+  `assets/huntress_puzzle.json` by its codec (reverse, base64, hex, split, reflection,
+  dynamic payload DEX, ...) into the `ANS-` answer code; all three day 21 modes CORRECT.
+  Day 23's puzzle v2 (`codec: analysis`, no data) is computed by `Release.code()`:
+  `dexvm.py` interprets that Dalvik bytecode in Python (exact int/long semantics, an
+  allow-list of pure platform methods, JNI `long f(long)` from lib/x86_64 by an x86-64
+  register subset). The app is never run; 8/8 Day 23 apps match the accepted codes.
+  Unknown codec names get a bounded two-step search (only an exact `ANS-` code is kept);
+  rot47, atbash, vigenere, string-key xor and base58 are ready. A question's
+  "in package X" must match the APK's manifest package.
+  Last of all, a code the app ships as text in any member is read (UTF-16LE too), and only
+  where nothing computed one, so it can never contradict the emulated answer.
 - **Script Analysis: partial.** `solvers/script_descriptors.py` answers every question of
   the specimens with a `HUNTRESS_ANALYSIS_V1` header (B64/HEX/HB64/FRAG): ~54% of a day,
   accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
@@ -138,18 +141,27 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
   `solvers/script.py` (`script-rules`, Ilse, on `analysis/scriptrules.py`) decodes those
   families too: 1329/1329 (day 20) and 1373/1373 (day 21) offline, agreeing with every
-  descriptor answer; ~1.3 s per day. In the robot from day 22. Day 23 (GDScript resource
-  loader, 1342 questions) is the open one: 12 kinds accepted, `carrier` (13 answers) and
-  `obfuscation` (14) rejected, and nothing at all for `host`, `indicator`, `leaf`,
-  `secondary`, `style`, `tertiary`, `token`.
+  descriptor answer; ~1.3 s per day. In the robot from day 22. Day 23 added
+  `LYR-<layers>-<payload>` headers (layers in encoder order) and `<family>-<hex6>-<field>`
+  ids (style, indicator, campaign-token, url-host, path-leaf): 1495/1495 TT and
+  10465/10465 Mastery agree with the accepted answers. Layer names are read generically
+  (rot13, b85, a85, zlib, gzip, url, bin ready); an unknown layer yields nothing.
 - **Binary** (owner David): `solvers/binary.py` (`binary-static-facts`, stdlib only; reads
   only the members the questions name) answers per question property: 240/240 (day 20) and
   252/252 (day 21) offline in ~1.9 s and ~210 MB, agreeing in substance with Ilse's
   independent solver (the rest are spellings the formats allow: ELF/ELF64, x86_64/x86-64).
   In the robot from day 22. The lane lists only through the whole day (`lane=` is HTTP 400).
-  Day 23 (276 questions, every one answered) failed on the one `d*_analysis_machine`
-  group: 15 decimal codes, at least one wrong, and nothing else was accepted with them.
-  The split now names which, and `_spellings` offers the label and the hex code after it.
+  A day's block is 12 questions: ~9 standard (sha256, format, machine, HCFG config fields)
+  plus 1-3 new kinds. Config fields resolve by "top-level X property", "decoded HCFG JSON
+  a.b" or the answer ID (`..._config_campaign`): day 19 replays 221/228 (was 147), every new
+  one equal to the accepted answer. A storage worded in a way no rule knows is searched
+  across every carrier (also zlib/gzip/xz/bz2, single-byte XOR, reversed, UTF-16, nested
+  ZIP) on untimed runs only, accepting one CRC/JSON-valid record; timed races keep to the
+  named storage rules, and offsets/storage labels are never claimed for a discovered record.
+  A machine field answers the decimal code, except 0x14c, which the graders take as the
+  label `i386` (day 23 rejected 332 for the managed F# assemblies). Where a spelling is
+  refused again, the split names the single answer and `_spellings` offers the label, the
+  decimal and the hex code on an untimed attempt.
 - **Web Exploitation** (owner Parsa, live targets): manual.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
@@ -236,9 +248,9 @@ Never read, print, or copy that file.
 .\scripts\huntress.ps1 doctor --output integration-data    # read-only schema/list capture
 .\scripts\huntress.ps1 triage <file>                       # offline one-page triage
 .\scripts\huntress.ps1 triage <file> --time --question "..."  # offline solver cost in ms
-python -I scripts\answer_gaps.py work\<id> --show "<regex>"  # offline: what the robot
-#   answers for a saved route, kind by kind, which kinds it cannot answer at all, and
-#   (with --show) those kinds' values, so a wrong convention is visible without a variant
+python -I scripts\solve_offline.py work\<id> --src src --show "<regex>"  # offline: what
+#   the robot answers for a saved route, kind by kind, which kinds it cannot answer at
+#   all, and (with --show) those kinds' values: a wrong convention without a variant
 .\scripts\huntress.ps1 daily                               # untimed, all challenges
 .\scripts\huntress.ps1 solve <id> --capture                # untimed, saves responses
 .\scripts\huntress.ps1 daily --timed                       # only on request; proven only
@@ -252,12 +264,26 @@ Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants 
 
 ## Release day: a new question type
 
+Three tools since Day 23 (all offline except `prepare`, which is read-only):
+- `python -m huntress_ctf prepare <id>` writes `work/<id>/` (assignment, every delivery,
+  triage.md) for any started route, from any machine with the token.
+- `scripts/solve_offline.py work/<id>` lists per question kind what the robot answers.
+- `scripts/release-agent.sh <id>` (or `--watch <day> --max N` after the release) lets
+  headless Claude Code write the missing solver on branch `agent/<id>-<stamp>` in its own
+  worktree, without the token and without submitting; the script then re-checks tests,
+  replay and coverage itself. A human reviews, merges and deploys.
+- `scripts/replay.py` re-solves every scored assignment in `~/.huntress/corpus` (the robot
+  records them after each CORRECT/accepted submit); `homebase.sh deploy` refuses a
+  deploy that regresses an accepted answer (`SKIP_REPLAY=1` overrides).
+
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds
-clearly (named like the property, e.g. `macho.uuid` -> `uuid`), formatted by the suffix
-convention. A CORRECT single stores the mapping as the hint's chain
-(`["autoprop", "macho.uuid=macho:uuid"]`); Time Trial, Mastery and later days use only
-confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
+clearly (named like the property, e.g. `macho.uuid` -> `uuid`; a unit suffix such as
+`_bytes` still names the field exactly), formatted by the suffix convention. A CORRECT
+single stores the mapping as the hint's chain (`["autoprop", "macho.uuid=macho:uuid"]`).
+Untimed Time Trial and Mastery make the same clear guess (a teammate often takes the
+Single Solve by hand, so nothing gets confirmed: Day 23); timed races and later days use
+only confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
 
 The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
 one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came

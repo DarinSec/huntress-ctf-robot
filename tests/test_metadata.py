@@ -116,7 +116,11 @@ class JarManifestTests(unittest.TestCase):
 
 
 class OrderingTests(unittest.TestCase):
-    """Day 23 rejected the stored central-directory names of a zip with directories."""
+    """Day 23 took the sorted central-directory names and rejected the stored order.
+
+    The parser sorts, because that is what the service accepted. The shapes it did not
+    confirm wait as `alternatives`, for a day that wants the names some other way.
+    """
 
     def candidates(self, names):
         drop = zipped([(name, b"x") for name in names])
@@ -128,18 +132,18 @@ class OrderingTests(unittest.TestCase):
                                {"answer_ids": ["names"], "questions": [question]}, bundle, Path("x"), ("names",))
         return MetadataSolver().solve(context)
 
-    def test_names_in_directories_offer_sorted_and_basename_shapes(self):
+    def test_names_in_directories_offer_the_basename_shapes(self):
         [candidate] = self.candidates(["drop-33/doc-4.csv", "box-28/item-1.csv"])
-        self.assertEqual(candidate.answer, '["drop-33/doc-4.csv","box-28/item-1.csv"]')  # Still the reading.
+        self.assertEqual(candidate.answer, '["box-28/item-1.csv","drop-33/doc-4.csv"]')  # Sorted paths.
         self.assertEqual(candidate.alternatives, (
-            '["box-28/item-1.csv","drop-33/doc-4.csv"]',  # Sorted paths.
-            '["doc-4.csv","item-1.csv"]',                 # Basenames in order; sorted is the same.
+            '["item-1.csv","doc-4.csv"]',  # The basenames of the sorted paths.
+            '["doc-4.csv","item-1.csv"]',  # The basenames sorted.
         ))
 
-    def test_flat_names_offer_only_the_sorted_shape(self):
+    def test_flat_names_have_no_other_shape_to_offer(self):
         [candidate] = self.candidates(["z.txt", "a.txt"])
-        self.assertEqual(candidate.answer, '["z.txt","a.txt"]')
-        self.assertEqual(candidate.alternatives, ('["a.txt","z.txt"]',))
+        self.assertEqual(candidate.answer, '["a.txt","z.txt"]')
+        self.assertEqual(candidate.alternatives, ())  # No directories, nothing left to vary.
 
 
 class PropertyTests(unittest.TestCase):
@@ -159,6 +163,10 @@ class PropertyTests(unittest.TestCase):
         drop = zipped([("room-01/item-1.txt", b"a"), ("room-02/item-1.txt", b"b")])
         self.assertEqual(m.zip_eocd_total_entries(drop), "2")
         self.assertEqual(m.zip_central_directory_member_names(drop), '["room-01/item-1.txt","room-02/item-1.txt"]')
+        # Day 23: the directory was not in sorted order and only the sorted names were accepted.
+        shuffled = zipped([("drop-33/doc-4.csv", b"a"), ("box-28/item-1.csv", b"b"), ("shelf-07/part-4.log", b"c")])
+        self.assertEqual(m.zip_central_directory_member_names(shuffled),
+                         '["box-28/item-1.csv","drop-33/doc-4.csv","shelf-07/part-4.log"]')
         rels = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
                 '<Relationship Id="rId9" Target="https://example.test/evidence/x" TargetMode="External"/>'
                 '<Relationship Id="rId10" Target="https://example.test/control" TargetMode="External"/>'
@@ -191,6 +199,14 @@ class PropertyTests(unittest.TestCase):
         hdlr = box(b"hdlr", b"\0" * 8 + b"vide" + b"\0" * 12)
         moov = box(b"moov", box(b"trak", box(b"mdia", hdlr + box(b"minf", box(b"stbl", stsd)))))
         self.assertEqual(m.media_primary_video_dimensions(box(b"ftyp", b"isom\0\0\0\0") + moov), "320x180")
+
+    def test_sqlite_page_size(self):
+        header = bytearray(b"SQLite format 3\0" + bytes(84))
+        header[16:18] = (16384).to_bytes(2, "big")
+        self.assertEqual(m.sqlite_page_size_bytes(bytes(header)), "16384")
+        header[16:18] = (1).to_bytes(2, "big")  # 1 encodes 65536.
+        self.assertEqual(m.sqlite_page_size_bytes(bytes(header)), "65536")
+        self.assertIsNone(m.sqlite_page_size_bytes(b"OggS mislabeled as .sqlite"))
 
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET

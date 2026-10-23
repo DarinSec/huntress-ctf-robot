@@ -270,14 +270,20 @@ def _section(question: Question, image):
     return matches[0] if len(matches) == 1 else None
 
 
+# Machine values the service wants as a label rather than as the decimal code (day 23
+# refused 332 for the managed F# assemblies and took "i386"; the label was accepted
+# everywhere the decimal had been, day 3's managed i386 included).
+MACHINE_LABELS = {0x14C: "i386"}
+
+
 def _spellings(question: Question, analysis: Analysis, answer: str) -> tuple[str, ...]:
     """Other spellings of a machine-field answer, for `learn` to offer if this one fails.
 
     Which spelling the grader takes is its own choice, not the bytes': day 22 refused the
-    "x86" label and took the decimal code 332, and a machine-field question's format
-    accepts "label or its equivalent decimal or hexadecimal code". So the decimal code
-    goes on the clock and the label and the hex code wait here, used only after the
-    service has rejected the decimal one on an untimed attempt.
+    "x86" label and took the decimal code 332, day 23 refused that 332 and took the
+    label `i386`, and the question's format accepts "label or its equivalent decimal or
+    hexadecimal code". Whichever one the lane sends goes on the clock; the rest wait
+    here, used only after the service has rejected that one on an untimed attempt.
     """
     q = question.text.casefold()
     if "architect" not in q or "machine field" not in q:
@@ -289,9 +295,10 @@ def _spellings(question: Question, analysis: Analysis, answer: str) -> tuple[str
     if len(images) != 1:
         return ()
     machine = getattr(images[0], "machine", None)
-    if machine is None or answer != str(machine):
+    if machine is None:
         return ()
-    other = [images[0].arch, f"0x{machine:x}", f"0x{machine:04x}"]
+    other = [str(machine), MACHINE_LABELS.get(machine), images[0].arch,
+             f"0x{machine:x}", f"0x{machine:04x}"]
     return tuple(dict.fromkeys(
         value for value in other
         if value and value != answer and valid_answer(value, question.answer_format)
@@ -338,7 +345,11 @@ def _structured(question: Question, analysis: Analysis) -> str | None:
             # label spelling is not derivable from the bytes, so for a single image we answer
             # the machine field with its decimal code for ANY architecture -- not just i386, and
             # even when its arch label is unmapped (so this must run before the arch-None guard).
-            return str(images[0].machine)
+            # Day 23 exception: the managed F# i386 assemblies (d22/d23) reject the decimal 332
+            # and require the IMAGE_FILE_MACHINE label "i386"; that label is accepted everywhere
+            # the decimal was (incl. day 3's managed i386), so map 0x14c -> "i386" specifically.
+            machine = images[0].machine
+            return MACHINE_LABELS.get(machine) or str(machine)
         if any(i.arch is None for i in images):
             return None
         values = sorted({i.arch for i in images})

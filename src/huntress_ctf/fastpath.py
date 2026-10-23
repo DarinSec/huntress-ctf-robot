@@ -31,7 +31,7 @@ from .containers import Member, passwords_from, prepare_tools, unwrap
 from .decoders import clear_cache
 from .display import print_result
 from .hints import get_hint, record_hint
-from . import network
+from . import corpus, network
 from .solvers import LOAD_ERRORS, SOLVERS, AnswerCandidate, Solver, SolveContext
 from .state import AttemptState, current_fields, deliveries, mode_name, remember_identity
 from .workspace import write_workspace
@@ -494,7 +494,7 @@ def _question_lists(value: Any) -> set[str]:
 def _report(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
     before: Any, run: Run, hint: dict[str, Any] | None, artifact_dir: Path,
-    work_dir: Path, responses: dict[str, Any], secrets: tuple[str, ...],
+    work_dir: Path, responses: dict[str, Any], secrets: tuple[str, ...], corpus_root: Path | None = None,
 ) -> None:
     print("Challenge:")
     print_result(challenge, secrets)
@@ -552,6 +552,19 @@ def _report(
         print("Submission result:")
         print_result(run.result, secrets)
     outcome = run.result.get("result") if isinstance(run.result, dict) else None
+    if run.artifact is not None and run.submitted and str(outcome).casefold() in ("correct", "accepted"):
+        # The replay corpus (corpus.py, scripts/replay.py): what the service accepted, kept for
+        # re-solving with later solver versions. Never allowed to fail the run.
+        try:
+            accepted_ids = set(AttemptState.parse(run.result).accepted_ids)
+            accepted = {key: value for key, value in run.submitted.items()
+                        if str(outcome).casefold() == "correct" or key in accepted_ids}
+            saved = corpus.record(challenge_id, challenge, run.attempt, run.artifact, run.deliveries,
+                                  accepted, secrets, root=corpus_root)
+            if saved:
+                print(f"Replay corpus: {json.dumps(str(saved))} ({len(accepted)} accepted answers)")
+        except (OSError, ValueError, TypeError, GameMasterError) as exc:
+            print(f"Replay corpus not written: {exc}")
     if run.artifact is not None and (run.result is None or str(outcome).casefold() == "incorrect"):
         try:
             directory = write_workspace(
@@ -714,7 +727,8 @@ def run_fast(
         if run.unpacked is not None:
             run.unpack_notes = run.unpacked.notes  # Unpacks now, off the clock, if no solver did.
         responses["attempt"], responses["result"] = run.attempt, run.result
-        _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets)
+        _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets,
+                corpus_root=(hints_path.parent / "corpus") if hints_path else None)
         if report is not None:
             report.update(_timings(run))
         if run.pipeline_failure and base_url:

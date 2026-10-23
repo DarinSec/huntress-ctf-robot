@@ -192,7 +192,7 @@ saker stoppade den:
    svepet 19:32 hoppade över båda TT men racade deras Mastery (1 249 ms, `incorrect`) —
    så en sådan skip blockerar nu lägena efter sig, precis som 409-kedjan.
 5. **Ingen såg vad som var fel.** Svaret låg i en logg på 2,4 MB. **Klart:**
-   `scripts/answer_gaps.py` (offline, gratis: vad roboten svarar för en sparad rutt, typ
+   `scripts/solve_offline.py` (offline, gratis: vad roboten svarar för en sparad rutt, typ
    för typ, vilka typer den inte kan svara på, och `--show` skriver värdena) plus
    `scripts/homebase.sh gaps <id>`; `homebase.sh report` skriver nu avvisad typ, utpekade
    fel svar och typer utan svar under varje rutt.
@@ -210,7 +210,7 @@ saker stoppade den:
   `_spellings` kan redan ha lagat det själv. 1 fråga, 3 flaggor.
 - **Android (Darin):** ta fram regeln ur `classes.dex` (subagenten `ctf-android`) och
   lägg den som en codec i `mobile_puzzle.py`. 1 fråga, 2 flaggor.
-- **Script (Ilse):** 9 typer, störst kvarvarande arbete. `answer_gaps.py --show` på den
+- **Script (Ilse):** 9 typer, störst kvarvarande arbete. `solve_offline.py --show` på den
   sparade rutten ger både de avvisade värdena och de sju typerna utan svar.
 - **Drift (Darin):** VM:n var nere 06:25–12:56 och 14:36–18:26 UTC den 23:e. Roboten
   spelar bara när den är uppe, och en pushad fix spelar bara när någon driftsätter: dag
@@ -222,7 +222,7 @@ saker stoppade den:
 
 Rätt instinkt, och den hör hemma efter punkt 1–4: en agent som läser rapporten tre
 minuter efter släppet behöver att rapporten redan pekar på den enda frågan som är fel —
-annars läser den 2,4 MB logg. Med `answer_gaps.py` och delningen på plats är indatan
+annars läser den 2,4 MB logg. Med `solve_offline.py --show` och delningen på plats är indatan
 liten och entydig, och agenten kan hålla sig till att skriva en regel per utpekad fråga
 på en egen gren, utan att starta, lämna in eller driftsätta något. Gör den läs-only mot
 Game Master (`status`, `artifact`) och låt replay-grinden (`verify_fields.py`) avgöra.

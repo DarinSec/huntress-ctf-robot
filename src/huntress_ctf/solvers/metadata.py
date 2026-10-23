@@ -7,7 +7,7 @@ evidence ZIPs), or a separate delivery. Questions are of three kinds:
 - file facts: exact size, MD5, SHA-1, SHA-256, first sixteen bytes as hex;
 - the filename of the one file an evidence archive holds, and a JSON array of named
   files in ascending SHA-256 order;
-- "Determine <property> for <file>." (Days 3-20), one parser per property below.
+- "Determine <property> for <file>." (Days 3-23), one parser per property below.
 
 A property is answered "none" only when the file was parsed and the field is absent
 (the answer format says so); a file that cannot be parsed gets no answer at all.
@@ -228,7 +228,9 @@ def zip_central_directory_member_names(data: bytes) -> str | None:
         raw = data[cursor + 46:cursor + 46 + name_length]
         names.append(raw.decode("utf-8" if flags & 0x800 else "cp437"))
         cursor += 46 + name_length + extra_length + comment_length
-    return json.dumps(names, separators=(",", ":"), ensure_ascii=False)
+    # Sorted: Day 23 rejected central-directory order and accepted the sorted names. Days 7-20
+    # were accepted too, because their directories were already in sorted order.
+    return json.dumps(sorted(names), separators=(",", ":"), ensure_ascii=False)
 
 
 def _pe(data: bytes):
@@ -629,6 +631,12 @@ def jar_main_class(data: bytes) -> str | None:
     return "none"
 
 
+def sqlite_page_size_bytes(data: bytes) -> str | None:
+    """Header offset 16, big-endian; the value 1 means 65536 (Day 23)."""
+    fields = formats.sqlite(data)
+    return str(fields["page_size"]) if fields and "page_size" in fields else None
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -650,6 +658,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "macho.cpu_type_set": macho_cpu_type_set,
     "apk.package_name": apk_package_name,
     "jar.main_class": jar_main_class,
+    "sqlite.page_size_bytes": sqlite_page_size_bytes,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [

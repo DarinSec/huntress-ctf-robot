@@ -8,10 +8,13 @@ that no parser in metadata.PROPERTIES knows:
   clearly the property, answer it once. The candidate's chain records the mapping
   ("autoprop", "<property>=<format>:<field>"); a CORRECT single solve stores it in
   hints.json like any proven chain.
-- Time Trial and Mastery (and later days): only mappings a CORRECT single solve confirmed.
+- Untimed Time Trial and Mastery: the same clear guess. A teammate often takes the Single
+  Solve by hand, so no mapping gets confirmed and the routes stayed open (Day 23
+  sqlite.page_size_bytes). An untimed "incorrect" is resent kind by kind, so a wrong guess
+  costs only its own kind.
+- Timed races (and later days): only mappings a CORRECT single solve confirmed.
 
-A wrong guess costs one rejected untimed answer, teaches nothing, and leaves the property
-to the AI. Once a parser for the property is added to PROPERTIES, this solver stays out.
+Once a parser for the property is added to PROPERTIES, this solver stays out.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import re
 
 from ..formats import describe
+from ..state import GameMasterError, current_fields
 from ..suggest import confident, formatted
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
 from .metadata import PROPERTIES, Files
@@ -63,7 +67,12 @@ class AutoPropertySolver:
         ]
         if not items:
             return []
-        single = "/" not in context.challenge_id
+        try:
+            fields = current_fields(context.attempt)
+        except GameMasterError:
+            fields = {}
+        timed = bool(fields.get("run_for_time") or fields.get("deadline"))
+        may_guess = "/" not in context.challenge_id or not timed
         known = confirmed_mappings()
         files = Files(context)
         candidates = []
@@ -78,7 +87,7 @@ class AutoPropertySolver:
                     continue
                 answer = formatted(prop, value)
                 evidence = f"{prop} = {label} field {key}, a mapping a CORRECT single solve confirmed."
-            elif single:
+            elif may_guess:
                 guess = confident(prop, data)
                 if guess is None:
                     continue

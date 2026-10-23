@@ -30,7 +30,22 @@ export PYTHONPATH="$HOME/src" HUNTRESS_GM_URL="http://10.0.0.219/huntress-ctf-pr
 # What a sweep depends on: the solver code and this script (its lanes), then the proven
 # solvers. The code is taken as the sweep starts, so a deploy during a sweep sweeps again.
 code() { { find "$HOME/src" -name '*.py' -type f -print0 | sort -z | xargs -0 sha1sum; cat "$0"; } | sha1sum; }
-version() { { echo "$1"; cat "$state/hints.json" 2>/dev/null; } | sha1sum | cut -c1-16; }
+# While the last sweep left a Time Trial or Mastery waiting for its earlier mode ("is not
+# solved yet"), the day's solved flags count too: a Single Solve or Time Trial a teammate
+# finishes by hand then starts the next mode within a minute (one read-only list, ~4 s).
+waiting() {
+  last=$(ls -t "$HOME"/day"$day"-*-untimed.log 2>/dev/null | head -1)
+  [ -n "$last" ] && grep -q 'is not solved yet' "$last" || return 0
+  python3 -m huntress_ctf list --day "$day" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit()
+items = data.get("challenges", data) if isinstance(data, dict) else data
+print(sorted(str(c.get("id")) for c in items if isinstance(c, dict) and c.get("solved") is True))'
+}
+version() { { echo "$1"; cat "$state/hints.json" 2>/dev/null; waiting; } | sha1sum | cut -c1-16; }
 swept="$state/day$day.swept"
 [ -e "$swept" ] && [ "$(cat "$swept")" = "$(version "$(code)")" ] && exit 0  # Nothing new to try.
 release=$(TZ=America/New_York date -d "08:59:30" +%s)

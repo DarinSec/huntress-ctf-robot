@@ -413,6 +413,37 @@ def _sqlite(data: bytes, f: dict) -> None:
              text_encoding={1: "UTF-8", 2: "UTF-16le", 3: "UTF-16be"}.get(struct.unpack_from(">I", data, 56)[0], "unknown"),
              user_version=struct.unpack_from(">I", data, 60)[0], application_id=struct.unpack_from(">I", data, 68)[0],
              sqlite_version_number=struct.unpack_from(">I", data, 96)[0])
+    # Page geometry (Day 23 "copied, truncated, embedded"): the header's claims against the bytes.
+    pages, size = f["database_size_pages"], f["page_size"]
+    f.update(reserved_bytes=data[20], freelist_trunk_page=struct.unpack_from(">I", data, 32)[0],
+             freelist_page_count=struct.unpack_from(">I", data, 36)[0],
+             default_cache_size=struct.unpack_from(">I", data, 48)[0],
+             largest_root_page=struct.unpack_from(">I", data, 52)[0],
+             incremental_vacuum=bool(struct.unpack_from(">I", data, 64)[0]),
+             version_valid_for=struct.unpack_from(">I", data, 92)[0],
+             journal_mode="wal" if data[18] == 2 and data[19] == 2 else "rollback",
+             file_size_bytes=len(data), expected_size_bytes=pages * size,
+             actual_page_count=len(data) // size if size else 0,
+             page_aligned=bool(size) and len(data) % size == 0,
+             truncated=len(data) < pages * size, trailing_bytes=max(0, len(data) - pages * size))
+    # The in-header size is only trusted when the change counter matches (sqlite fileformat 1.3.7).
+    f["header_size_valid"] = pages > 0 and f["file_change_counter"] == f["version_valid_for"]
+    f["application"] = SQLITE_APPLICATIONS.get(f["application_id"], "none" if not f["application_id"] else "unknown")
+    f["application_id_hex"] = f"0x{f['application_id']:08x}"
+
+
+# PRAGMA application_id values registered in SQLite's magic.txt (the "parent application" a database claims).
+SQLITE_APPLICATIONS = {
+    0x0F055112: "Fossil checkout", 0x0F055113: "Fossil global", 0x0F055111: "Fossil repository",
+    0x47504B47: "GeoPackage", 0x47503130: "GeoPackage 1.0", 0x47503131: "GeoPackage 1.1",
+    0x4D504258: "MBTiles",
+}
+
+
+def sqlite(data: bytes) -> dict | None:
+    if not data.startswith(b"SQLite format 3\0") or len(data) < 100:
+        return None
+    return _guarded(_sqlite, data)
 
 
 def _pcap(data: bytes, f: dict) -> None:
@@ -866,4 +897,6 @@ def describe(data: bytes) -> list[tuple[str, dict]]:
         fields = parse(data)
         if fields is not None:
             return [(label, fields)]
-    return other_formats(data) + document_formats(data)
+    from . import formats_dfir  # Formats no day has asked about yet (Day 24+ candidates).
+
+    return other_formats(data) + document_formats(data) + formats_dfir.formats(data)
