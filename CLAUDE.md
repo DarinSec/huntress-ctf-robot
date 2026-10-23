@@ -60,13 +60,31 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   `~/.huntress/robot.lock` (`HUNTRESS_LOCK` overrides); a second robot stops with the
   holder's command, or queues with `--lock-wait SECONDS`. Read-only commands never lock.
 - `daily` untimed runs each challenge family (Single Solve, then Time Trial, then
-  Mastery) in its own thread and connection; the timed routes of an unsolved Single
-  Solve are skipped (HTTP 409). Races stay one at a time, each route once: hints.json
-  keeps `raced_at`, `races` and `best_on_clock_ms`; `--rerace` races again.
+  Mastery) in its own thread and connection. A route that does not score blocks the
+  modes after it in its family: the service answers a later mode HTTP 409 until the one
+  before it scores, so asking anyway reported an "error" that cost day 23 ten sweeps. A
+  route skipped because it was turned down blocks them too - the later modes ask the same
+  question kinds, and gating only the Time Trial moved day 23's waste to the Masteries.
+  Races stay one at a time, each route once: hints.json keeps `raced_at`, `races` and
+  `best_on_clock_ms`; `--rerace` races again. A route the service has already turned
+  down is not raced at all: hints.json keeps `turned_down` (an untimed `incorrect`,
+  `unresolved` or `conflict`, or a rejected submission on the clock) with
+  `turned_down_at`, because a race submits once and would spend a ranked variant on the
+  same answer - day 23's Metadata Time Trial raced three times on one rejected
+  convention, and the Android one three times with no answer at all. A later
+  `recorded_at` (a solver that scored on the route since) or a run that ends `complete`
+  clears the mark; `--rerace` ignores it.
   `--wait-release S` (with `--day`) polls one lane until the day is listed.
 - An untimed "incorrect" (one wrong answer rejects the whole request) is resent kind by
   kind on the same open attempt (`learn.run_learn(open_only=True)`): the right kinds are
   accepted and the report names the new one. IDs without digits (Script) group by field.
+  A rejected kind is then **split in halves** until the refused answers are named
+  (`rejected_answer_ids`): the right ones are accepted on the way, so one wrong answer
+  among fifteen no longer holds the other fourteen open, and the report points at the one
+  question to fix. Each named answer is finally retried with the other spellings its
+  solver offers (`AnswerCandidate.alternatives`, untimed only, never on the clock), so a
+  grader-chosen spelling (a machine field as a label, a decimal or a hex code) heals
+  itself within the day; `report["alternatives"]` names the one that was accepted.
 - Web routes return `targets[]` and no file: nothing is downloaded, and `daily` skips
   them unless asked with `--lane web-exploitation`.
 
@@ -90,13 +108,29 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   "0x%08x"; .NET MVID lowercase; MSI ProductCode exactly as stored "{UPPER}"; Message-ID
   with <>; ffprobe codec names; OOXML external targets sorted; central-directory names
   in order, compact JSON. "none" only when the parsed file lacks the field.
+  Day 23's Time Trial is the exception that cost the lane two flags: 27 of its 28 kinds
+  were accepted and `zip.central_directory_member_names` was rejected for
+  `evidence-drop-001.zip`. That zip is ordinary (15 entries, central-directory order ==
+  local-header order == `zipfile`'s view, no directory entries, two entries sharing a
+  basename), and our answer is a faithful compact reading of it - what differs from
+  earlier days is only that its entries sit in directories. Which shape the grader wants
+  is not in the bytes, so `_orderings` offers the sorted paths, the basenames and the
+  sorted basenames as `alternatives`, and the next untimed sweep settles it in three
+  requests instead of a guess.
 - **A Mastery request is all-or-nothing:** one wrong answer makes the whole request
   "incorrect" with nothing accepted. To learn a new lane's conventions run
   `learn <id>` (spends one variant): the robot's answers go per question kind, and the
   report names the kinds that fail. Fix those, then race normally (one request).
-- **Mobile Android: done (day 21).** `solvers/mobile_puzzle.py` decodes each app's
-  `assets/huntress_puzzle.json` by its codec (reverse, base64, hex, split, reflection,
-  dynamic payload DEX, ...) into the `ANS-` answer code; all three day 21 modes CORRECT.
+- **Mobile Android: done (day 21), new mechanism on day 23.** `solvers/mobile_puzzle.py`
+  decodes each app's `assets/huntress_puzzle.json` by its codec (reverse, base64, hex,
+  split, reflection, dynamic payload DEX, ...) into the `ANS-` answer code; all three day
+  21 modes CORRECT. Day 23's asset is schema v2 and carries **no payload at all**
+  (`{"codec": "analysis", "build": ...}`): the code is computed in the app, not stored, so
+  the solver's new sweep for a code written as text in any member finds nothing and the
+  question stays unanswered. The DEX names the ingredients (`instrumentationSignals`,
+  `hook_detection`, `CONTROL`/`STRUCTURAL`, `0123456789ABCDEF`, `toHexString`, methods
+  `scanSignal61`, `sealHook1e`, `mixTrampoline79`, ...) - take the rule out of the
+  bytecode with the `ctf-android` subagent and codify it as a codec.
 - **Script Analysis: partial.** `solvers/script_descriptors.py` answers every question of
   the specimens with a `HUNTRESS_ANALYSIS_V1` header (B64/HEX/HB64/FRAG): ~54% of a day,
   accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
@@ -104,12 +138,18 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
   `solvers/script.py` (`script-rules`, Ilse, on `analysis/scriptrules.py`) decodes those
   families too: 1329/1329 (day 20) and 1373/1373 (day 21) offline, agreeing with every
-  descriptor answer; ~1.3 s per day. In the robot from day 22.
+  descriptor answer; ~1.3 s per day. In the robot from day 22. Day 23 (GDScript resource
+  loader, 1342 questions) is the open one: 12 kinds accepted, `carrier` (13 answers) and
+  `obfuscation` (14) rejected, and nothing at all for `host`, `indicator`, `leaf`,
+  `secondary`, `style`, `tertiary`, `token`.
 - **Binary** (owner David): `solvers/binary.py` (`binary-static-facts`, stdlib only; reads
   only the members the questions name) answers per question property: 240/240 (day 20) and
   252/252 (day 21) offline in ~1.9 s and ~210 MB, agreeing in substance with Ilse's
   independent solver (the rest are spellings the formats allow: ELF/ELF64, x86_64/x86-64).
   In the robot from day 22. The lane lists only through the whole day (`lane=` is HTTP 400).
+  Day 23 (276 questions, every one answered) failed on the one `d*_analysis_machine`
+  group: 15 decimal codes, at least one wrong, and nothing else was accepted with them.
+  The split now names which, and `_spellings` offers the label and the hex code after it.
 - **Web Exploitation** (owner Parsa, live targets): manual.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
@@ -124,6 +164,10 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
 - IDs carry lane and day: `warmups-day-01`, `script-analysis-day-01-native-signals/mastery`;
   each mode is its own ID (`…/time_trial`, `…/mastery`). Six lanes, including
   `web-exploitation` (live `targets[]`, no artifact).
+- **The modes are a chain:** a route answers HTTP 409 until the mode before it in its
+  family scores. Day 23: three Single Solves were solved, their Time Trials stayed
+  unresolved, and all three Masteries answered 409 - so one wrong answer in a Time Trial
+  costs that lane two flags, not one.
 - Status/start use `accepted_ids`, `artifacts[{filename, sha256, size, download}]` (that
   sha256 is the `op=artifact` bytes'), and `questions[{id, question, answer_format}]`.
   Most Day 1 timed routes lack `run_for_time_supported`, so an ordinary start is timed.
@@ -192,6 +236,9 @@ Never read, print, or copy that file.
 .\scripts\huntress.ps1 doctor --output integration-data    # read-only schema/list capture
 .\scripts\huntress.ps1 triage <file>                       # offline one-page triage
 .\scripts\huntress.ps1 triage <file> --time --question "..."  # offline solver cost in ms
+python -I scripts\answer_gaps.py work\<id> --show "<regex>"  # offline: what the robot
+#   answers for a saved route, kind by kind, which kinds it cannot answer at all, and
+#   (with --show) those kinds' values, so a wrong convention is visible without a variant
 .\scripts\huntress.ps1 daily                               # untimed, all challenges
 .\scripts\huntress.ps1 solve <id> --capture                # untimed, saves responses
 .\scripts\huntress.ps1 daily --timed                       # only on request; proven only
@@ -216,8 +263,13 @@ The robot answers every known type at 15:00 (Swedish time). A new type (Metadata
 one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
 
-1. `scripts/homebase.sh report`: every route's outcome, and for each unresolved Warmups or
-   Metadata route its questions with the field suggestions (`log` shows the raw tail).
+1. `scripts/homebase.sh report`: every route's outcome, under each the kind the service
+   rejected, the single answers the split pinned it to and the kinds nothing answered,
+   and for each unresolved Warmups or Metadata route its questions with the field
+   suggestions (`log` shows the raw tail).
+1b. `scripts/homebase.sh gaps <id> ["<regex>"]`: the same route offline, kind by kind,
+   with the regex printing those kinds' values. Use it for any lane, before pulling
+   bytes: it costs nothing and reads what the robot itself would answer now.
 2. `scripts/homebase.sh pull <id>`: `triage.md` lists every question with its format,
    marks a `Determine <property>` without a parser and, under it, suggests the matching
    field and a candidate answer in the suffix convention (`_u16_hex` -> `0x%04x`, `_set`

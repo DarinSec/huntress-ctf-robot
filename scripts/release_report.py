@@ -30,6 +30,48 @@ def latest(day: int, kind: str) -> tuple[str | None, dict | None, str]:
         return logs[-1], None, text  # Still running.
 
 
+def blockers(text: str) -> dict[str, list[str]]:
+    """Per route, the one thing standing between it and its flag, from the day's log.
+
+    After an untimed "incorrect" the robot resends kind by kind and splits a rejected
+    kind until the refused answers are named, then prints that report under
+    "===== <id> (incorrect: resending kind by kind) =====". A route that submitted only
+    some of its answers prints `unresolved_answer_ids` in its own section instead.
+    Reading both here saves searching a log of several MB for the one question a lane
+    owner has to fix.
+    """
+    found: dict[str, list[str]] = {}
+    for section in text.split("\n===== ")[1:]:
+        header, _, body = section.partition("\n")
+        challenge_id = header.partition(" (")[0]
+        lines = found.setdefault(challenge_id, [])
+        if "(incorrect: resending kind by kind)" in header:
+            try:
+                report, _ = json.JSONDecoder().raw_decode(body.lstrip())
+            except ValueError:
+                continue
+            kinds = report.get("kinds") if isinstance(report.get("kinds"), dict) else {}
+            lines += [f"kind rejected: {name}" for name, entry in sorted(kinds.items())
+                      if isinstance(entry, dict) and str(entry.get("result")).casefold() == "incorrect"]
+            for answer_id, healed in sorted((report.get("alternatives") or {}).items()):
+                lines.append(f"spelling accepted for {answer_id}: {json.dumps(healed)}")
+            if report.get("rejected_answer_ids"):
+                lines.append("wrong answers: " + ", ".join(report["rejected_answer_ids"][:12]))
+            if report.get("no_answer_from_the_robot"):
+                lines.append("no answer from the robot: " + ", ".join(report["no_answer_from_the_robot"][:12]))
+            continue
+        open_ids = re.search(r'"unresolved_answer_ids":\s*(\[[^]]*\])', body)
+        if open_ids:
+            try:
+                still_open = json.loads(open_ids[1])
+            except ValueError:
+                continue
+            if still_open:
+                lines.append(f"{len(still_open)} questions still open: "
+                             + ", ".join(str(item) for item in still_open[:12]))
+    return {challenge_id: lines for challenge_id, lines in found.items() if lines}
+
+
 def questions(challenge_id: str) -> list[str]:
     folder = re.sub(r"[^A-Za-z0-9_-]", "_", challenge_id)[:64]
     try:
@@ -54,11 +96,14 @@ def main() -> None:
             print("   still running")
             continue
         print(f"   wall_seconds {summary.get('wall_seconds')}")
+        blocked = blockers(text)
         for entry in summary["challenges"]:
             if entry["outcome"] == "skipped" and not str(entry["challenge"]).startswith(OWN_LANES):
                 continue
             extra = entry.get("on_clock_ms") or entry.get("reason") or ""
             print(f"   {entry['outcome']:10} {entry['challenge']}  {entry.get('wall_seconds', '')} {extra}")
+            for line in blocked.get(str(entry["challenge"]), ()):
+                print(f"              {line}")
         if kind == "untimed":
             stuck = [entry["challenge"] for entry in summary["challenges"]
                      if str(entry["challenge"]).startswith(OWN_LANES)

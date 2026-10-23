@@ -270,6 +270,34 @@ def _section(question: Question, image):
     return matches[0] if len(matches) == 1 else None
 
 
+def _spellings(question: Question, analysis: Analysis, answer: str) -> tuple[str, ...]:
+    """Other spellings of a machine-field answer, for `learn` to offer if this one fails.
+
+    Which spelling the grader takes is its own choice, not the bytes': day 22 refused the
+    "x86" label and took the decimal code 332, and a machine-field question's format
+    accepts "label or its equivalent decimal or hexadecimal code". So the decimal code
+    goes on the clock and the label and the hex code wait here, used only after the
+    service has rejected the decimal one on an untimed attempt.
+    """
+    q = question.text.casefold()
+    if "architect" not in q or "machine field" not in q:
+        return ()  # Asked before the images are parsed: most questions are not about one.
+    try:
+        images = analysis.images
+    except ParseError:
+        return ()
+    if len(images) != 1:
+        return ()
+    machine = getattr(images[0], "machine", None)
+    if machine is None or answer != str(machine):
+        return ()
+    other = [images[0].arch, f"0x{machine:x}", f"0x{machine:04x}"]
+    return tuple(dict.fromkeys(
+        value for value in other
+        if value and value != answer and valid_answer(value, question.answer_format)
+    ))
+
+
 def _structured(question: Question, analysis: Analysis) -> str | None:
     q = question.text.casefold()
     if match := _PROPERTY.search(question.text):
@@ -516,7 +544,8 @@ class BinarySolver:
                     evidence = f"Parsed the requested static fact from validated assigned bytes: {question.artifact or 'artifact'}."
                     chain = ()
                 if answer is not None and valid_answer(answer, question.answer_format):
-                    result.append(AnswerCandidate(question.answer_id, answer, self.name, evidence, chain))
+                    result.append(AnswerCandidate(question.answer_id, answer, self.name, evidence, chain,
+                                                  _spellings(question, analysis, answer)))
             except (ParseError, struct.error, ValueError, IndexError, UnicodeError, zipfile.BadZipFile, RuntimeError):
                 continue  # Preserve unsupported/malformed/ambiguous questions.
         return result

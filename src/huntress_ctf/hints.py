@@ -71,6 +71,43 @@ def record_hint(
         return _save(hints, path, "solver hint")
 
 
+TURNED_DOWN_KEYS = ("turned_down", "turned_down_at")
+
+# Outcomes that prove another variant would be spent for nothing. A timed run counts only
+# when the service rejected a submission: its "unresolved" is also what a gate skip and a
+# reserve stop return, and neither spends anything.
+TURNED_DOWN = {False: {"incorrect", "unresolved", "conflict"}, True: {"incorrect"}}
+
+
+def record_outcome(
+    challenge_id: str, outcome: str, timed: bool = False, path: Path | None = None,
+) -> str | None:
+    """Remember a run that no further variant should be spent on until something changes.
+
+    A race submits once and has no second chance, so a route whose answers the service
+    has already turned down costs a ranked variant for nothing - day 23's Metadata Time
+    Trial raced three times on the same rejected answer, and the Android one three times
+    with no answer at all. "complete" clears the mark, so the first run after a fix lets
+    the route race again; `--rerace` ignores it meanwhile.
+    """
+    path = path or default_path()
+    if outcome != "complete" and outcome not in TURNED_DOWN[bool(timed)]:
+        return None
+    with _WRITING:
+        hints = load_hints(path)
+        entry = hints.get(challenge_id) if isinstance(hints.get(challenge_id), dict) else {}
+        if outcome == "complete":
+            if not entry.keys() & set(TURNED_DOWN_KEYS):
+                return None  # Nothing to clear; record_hint writes the hint itself.
+            for key in TURNED_DOWN_KEYS:
+                entry.pop(key, None)
+        else:
+            entry["turned_down"] = outcome + (" (timed)" if timed else "")
+            entry["turned_down_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        hints[challenge_id] = entry
+        return _save(hints, path, "run outcome")
+
+
 def record_race(challenge_id: str, on_clock_ms: float | None, path: Path | None = None) -> str | None:
     """After a completed timed race: count it and keep the best server-clock estimate."""
     path = path or default_path()

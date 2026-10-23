@@ -115,6 +115,33 @@ class JarManifestTests(unittest.TestCase):
         self.assertIsNone(m.PROPERTIES["jar.main_class"](b"not a zip"))
 
 
+class OrderingTests(unittest.TestCase):
+    """Day 23 rejected the stored central-directory names of a zip with directories."""
+
+    def candidates(self, names):
+        drop = zipped([(name, b"x") for name in names])
+        bundle = zipped([("evidence-drop-001.zip", drop)])
+        question = {"id": "names", "artifact": "evidence.zip -> evidence-drop-001.zip",
+                    "question": "Determine zip.central_directory_member_names for evidence-drop-001.zip.",
+                    "answer_format": {"kind": "json", "syntax": "compact valid JSON array with exact values and order"}}
+        context = SolveContext("metadata-forensics-day-23-x/time_trial", {"lane": "metadata-forensics"},
+                               {"answer_ids": ["names"], "questions": [question]}, bundle, Path("x"), ("names",))
+        return MetadataSolver().solve(context)
+
+    def test_names_in_directories_offer_sorted_and_basename_shapes(self):
+        [candidate] = self.candidates(["drop-33/doc-4.csv", "box-28/item-1.csv"])
+        self.assertEqual(candidate.answer, '["drop-33/doc-4.csv","box-28/item-1.csv"]')  # Still the reading.
+        self.assertEqual(candidate.alternatives, (
+            '["box-28/item-1.csv","drop-33/doc-4.csv"]',  # Sorted paths.
+            '["doc-4.csv","item-1.csv"]',                 # Basenames in order; sorted is the same.
+        ))
+
+    def test_flat_names_offer_only_the_sorted_shape(self):
+        [candidate] = self.candidates(["z.txt", "a.txt"])
+        self.assertEqual(candidate.answer, '["z.txt","a.txt"]')
+        self.assertEqual(candidate.alternatives, ('["a.txt","z.txt"]',))
+
+
 class PropertyTests(unittest.TestCase):
     def test_images_documents_and_text(self):
         jpeg = b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0" + b"\0" * 9 + \

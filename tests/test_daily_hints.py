@@ -11,7 +11,7 @@ from huntress_ctf import solvers
 from huntress_ctf.autopilot import COMPLETE, INCORRECT, UNRESOLVED
 from huntress_ctf.client import GameMasterError
 from huntress_ctf.daily import eligibility, families, run_daily, wait_for_release
-from huntress_ctf.hints import get_hint, record_hint
+from huntress_ctf.hints import get_hint, load_hints, record_hint, record_outcome
 from huntress_ctf.solvers import AnswerCandidate
 
 CHALLENGES = {"challenges": [
@@ -89,6 +89,39 @@ class DailyTests(unittest.TestCase):
         self.assertIsNotNone(eligibility(new_day, True, {}))
         other_lane = {"id": "binary-day-20-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery"}
         self.assertIsNotNone(eligibility(other_lane, True, {"binary-day-20-x": {}}))
+
+    def test_a_route_the_service_turned_down_untimed_is_not_raced(self):
+        # Day 23: the Metadata Time Trial was rejected untimed and raced twice anyway,
+        # spending a ranked variant each time on the same answer.
+        hints = self.root / "hints.json"
+        route = {"id": "metadata-day-23-x/time_trial", "lane": "metadata-forensics",
+                 "mode": "time_trial", "run_for_time_supported": True}
+        record_hint("metadata-day-23-x/time_trial", [AnswerCandidate("a", "x", "s", "e")], hints)
+        self.assertIsNone(eligibility(route, True, load_hints(hints)))
+        self.assertIsNone(record_outcome("metadata-day-23-x/time_trial", "incorrect", path=hints))
+        reason = eligibility(route, True, load_hints(hints))
+        self.assertIn("a race would spend a ranked variant on it again", reason)
+        self.assertIn("incorrect", reason)
+        self.assertIsNone(eligibility(route, True, load_hints(hints), rerace=True))  # --rerace still races.
+        # A solver that scores on the route after the mark clears it by itself (`learn`
+        # healing a spelling records the hint without ending the run "complete").
+        healed = load_hints(hints)
+        healed[route["id"]]["recorded_at"] = "2099-01-01T00:00:00+00:00"
+        self.assertIsNone(eligibility(route, True, healed))
+        # So does the first run that completes the route.
+        record_outcome("metadata-day-23-x/time_trial", "complete", path=hints)
+        self.assertIsNone(eligibility(route, True, load_hints(hints)))
+        # A mark on a route with no proven solver does not make it look proven.
+        record_outcome("binary-day-23-y", "unresolved", path=hints)
+        self.assertEqual(eligibility({"id": "binary-day-23-y", "run_for_time_supported": True},
+                                     True, load_hints(hints), rerace=True),
+                         "no proven solver yet; solve it untimed first")
+        # A timed run marks only a rejected submission: its "unresolved" is also what a
+        # gate skip and a reserve stop return, and neither of those spends a variant.
+        self.assertIsNone(record_outcome("warmups-day-23/mastery", "unresolved", timed=True, path=hints))
+        self.assertIsNone(load_hints(hints).get("warmups-day-23/mastery"))
+        record_outcome("warmups-day-23/mastery", "incorrect", timed=True, path=hints)
+        self.assertEqual(load_hints(hints)["warmups-day-23/mastery"]["turned_down"], "incorrect (timed)")
 
     def test_eligibility_reasons(self):
         self.assertEqual(eligibility({"id": "x", "run_for_time_supported": True}, True, {}),
@@ -169,9 +202,43 @@ class ReleaseDayTests(unittest.TestCase):
         self.assertEqual(summary["warmups-day-21/time_trial"]["outcome"], "complete")
         self.assertEqual(summary["binary-day-21-x"]["outcome"], "unresolved")
         for blocked in ("binary-day-21-x/time_trial", "binary-day-21-x/mastery"):
-            self.assertEqual(summary[blocked]["reason"], "its Single Solve is not solved yet")
+            self.assertEqual(summary[blocked]["reason"], "binary-day-21-x is not solved yet")
         self.assertIn("live targets[]", summary["web-exploitation-day-21-y"]["reason"])
         self.assertEqual(code, UNRESOLVED)
+
+    def test_a_time_trial_that_does_not_score_blocks_its_mastery(self):
+        # Day 23: the Single Solves were solved, three Time Trials were not, and asking
+        # for their Masteries anyway returned HTTP 409 reported as "error" - ten sweeps.
+        def fake(target, challenge_id, **kwargs):
+            asked.append(challenge_id)
+            return UNRESOLVED if challenge_id.endswith("/time_trial") else COMPLETE
+        for workers in (4, 1):  # Families in parallel, then the sequential (timed) path.
+            asked: list[str] = []
+            with patch("huntress_ctf.daily.run_fast", side_effect=fake):
+                _, output = self.run_daily(DayClient(), day=21, workers=workers)
+            summary = {entry["challenge"]: entry for entry in
+                       json.loads(output.split("===== Summary =====")[1])["challenges"]}
+            self.assertEqual(summary["binary-day-21-x/mastery"]["outcome"], "skipped")
+            self.assertEqual(summary["binary-day-21-x/mastery"]["reason"],
+                             "binary-day-21-x/time_trial is not solved yet")
+            self.assertNotIn("binary-day-21-x/mastery", asked)
+
+    def test_a_turned_down_route_also_blocks_the_modes_after_it(self):
+        # Gating the Time Trial alone moved the waste one step: day 23 skipped the two
+        # Time Trials and raced their Masteries, which ask the same question kinds.
+        record_hint("binary-day-21-x", [AnswerCandidate("a", "x", "s", "e")], self.hints)
+        record_hint("binary-day-21-x/time_trial", [AnswerCandidate("a", "x", "s", "e")], self.hints)
+        record_hint("binary-day-21-x/mastery", [AnswerCandidate("a", "x", "s", "e")], self.hints)
+        record_outcome("binary-day-21-x/time_trial", "incorrect", path=self.hints)
+        asked: list[str] = []
+        with patch("huntress_ctf.daily.run_fast", side_effect=lambda t, i, **k: asked.append(i) or COMPLETE):
+            _, output = self.run_daily(DayClient(), day=21, timed=True)
+        summary = {entry["challenge"]: entry for entry in
+                   json.loads(output.split("===== Summary =====")[1])["challenges"]}
+        self.assertIn("turned down as incorrect", summary["binary-day-21-x/time_trial"]["reason"])
+        self.assertEqual(summary["binary-day-21-x/mastery"]["reason"],
+                         "binary-day-21-x/time_trial is not solved yet")
+        self.assertNotIn("binary-day-21-x/mastery", asked)
 
     def test_web_routes_start_only_when_asked_for(self):
         web = DAY["challenges"][-1]

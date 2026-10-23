@@ -266,6 +266,18 @@ class BinarySolverTests(unittest.TestCase):
         # A plain architecture question (no "machine field") still returns the readable label.
         self.assertEqual(solve(pe_fixture(32), "What is the architecture?"), {"0": "x86"})
 
+    def test_a_machine_field_offers_its_other_spellings_for_an_untimed_retry(self):
+        # Day 23 rejected the whole group of fifteen decimal machine answers. The decimal
+        # code still goes on the clock; the label and the hex code are what `learn` tries
+        # afterwards, on the open untimed attempt, instead of losing the day to a spelling.
+        machine = "Report the processor architecture identified by its executable-header machine field."
+        candidates = BinarySolver().solve(context(elf_fixture(64), (machine,)))
+        self.assertEqual([(c.answer, c.alternatives) for c in candidates],
+                         [("62", ("x86_64", "0x3e", "0x003e"))])
+        # Questions that are not about one image's machine field offer nothing extra.
+        for text in ("What is the architecture?", "Determine zip.eocd_total_entries for sample."):
+            self.assertTrue(all(not c.alternatives for c in BinarySolver().solve(context(elf_fixture(64), (text,)))))
+
     def test_ambiguous_pe_entry_point_and_function_types_are_skipped(self):
         self.assertEqual(solve(pe_fixture(), "What is the entry point?"), {})
         self.assertEqual(solve(elf_fixture(), "List imported function names."), {})

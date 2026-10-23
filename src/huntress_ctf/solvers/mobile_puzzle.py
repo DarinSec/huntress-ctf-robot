@@ -5,7 +5,9 @@ the backend answer code is the data decoded by the codec ("reverse" on day 21:
 "FEDCBA9876543210-SNA" -> "ANS-0123456789ABCDEF", CORRECT live). Mastery bundles earlier
 days' codecs: "split" puts parts[i] at position order[i], "reflection" carries the code
 as is, "dynamic" names a payload DEX that holds it. Unknown codecs get the value as is,
-reversed, and one strict layer from decoders.py.
+reversed, and one strict layer from decoders.py. An asset with no payload at all (day
+23's {"schema": "...v2", "codec": "analysis"}) falls back to the codes the app ships as
+text in any member.
 Only a value that is exactly an answer code ("ANS-" + 16 uppercase hex) is returned.
 """
 
@@ -24,6 +26,7 @@ from .base import AnswerCandidate, SolveContext, fits_format, question_items
 
 ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
 _IN_TEXT = re.compile(rb"ANS-[0-9A-F]{16}")
+MAX_MEMBER_BYTES = 8 * 1024 * 1024  # A code is a string; whole libraries are not read.
 
 
 def _split(puzzle: dict) -> set[str]:
@@ -93,18 +96,39 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
     return {value.strip() for value in found}
 
 
+def _in_app(apk: zipfile.ZipFile) -> set[str]:
+    """Every answer code the app ships as text, for an asset that carries no payload.
+
+    Day 23's asset declares {"schema": "...v2", "codec": "analysis"} and no data, so the
+    code is not in it. Where the app still holds one (a DEX string, a resource, another
+    asset), reading it is deterministic; where the code has to be computed, nothing
+    matches and the question stays unanswered rather than guessed. NUL bytes are dropped
+    so a UTF-16LE string reads as text too.
+    """
+    found: set[str] = set()
+    for item in apk.infolist():
+        if item.is_dir() or item.file_size > MAX_MEMBER_BYTES:
+            continue
+        data = apk.read(item)
+        found.update(match.decode() for match in _IN_TEXT.findall(data))
+        if b"\0" in data:
+            found.update(match.decode() for match in _IN_TEXT.findall(data.replace(b"\0", b"")))
+    return found
+
+
 def answer_code(apk_bytes: bytes) -> str | None:
     """The one answer code the APK's puzzle asset decodes to, or None."""
     try:
         with zipfile.ZipFile(BytesIO(apk_bytes)) as apk:
             names = [name for name in apk.namelist() if name.endswith("huntress_puzzle.json")]
-            if len(names) != 1:
-                return None
-            puzzle = json.loads(apk.read(names[0]))
-            if not isinstance(puzzle, dict) or not isinstance(puzzle.get("data"), str):
-                return None
-            codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
-                     if ANSWER.fullmatch(value)}
+            codes: set[str] = set()
+            if len(names) == 1:
+                puzzle = json.loads(apk.read(names[0]))
+                if isinstance(puzzle, dict) and isinstance(puzzle.get("data"), str):
+                    codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
+                             if ANSWER.fullmatch(value)}
+            if not codes and names:
+                codes = _in_app(apk)
     except (zipfile.BadZipFile, ValueError, KeyError, UnicodeDecodeError):
         return None
     return codes.pop() if len(codes) == 1 else None

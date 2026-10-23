@@ -21,7 +21,7 @@ from .autopilot import COMPLETE, CONFLICT, EXPIRED, INCORRECT, PENDING, UNRESOLV
 from .client import GameMasterClient, GameMasterError
 from .display import print_result
 from .fastpath import TARGET_LANES, lane_of, run_fast
-from .hints import load_hints, record_race
+from .hints import TURNED_DOWN_KEYS, load_hints, record_outcome, record_race
 from .learn import run_learn
 from .state import AttemptState, mode_name
 
@@ -39,6 +39,10 @@ OUTCOMES = {
     EXPIRED: "expired", CONFLICT: "conflict", PENDING: "pending",
 }
 _MODE_ORDER = {"time_trial": 1, "mastery": 2}
+
+# A skip that means "this route is blocked", not "there is nothing to do here": the
+# later modes of the family ask the same question kinds it was turned down for.
+TURNED_DOWN_REASON = "turned down as "
 
 
 def _records(response: Any) -> list[dict[str, Any]]:
@@ -91,7 +95,19 @@ def eligibility(
         if raced.get("raced_at") and not rerace:
             best = raced.get("best_on_clock_ms")
             return f"already raced (best {best} ms on the clock); --rerace spends another variant"
-        if challenge_id in hints:
+        rejected = raced.get("turned_down")
+        # A solver that scored on the route after the mark (record_hint's `recorded_at`)
+        # clears it by itself; ISO timestamps compare in order.
+        if str(raced.get("recorded_at") or "") > str(raced.get("turned_down_at") or ""):
+            rejected = None
+        if rejected and not rerace:
+            # One submission per race: a route the service has already turned down would
+            # spend a ranked variant on the same answer (day 23 Metadata did it three times).
+            return (f"{TURNED_DOWN_REASON}{rejected} ({raced.get('turned_down_at')}); a race"
+                    " would spend a ranked variant on it again. --rerace races anyway")
+        # An entry that holds only that mark is no proof that a solver ever scored.
+        marks_only = bool(raced.keys()) and raced.keys() <= set(TURNED_DOWN_KEYS)
+        if challenge_id in hints and not marks_only:
             return None
         # A new day: its Single Solve scored with a lane solver that handles every
         # variant of the course, so its Time Trial and Mastery may race straight away.
@@ -235,7 +251,10 @@ def run_daily(
         challenge_id = _id(record)
         reason = eligibility(record, timed, hints, lane=lane, requested_lanes=lanes, rerace=rerace)
         if reason is not None:
-            return {"challenge": challenge_id, "outcome": "skipped", "reason": reason}
+            entry = {"challenge": challenge_id, "outcome": "skipped", "reason": reason}
+            if reason.startswith(TURNED_DOWN_REASON):
+                entry["blocks_family"] = True
+            return entry
         began = clock()
         on_clock: list[float] = []
         try:
@@ -265,6 +284,10 @@ def run_daily(
                 print(f"\n===== {challenge_id} (incorrect: resending kind by kind) =====")
                 code = run_learn(target, challenge_id, hints_path=hints_path, challenge=record, open_only=True)
             entry = {"challenge": challenge_id, "outcome": OUTCOMES.get(code, str(code))}
+            # So tonight's and tomorrow's races skip what the service turned down.
+            note = record_outcome(challenge_id, entry["outcome"], timed, hints_path)
+            if note:
+                print(note)
         except GameMasterError as exc:
             entry = {"challenge": challenge_id, "outcome": "error", "reason": str(exc)}
         if on_clock:
@@ -274,7 +297,10 @@ def run_daily(
         return entry
 
     if timed or workers <= 1 or not hasattr(client, "clone"):
-        summary = [run_one(client, record) for record in records]
+        entries: dict[int, dict[str, Any]] = {}
+        for group in families(records):
+            _run_group(client, group, run_one, entries)
+        summary = [entries[id(record)] for record in records]
     else:
         summary = _run_families(client, records, run_one, workers)
     print("\n===== Summary =====")
@@ -284,6 +310,32 @@ def run_daily(
     })
     ran = [entry for entry in summary if entry["outcome"] != "skipped"]
     return COMPLETE if all(entry["outcome"] == "complete" for entry in ran) else UNRESOLVED
+
+
+def _run_group(
+    target: GameMasterClient, group: list[dict[str, Any]],
+    run_one: Callable[[GameMasterClient, dict[str, Any]], dict[str, Any]],
+    entries: dict[int, dict[str, Any]],
+) -> None:
+    """One family in mode order; a route that does not score blocks the modes after it.
+
+    The service answers a later mode HTTP 409 until the one before it scores (day 23: an
+    unresolved Time Trial locked three Masteries), so asking anyway reports an "error"
+    that is really a lock, and `day.sh` spends a retry on it.
+    """
+    blocked = None
+    for record in group:
+        if blocked:
+            entries[id(record)] = {"challenge": _id(record), "outcome": "skipped", "reason": blocked}
+            continue
+        try:
+            entry = run_one(target, record)
+        except Exception as exc:  # One family's crash must not stop the others.
+            traceback.print_exc(file=sys.stdout)
+            entry = {"challenge": _id(record), "outcome": "error", "reason": repr(exc)}
+        entries[id(record)] = entry
+        if entry["outcome"] not in ("complete", "skipped") or entry.get("blocks_family"):
+            blocked = f"{_id(record)} is not solved yet"
 
 
 def _run_families(
@@ -298,21 +350,7 @@ def _run_families(
         output.begin()
         target = client.clone()
         try:
-            blocked = None
-            for record in group:
-                if blocked:
-                    entries[id(record)] = {"challenge": _id(record), "outcome": "skipped", "reason": blocked}
-                    continue
-                try:
-                    entry = run_one(target, record)
-                except Exception as exc:  # One family's crash must not stop the others.
-                    traceback.print_exc(file=sys.stdout)
-                    entry = {"challenge": _id(record), "outcome": "error", "reason": repr(exc)}
-                entries[id(record)] = entry
-                single = "/" not in str(_id(record))
-                if single and entry["outcome"] not in ("complete", "skipped"):
-                    # Its Time Trial and Mastery answer HTTP 409 until it scores.
-                    blocked = "its Single Solve is not solved yet"
+            _run_group(target, group, run_one, entries)
         finally:
             target.close()
             output.end()

@@ -11,6 +11,9 @@
 #   scripts/homebase.sh sweep        run ~/day.sh now instead of waiting for cron
 #   scripts/homebase.sh log          the latest day and Hall of Fame summaries
 #   scripts/homebase.sh pull <id>    copy work/<id>/ to artifacts/work/ (git-ignored), show triage.md
+#   scripts/homebase.sh gaps <id> [regex]  offline, on the VM: what the robot answers for that
+#                                    saved route, kind by kind, and the kinds it cannot answer;
+#                                    a regex prints those kinds' values (a wrong convention)
 #   scripts/homebase.sh times [day]  minutes after the release at which each route was solved
 #   scripts/homebase.sh report [day] the release at a glance: outcomes, then the questions and
 #                                    field suggestions of each unresolved Warmups/Metadata route
@@ -78,6 +81,13 @@ case "${1:-}" in
     remote "cd ~/work && tar -cf - '$folder'" | tar -xf - -C "$root/artifacts/work"
     echo "Copied to artifacts/work/$folder (untrusted data: never execute it)."
     sed -n '1,80p' "$root/artifacts/work/$folder/triage.md"
+    ;;
+  gaps)
+    id="${2:?usage: homebase.sh gaps <challenge-id> [regex]}"
+    folder="${id//[^A-Za-z0-9_-]/_}"
+    show=""
+    [ -n "${3:-}" ] && show="--show '$3'"
+    remote "python3 -I - ~/work/'$folder' --src ~/src $show" < "$root/scripts/answer_gaps.py"
     ;;
   times)
     remote "python3 -I - ${2:-1}" < "$root/scripts/solvetimes.py"

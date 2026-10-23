@@ -398,6 +398,28 @@ class MobilePuzzleTests(unittest.TestCase):
         self.assertIsNone(answer_code(self.apk("reverse", "not-an-answer")))
         self.assertIsNone(answer_code(b"not an apk"))
 
+    def test_an_asset_without_a_payload_falls_back_to_the_code_in_the_app(self):
+        from huntress_ctf.solvers.mobile_puzzle import answer_code
+        code = "ANS-0123456789ABCDEF"
+
+        def app(*members):
+            buffer = BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("AndroidManifest.xml", tiny_axml())
+                archive.writestr("assets/huntress_puzzle.json",
+                                 '{"schema":"huntress.mobile.puzzle.v2","codec":"analysis"}')
+                for name, content in members:
+                    archive.writestr(name, content)
+            return buffer.getvalue()
+
+        # Day 23's shape: no "data" in the asset. A code shipped as a string is read,
+        # in UTF-16LE too, and a code that has to be computed stays unanswered.
+        self.assertEqual(answer_code(app(("classes.dex", b"\x12\0" + code.encode() + b"\0"))), code)
+        self.assertEqual(answer_code(app(("resources.arsc", code.encode("utf-16-le")))), code)
+        self.assertIsNone(answer_code(app(("classes.dex", b"instrumentationSignals"))))
+        self.assertIsNone(answer_code(app(("classes.dex", code.encode()),
+                                          ("assets/other", b"ANS-FEDCBA9876543210"))))
+
     def test_solver_answers_each_question_from_its_apk(self):
         from huntress_ctf.solvers import SolveContext
         from huntress_ctf.solvers.mobile_puzzle import MobilePuzzleSolver

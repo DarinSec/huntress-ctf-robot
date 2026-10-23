@@ -16,15 +16,23 @@ on the same challenge collide. Build and test on your own machine; Darin deploys
 
 ## Who owns what
 
-| Lane | Owner | Status (day 21) |
+Day 23 took 6 of 18 flags. Not one route failed because the robot had no answer: it
+answered 276 of 276 Binary questions and 28 of 28 Metadata ones. One wrong answer per
+lane rejected the whole request, and a Mastery stays locked (HTTP 409) until its Time
+Trial scores, so each one cost two or three flags. The open ones are in the table below;
+`scripts/homebase.sh report` now names the rejected kind and the exact answers under each
+route, and `scripts/homebase.sh gaps <id>` (or `python -I scripts/answer_gaps.py
+work/<id> --show "<regex>"`) shows offline what the robot answers and what it cannot.
+
+| Lane | Owner | Status (day 23) |
 | --- | --- | --- |
 | Robot, deploys, Homebase | Darin | Runs daily from 15:00, sweeps again within a minute of a deploy |
-| Warmups | Darin | Automatic: 3/3 flags 12 s after the release |
-| Metadata Forensics | Darin | Automatic; most new property types too (`solvers/autoprop.py`) |
-| Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`) |
-| Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min |
-| Binary | David | Automatic (`solvers/binary.py`); new types still need code: day 22's primary DLL and machine field |
-| Web Exploitation | Parsa | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP and keep-alive reuse |
+| Warmups | Darin | Automatic: 3/3 flags, 414 and 397 ms on the clock on day 23 |
+| Metadata Forensics | Darin | Automatic; new property types too (`solvers/autoprop.py`). **Open:** day 23 `zip.central_directory_member_names` |
+| Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`). **Open:** day 23's asset has no payload; the code is computed in the DEX |
+| Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min. **Open:** day 23 `carrier`, `obfuscation`, and 7 kinds with no answer |
+| Binary | David | Automatic (`solvers/binary.py`). **Open:** day 23's `d*_analysis_machine` group - the split names which of the 15 is wrong, and `_spellings` may already have healed it |
+| Web Exploitation | Parsa | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP and keep-alive reuse. Day 23 never ran: the lane was in `main` at 11:57 but the Homebase still had the day before's code |
 
 ## Set up (Windows, macOS or Linux)
 

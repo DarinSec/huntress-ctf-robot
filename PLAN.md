@@ -147,6 +147,86 @@ Lagets sista flagga per dag, i minuter efter släppet (`scripts/homebase.sh time
 - **Hall of Fame:** `hof.sh` racear om alla bevisade Warmups- och Metadata-rutter varannan
   timme 00:30–10:30 UTC, med `--reserve 8` och `--gate-ms 250` (median 208 ms uppmätt).
 
+## Läget 23 okt: roboten är bra på allt som redan funnits — förebygg det nya
+
+Roboten tog **6 flaggor av 18** fram till 15:17 och stod sedan still. Resten av dagens
+flaggor kom in senare på kvällen på annat sätt: svepet 19:20 UTC visar varje dag 23-rutt
+som `already solved`, även Web. Dagen är alltså hel — men roboten gjorde inte jobbet, och
+det är precis det vi ska förebygga. Inte en enda rutt föll på att roboten saknade
+täckning: den svarade på 276 av 276 Binary-frågor och 28 av 28 Metadata-frågor. Fem andra
+saker stoppade den:
+
+| Rutt | Vad som stoppade | Kostade |
+| --- | --- | --- |
+| Metadata TT + Mastery | 27 av 28 frågetyper godkända; `zip.central_directory_member_names` avvisad | 2 flaggor |
+| Binary S + TT + Mastery | alla 276 svar fanns; gruppen `d*_analysis_machine` (15 decimalkoder) avvisad | 3 flaggor |
+| Android TT + Mastery | ny v2-asset utan payload (`codec: "analysis"`): koden räknas fram i appen | 2 flaggor |
+| Script TT + Mastery | 12 typer godkända, `carrier` och `obfuscation` avvisade, 7 typer utan svar | 2 flaggor |
+| Web alla tre | lanen fanns i `main` 11:57 men Homebase körde koden från 22 okt | 3 flaggor |
+
+### Fem sätt att fastna, och vad som hindrar dem
+
+1. **Ett fel svar i en grupp dödar hela gruppen.** En förfrågan är allt-eller-inget, så
+   ett fel svar bland 15 lämnade även de 14 rätta oaccepterade — och vi såg bara "15 är
+   fel". **Klart:** en avvisad frågetyp delas nu i halvor till de avvisade svaren är
+   utpekade (`rejected_answer_ids`); de rätta blir godkända på vägen. Ett fel svar bland
+   15 kostar nu ett svar, inte femton, och rapporten pekar på den enda fråga som ska lagas.
+2. **Stavningen är graderarens val, inte bytenas.** Dag 20 ville servern ha hex i stället
+   för namn, dag 22 decimal i stället för "x86", dag 23 avvisade decimal. **Klart:** en
+   lösare får ange `alternatives` (andra stavningar samma bevis tillåter). De skickas
+   aldrig på klockan — men när servern avvisat ett svar otidsat provar roboten dem själv,
+   en förfrågan per stavning, och rapporten skriver vilken som togs. Maskinfältet i
+   `solvers/binary.py` är första producenten (decimal på klockan, därefter etikett och hex).
+3. **Ett lås såg ut som ett fel.** Mastery svarar 409 så länge Time Trial inte är löst.
+   Roboten frågade ändå, fick "error" och `day.sh` gjorde om hela svepet tio gånger
+   (12:59–13:17) innan den gav upp — och brände hela retry-budgeten som finns för riktiga
+   fel. **Klart:** en rutt som inte går i mål blockerar nu lägena efter sig i familjen,
+   både i det parallella och i det tidsatta (sekventiella) spåret.
+4. **Rankade varianter brändes på svar vi visste var fel.** Ett lopp lämnar in en gång,
+   men ingenting kom ihåg att servern just avvisat rutten: dag 23:s Metadata TT racades
+   tre gånger på samma avvisade konvention (13:17, 19:20, 19:23 UTC — 524 och 510 ms på
+   klockan, `incorrect`) och Android TT tre gånger utan svar alls. **Klart:** hints.json
+   bär `turned_down`/`turned_down_at` och grinden hoppar över rutten; ett senare
+   `recorded_at` (en lösare som gick i mål) eller en körning som slutar `complete` släpper
+   märket, och `--rerace` kör ändå. Första versionen flyttade bara slöseriet ett steg —
+   svepet 19:32 hoppade över båda TT men racade deras Mastery (1 249 ms, `incorrect`) —
+   så en sådan skip blockerar nu lägena efter sig, precis som 409-kedjan.
+5. **Ingen såg vad som var fel.** Svaret låg i en logg på 2,4 MB. **Klart:**
+   `scripts/answer_gaps.py` (offline, gratis: vad roboten svarar för en sparad rutt, typ
+   för typ, vilka typer den inte kan svara på, och `--show` skriver värdena) plus
+   `scripts/homebase.sh gaps <id>`; `homebase.sh report` skriver nu avvisad typ, utpekade
+   fel svar och typer utan svar under varje rutt.
+
+### Kvar att göra, med ägare
+
+- **Metadata (Darin):** undersökt 23 okt. Zippen är helt ordinär (15 poster,
+  central-directory-ordning == lokal headerordning == `zipfile`:s vy, inga katalogposter)
+  och vårt svar är en trogen kompakt läsning. Det enda som skiljer från tidigare dagar är
+  att posterna ligger i kataloger — vilken form graderaren vill ha står inte i bytena, så
+  `_orderings` i `solvers/metadata.py` erbjuder sorterade sökvägar, basnamn och sorterade
+  basnamn som `alternatives`. Nästa otidsatta svep avgör saken i tre förfrågningar.
+  1 fråga, 2 flaggor.
+- **Binary (David):** kör svepet igen och läs vilket av de 15 maskinsvaren som pekas ut;
+  `_spellings` kan redan ha lagat det själv. 1 fråga, 3 flaggor.
+- **Android (Darin):** ta fram regeln ur `classes.dex` (subagenten `ctf-android`) och
+  lägg den som en codec i `mobile_puzzle.py`. 1 fråga, 2 flaggor.
+- **Script (Ilse):** 9 typer, störst kvarvarande arbete. `answer_gaps.py --show` på den
+  sparade rutten ger både de avvisade värdena och de sju typerna utan svar.
+- **Drift (Darin):** VM:n var nere 06:25–12:56 och 14:36–18:26 UTC den 23:e. Roboten
+  spelar bara när den är uppe, och en pushad fix spelar bara när någon driftsätter: dag
+  23:s Web-lane låg i `main` fem timmar utan att köras. Nästa steg är att `day.sh` själv
+  hämtar `main`, kör testerna och byter `~/src` (samma grind som `deploy` redan har), så
+  att en pushad lösare spelar inom en minut utan en människa vid tangentbordet.
+
+### Om en releaseagent (Ilses förslag)
+
+Rätt instinkt, och den hör hemma efter punkt 1–4: en agent som läser rapporten tre
+minuter efter släppet behöver att rapporten redan pekar på den enda frågan som är fel —
+annars läser den 2,4 MB logg. Med `answer_gaps.py` och delningen på plats är indatan
+liten och entydig, och agenten kan hålla sig till att skriva en regel per utpekad fråga
+på en egen gren, utan att starta, lämna in eller driftsätta något. Gör den läs-only mot
+Game Master (`status`, `artifact`) och låt replay-grinden (`verify_fields.py`) avgöra.
+
 ## Grenen `work-in-progress` (Codex, 21 okt): inte inslagen
 
 Provad 21 okt 14:10 på dag 20:s riktiga uppgifter (kopia på Homebase, ingen inlämning):

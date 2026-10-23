@@ -38,6 +38,11 @@ class AnswerCandidate:
     solver: str
     evidence: str
     chain: tuple[str, ...] = ()
+    # Other spellings of the same evidence, best first, where the accepted one is the
+    # grader's choice rather than the bytes' (a machine field as a label, a decimal or a
+    # hex code). `answer` is the only one a race ever sends; `learn` offers these, one
+    # request each, to an answer the service has just rejected.
+    alternatives: tuple[str, ...] = ()
 
 
 class Solver(Protocol):
