@@ -129,6 +129,13 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   252/252 (day 21) offline in ~1.9 s and ~210 MB, agreeing in substance with Ilse's
   independent solver (the rest are spellings the formats allow: ELF/ELF64, x86_64/x86-64).
   In the robot from day 22. The lane lists only through the whole day (`lane=` is HTTP 400).
+  A day's block is 12 questions: ~9 standard (sha256, format, machine, HCFG config fields)
+  plus 1-3 new kinds. Config fields resolve by "top-level X property", "decoded HCFG JSON
+  a.b" or the answer ID (`..._config_campaign`): day 19 replays 221/228 (was 147), every new
+  one equal to the accepted answer. A storage worded in a way no rule knows is searched
+  across every carrier (also zlib/gzip/xz/bz2, single-byte XOR, reversed, UTF-16, nested
+  ZIP) on untimed runs only, accepting one CRC/JSON-valid record; timed races keep to the
+  named storage rules, and offsets/storage labels are never claimed for a discovered record.
 - **Web Exploitation** (owner Parsa, live targets): manual.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a

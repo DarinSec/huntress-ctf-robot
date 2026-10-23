@@ -1,6 +1,7 @@
 """Generated public-schema carriers. No event artifacts or accepted answers."""
 import hashlib
 import json
+from dataclasses import replace
 import struct
 import unittest
 
@@ -57,8 +58,10 @@ FIELD = "Submit the exact string value of the decoded HCFG JSON object's top-lev
 
 
 class BinaryPayloadTests(unittest.TestCase):
-    def solve(self, data, prompts):
+    def solve(self, data, prompts, timed=False):
         ctx = archive_context({"unit--sample.bin": data}, [("unit_analysis_" + k, PREFIX + text) for k, text in prompts])
+        if timed:
+            ctx = replace(ctx, attempt={**ctx.attempt, "run_for_time": True, "deadline": "2026-10-24T13:01:00Z"})
         return {c.answer_id.removeprefix("unit_analysis_"): c.answer for c in BinarySolver().solve(ctx)}
 
     def test_coff_long_section_names_resolve_bounded_string_table(self):
@@ -152,7 +155,9 @@ class BinaryPayloadTests(unittest.TestCase):
 
     def test_overlay_schema_must_be_unique_in_public_family(self):
         blob = pe_fixture() + resource_overlay(config_record())
-        self.assertEqual(self.solve(blob, [("domain", FIELD)]), {})
+        # A timed race keeps to the public schema; untimed, the one CRC-valid record is found anyway.
+        self.assertEqual(self.solve(blob, [("domain", FIELD)], timed=True), {})
+        self.assertEqual(self.solve(blob, [("domain", FIELD)]), {"domain": "example.invalid"})
         self.assertEqual(self.solve(blob, [("domain", "Find the final PK19 overlay. " + FIELD),
                                            ("other", "Find the final RS20 overlay. " + FIELD)]), {})
 

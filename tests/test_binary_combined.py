@@ -223,9 +223,12 @@ class CombinedSelectionTests(unittest.TestCase):
 
 
 class ExtraHcfgTests(unittest.TestCase):
-    def candidates(self, encoded, directive):
+    def candidates(self, encoded, directive, timed=False):
         prompt = "Use all unit-- members. " + directive + " Submit the exact string value of the decoded HCFG JSON object's top-level campaign property."
-        return BinarySolver().solve(archive_context({"unit--file.exe": pe_fixture() + b"\0" + encoded + b"\0"}, [("u_analysis_campaign", prompt)]))
+        ctx = archive_context({"unit--file.exe": pe_fixture() + b"\0" + encoded + b"\0"}, [("u_analysis_campaign", prompt)])
+        if timed:
+            ctx = replace(ctx, attempt={**ctx.attempt, "run_for_time": True, "deadline": "2026-10-24T13:01:00Z"})
+        return BinarySolver().solve(ctx)
 
     def test_question_directed_base64url_and_hex(self):
         record = config_record({"campaign": "  exact fixture  "})
@@ -245,7 +248,11 @@ class ExtraHcfgTests(unittest.TestCase):
             self.assertEqual(self.candidates(record.hex().encode(), "Hex-decode the unique hex-encoded HCFG carrier."), [])
 
     def test_no_implicit_encoded_scan_without_public_rule(self):
-        self.assertEqual(self.candidates(config_record().hex().encode(), "Read the HCFG."), [])
+        # Timed races keep to the public storage rules; untimed runs search every carrier for
+        # one CRC-valid record (a new day's wording), where a wrong guess costs one resent kind.
+        self.assertEqual(self.candidates(config_record().hex().encode(), "Read the HCFG.", timed=True), [])
+        self.assertEqual([c.answer for c in self.candidates(config_record().hex().encode(), "Read the HCFG.")],
+                         ["synthetic-campaign"])
 
     def test_literal_precedes_explicit_encoded_fallback(self):
         literal = config_record({'campaign': 'literal'})

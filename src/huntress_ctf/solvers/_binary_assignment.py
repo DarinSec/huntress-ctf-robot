@@ -8,15 +8,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import binascii
+import bz2
+from io import BytesIO
 import hashlib
 import json
+import lzma
 from pathlib import PurePosixPath
 import re
 import struct
 import zipfile
 import zlib
 
-from ..state import deliveries
+from ..state import GameMasterError, current_fields, deliveries
 from ._binary_formats import ELF, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
 from ._binary_files import BinaryFiles, MAX_BINARY_MEMBER_BYTES
@@ -60,6 +63,46 @@ def config_at(data: bytes, offset: int) -> Config | None:
     return Config(offset, version, key, crc, values) if isinstance(values, dict) else None
 
 
+def _leaves(values: dict, prefix: str = "") -> dict[str, object]:
+    out = {}
+    for key, value in values.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(_leaves(value, path + "."))
+        else:
+            out[path] = value
+    return out
+
+
+_FIELD_ID = re.compile(r"_config_([a-z0-9]+(?:_[a-z0-9]+)*)$")
+_NOT_FIELDS = {"crc32_hex", "crc32", "xor_key_hex", "version", "offset", "storage"}
+
+
+def _config_field(question: Question, values: dict | None):
+    """The config value a question asks for, however it is worded.
+
+    "top-level campaign property" (days 20-23), "decoded HCFG JSON config.campaign" (day 19),
+    or failing both the answer ID ("..._config_campaign"), which only counts when exactly one
+    key of that name exists in the CRC-validated record. With values=None: whether it asks one.
+    """
+    q = question.text
+    top = re.search(r"top-level ([a-z_]+) property", q)
+    path = re.search(r"decoded HCFG JSON (?!(?:object|record|payload)\b)((?:[A-Za-z0-9_]+\.)*[A-Za-z0-9_]+)", q)
+    name = _FIELD_ID.search(question.answer_id)
+    wanted = name[1] if name and name[1] not in _NOT_FIELDS and "HCFG" in q else None
+    if values is None:
+        return True if (top or path or wanted) else None
+    if top:
+        return values.get(top[1])
+    leaves = _leaves(values)
+    if path and path[1] in leaves:
+        return leaves[path[1]]
+    if wanted:
+        hits = [value for key, value in leaves.items() if key.rsplit(".", 1)[-1] == wanted]
+        return hits[0] if len(hits) == 1 else None
+    return None
+
+
 class AssignedArchive:
     def __init__(self, context: SolveContext, files: Files):
         self.context = context
@@ -87,6 +130,11 @@ class AssignedArchive:
         self.ordered_members = {}
         self.issued = deliveries(context.attempt)
         self.direct_references = set()
+        try:
+            fields = current_fields(context.attempt)
+        except GameMasterError:
+            fields = {}
+        self.timed = bool(fields.get("run_for_time") or fields.get("deadline"))
 
     def digest(self, data: bytes, algorithm="sha256") -> str:
         key = (id(data), algorithm)
@@ -127,6 +175,116 @@ class AssignedArchive:
         if len(found) > 1:
             raise ParseError("Multiple valid encoded HCFG records")
         return found[0] if found else None
+
+    def discover(self, data: bytes, depth: int = 0) -> Config | None:
+        """The one HCFG record hidden anywhere a day has hidden one, or might next.
+
+        Carriers the course used (raw, hex, base64, base64url, PK19/RS20 overlays, Wasm data
+        segments, sections, JAR constants) plus the likely next ones: zlib/gzip/xz/bzip2
+        streams, a single-byte XOR over the whole record, reversed bytes, UTF-16 strings
+        (.NET #US heap) and nested ZIP members. A record counts only when its CRC32 and JSON
+        validate; two different records make the answer ambiguous, so nothing is returned.
+        Offsets are kept only for a literal record in the member itself (storage "discovered_raw").
+        """
+        found: dict[tuple[int, str], Config] = {}
+        ambiguous = False
+
+        def add(node: Config | None, how: str) -> None:
+            if node is not None:
+                offset = node.offset if how == "raw" else -1
+                found.setdefault((node.crc, json.dumps(node.values, sort_keys=True)),
+                                 Config(offset, node.version, node.key, node.crc, node.values, "discovered_" + how))
+
+        def literal(blob: bytes, how: str) -> None:
+            start = 0
+            for _ in range(4096):
+                at = blob.find(b"HCFG", start)
+                if at < 0:
+                    return
+                add(config_at(blob, at), how)
+                start = at + 4
+
+        def encoded(blob: bytes, how: str) -> None:
+            nonlocal ambiguous
+            for codec in ("hex", "base64url", "base64"):
+                try:
+                    node = self.encoded_config(blob, codec, False)
+                except ParseError:
+                    ambiguous = True
+                    continue
+                add(node, how or codec)
+
+        literal(data, "raw")
+        encoded(data, "")
+        literal(data[::-1], "reversed")
+        text = b"\n".join(m.group()[::2] for m in re.finditer(rb"(?:[\x20-\x7e]\x00){24,}", data[:64 * 1024 * 1024]))
+        if text:
+            encoded(text, "utf16")
+        for magic in (b"PK19", b"RS20"):
+            if magic in data:
+                try:
+                    add(config_at(read_overlay(data, magic).payload, 0), "overlay")
+                except ParseError:
+                    pass
+        if data.startswith(b"\0asm"):
+            try:
+                for _, payload in self.wasm(data).data_segments:
+                    literal(payload, "wasm_data_segment")
+            except ParseError:
+                pass
+        if len(data) <= 32 * 1024 * 1024:
+            for key in range(1, 256):  # The whole record XORed with one more byte.
+                marker, start = bytes(c ^ key for c in b"HCFG"), 0
+                for _ in range(64):
+                    at = data.find(marker, start)
+                    if at < 0:
+                        break
+                    length = struct.unpack("<H", bytes(c ^ key for c in data[at + 6:at + 8]))[0] if at + 8 <= len(data) else 0
+                    add(config_at(bytes(c ^ key for c in data[at:at + 12 + length]), 0), "xor")
+                    start = at + 4
+        if depth == 0:
+            blobs = []
+            for magic, open_stream in ((b"\x78\x9c", lambda: zlib.decompressobj()), (b"\x78\xda", lambda: zlib.decompressobj()),
+                                       (b"\x78\x01", lambda: zlib.decompressobj()), (b"\x78\x5e", lambda: zlib.decompressobj()),
+                                       (b"\x1f\x8b\x08", lambda: zlib.decompressobj(16 + zlib.MAX_WBITS))):
+                start = 0
+                for _ in range(256):
+                    at = data.find(magic, start)
+                    if at < 0:
+                        break
+                    try:
+                        out = open_stream().decompress(data[at:], 16 * 1024 * 1024)
+                    except zlib.error:
+                        out = b""
+                    if len(out) >= 12:
+                        blobs.append(out)
+                    start = at + 2
+            for magic, unpack in ((b"\xfd7zXZ\x00", lzma.decompress), (b"BZh", bz2.decompress)):
+                at = data.find(magic)
+                if at >= 0:
+                    try:
+                        blobs.append(unpack(data[at:])[:16 * 1024 * 1024])
+                    except (lzma.LZMAError, OSError, ValueError, EOFError):
+                        pass
+            if data.startswith(b"PK"):
+                try:
+                    with zipfile.ZipFile(BytesIO(data)) as archive:
+                        for info in archive.infolist()[:4096]:
+                            if not info.is_dir() and info.file_size <= 16 * 1024 * 1024 and not info.flag_bits & 1:
+                                blobs.append(archive.read(info))
+                except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, zlib.error, NotImplementedError):
+                    pass
+            for blob in blobs:
+                try:
+                    node = self.discover(blob, depth + 1)
+                except ParseError:
+                    ambiguous = True
+                    continue
+                if node is not None:
+                    add(Config(-1, node.version, node.key, node.crc, node.values), "nested")
+        if ambiguous or len(found) != 1:
+            return None
+        return next(iter(found.values()))
 
     def wasm(self, data: bytes) -> Wasm:
         if id(data) not in self.wasms:
@@ -278,6 +436,12 @@ class AssignedArchive:
             scope_key = "base64"
         elif "literal HCFG" in q and ("Scan" in q or "scan" in q):
             scope_key = "first_literal" if "first record" in q else "unique_literal"
+        elif not self.timed:
+            # A storage worded in a way no rule knows (a new day): search every carrier, keep
+            # only a CRC32/JSON-valid record that all of them agree on (see discover()). Untimed
+            # only: there an "incorrect" is resent kind by kind, so a wrong record costs one
+            # kind; a timed race keeps to the public storage rules.
+            scope_key = "discover"
         else:
             raise ParseError("No implemented HCFG storage rule matches the public question")
         key = (id(data), scope_key)
@@ -301,6 +465,8 @@ class AssignedArchive:
                 if len(found) != 1:
                     raise ParseError("No unique valid HCFG in WebAssembly data segments")
                 node = found[0]
+            elif scope_key == "discover":
+                node = self.discover(data)
             elif section_scope:
                 sections = [s for s in self.image(data).sections if s.name == ".hcfg"]
                 if len(sections) != 1:
@@ -390,11 +556,11 @@ class AssignedArchive:
             return True, str(len(data) - self.overlay(question, data).offset)
         if "In the final RS20 resource overlay" in q and "size field" in q:
             return True, str(self.overlay(question, data).resource_size)
-        if "HCFG" in q and any(word in q for word in ("top-level", "header bytes", "header byte", "HCFG byte 4", "winning encoded carrier", "Apply these mutually exclusive rules")):
+        asks_field = _config_field(question, None) is not None
+        if "HCFG" in q and (asks_field or any(word in q for word in ("top-level", "header bytes", "header byte", "HCFG byte 4", "winning encoded carrier", "Apply these mutually exclusive rules"))):
             config = self.config(question, data)
-            field = re.search(r"top-level ([a-z_]+) property", q)
-            if field:
-                value = config.values.get(field[1])
+            if asks_field:
+                value = _config_field(question, config.values)
                 return True, value if isinstance(value, str) else None
             if "bytes 8..11 and render" in q:
                 return True, f"0x{config.crc:08x}"
@@ -402,6 +568,9 @@ class AssignedArchive:
                 return True, f"0x{config.key:02x}"
             if "HCFG byte 4" in q:
                 return True, str(config.version)
+            if config.storage.startswith("discovered") and ("winning encoded carrier" in q
+                                                            or "Apply these mutually exclusive rules" in q):
+                return True, None  # Offset and storage label are defined by the rule the question names.
             if "winning encoded carrier" in q:
                 return True, str(config.offset)
             if "Apply these mutually exclusive rules" in q:
