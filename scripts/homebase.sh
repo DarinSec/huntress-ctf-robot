@@ -5,7 +5,7 @@
 # once by expect into a shared connection that stays open for 10 minutes.
 #
 #   scripts/homebase.sh run '<cmd>'  run one command there (PYTHONPATH and the proxy URL set)
-#   scripts/homebase.sh deploy       test src/ on the VM, then swap it into ~/src (keeps
+#   scripts/homebase.sh deploy       test src/ and replay the corpus on the VM, then swap it into ~/src (keeps
 #                                    ~/src.previous) and install day.sh and hof.sh; the
 #                                    minute cron sweeps the day with the new code
 #   scripts/homebase.sh sweep        run ~/day.sh now instead of waiting for cron
@@ -53,16 +53,23 @@ case "${1:-}" in
   deploy)
     stamp=$(date +%Y%m%d-%H%M%S)
     (cd "$root" && find src tests -name __pycache__ -prune -o -type f -print \
-      | tar -cf - -T - scripts/homebase-day.sh scripts/homebase-hof.sh) \
+      | tar -cf - -T - scripts/homebase-day.sh scripts/homebase-hof.sh scripts/replay.py) \
       | remote "set -e
         d=~/deploy-$stamp; mkdir \$d; tar -xf - -C \$d; cd \$d
         if ! HUNTRESS_LOCK=/tmp/deploy-test.lock PYTHONPATH=src python3 -m unittest discover -s tests > test.log 2>&1; then
           tail -25 test.log; echo 'Tests failed on the VM; ~/src is unchanged.'; exit 1
         fi
         tail -3 test.log
+        # Every assignment the robot scored, re-solved with the new code (scripts/replay.py):
+        # an answer that matched the accepted one and no longer does stops the deploy.
+        if [ '${SKIP_REPLAY:-0}' != 1 ] && ! HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=src python3 scripts/replay.py --dry > replay.log 2>&1; then
+          grep -B1 -A3 REGRESSION replay.log | head -40; echo 'Replay found regressions; ~/src is unchanged (SKIP_REPLAY=1 to deploy anyway).'; exit 1
+        fi
         rm -rf ~/src.previous ~/src.new; cp -a ~/src ~/src.previous; cp -a src ~/src.new
         rm -rf ~/src; mv ~/src.new ~/src
         install -m 755 scripts/homebase-day.sh ~/day.sh; install -m 755 scripts/homebase-hof.sh ~/hof.sh
+        install -m 755 scripts/replay.py ~/replay.py
+        HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=~/src python3 ~/replay.py > /dev/null 2>&1 || true  # New baseline.
         echo \"Deployed \$d (previous code in ~/src.previous).\""
     ;;
   sweep)
