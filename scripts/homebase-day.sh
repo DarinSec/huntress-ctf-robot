@@ -48,7 +48,7 @@ robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
 # 21) give the teammate who finishes Script a head start; a partial solve stays open.
 # Since day 22 Script has script-rules (Ilse) and Binary binary-static-facts (David):
 # both answered every question of the day 20 and 21 Single Solves offline.
-lanes="warmups,metadata-forensics,mobile-android,script-analysis,binary-reverse-engineering"
+lanes="warmups,metadata-forensics,mobile-android,script-analysis,binary-reverse-engineering,web-exploitation"
 log="$HOME/day$day-$(date +%H%M)"
 started_code=$(code)  # After the release wait: deploys while waiting are this sweep's code.
 echo "== Day $day: untimed sweep, $(date)"
