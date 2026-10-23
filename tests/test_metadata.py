@@ -132,6 +132,10 @@ class PropertyTests(unittest.TestCase):
         drop = zipped([("room-01/item-1.txt", b"a"), ("room-02/item-1.txt", b"b")])
         self.assertEqual(m.zip_eocd_total_entries(drop), "2")
         self.assertEqual(m.zip_central_directory_member_names(drop), '["room-01/item-1.txt","room-02/item-1.txt"]')
+        # Day 23: the directory was not in sorted order and only the sorted names were accepted.
+        shuffled = zipped([("drop-33/doc-4.csv", b"a"), ("box-28/item-1.csv", b"b"), ("shelf-07/part-4.log", b"c")])
+        self.assertEqual(m.zip_central_directory_member_names(shuffled),
+                         '["box-28/item-1.csv","drop-33/doc-4.csv","shelf-07/part-4.log"]')
         rels = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
                 '<Relationship Id="rId9" Target="https://example.test/evidence/x" TargetMode="External"/>'
                 '<Relationship Id="rId10" Target="https://example.test/control" TargetMode="External"/>'
@@ -164,6 +168,14 @@ class PropertyTests(unittest.TestCase):
         hdlr = box(b"hdlr", b"\0" * 8 + b"vide" + b"\0" * 12)
         moov = box(b"moov", box(b"trak", box(b"mdia", hdlr + box(b"minf", box(b"stbl", stsd)))))
         self.assertEqual(m.media_primary_video_dimensions(box(b"ftyp", b"isom\0\0\0\0") + moov), "320x180")
+
+    def test_sqlite_page_size(self):
+        header = bytearray(b"SQLite format 3\0" + bytes(84))
+        header[16:18] = (16384).to_bytes(2, "big")
+        self.assertEqual(m.sqlite_page_size_bytes(bytes(header)), "16384")
+        header[16:18] = (1).to_bytes(2, "big")  # 1 encodes 65536.
+        self.assertEqual(m.sqlite_page_size_bytes(bytes(header)), "65536")
+        self.assertIsNone(m.sqlite_page_size_bytes(b"OggS mislabeled as .sqlite"))
 
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET

@@ -31,8 +31,10 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
 ## What the robot already does for every artifact
 
 - Unpacks ZIP (incl. ZipCrypto with the lesson password, default `infected`), gzip and tar
-  in memory (`containers.py`); solvers see them as `context.members`. Encrypted entries of
-  32 KiB or more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
+  in memory (`containers.py`); solvers see them as `context.members`. Nested packages
+  (JAR/APK/Office/...) stay whole: a JAR's 3,134 classes once filled the member limit
+  before Day 23 Binary's later samples were reached. Encrypted entries of 32 KiB or
+  more, and AES, go through `tar.exe`/7-Zip/unzip (~40 ms per MB instead of ~1 s
   in pure Python), CRC-checked against the ZIP itself. Where none reads AES (the playing
   Homebase has only Info-ZIP unzip), the `cryptography` package decrypts it in Python with
   the HMAC checked (day 20 Script: 145 members in 356 ms).
@@ -61,8 +63,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   holder's command, or queues with `--lock-wait SECONDS`. Read-only commands never lock.
 - `daily` untimed runs each challenge family (Single Solve, then Time Trial, then
   Mastery) in its own thread and connection; the timed routes of an unsolved Single
-  Solve are skipped (HTTP 409). Races stay one at a time, each route once: hints.json
-  keeps `raced_at`, `races` and `best_on_clock_ms`; `--rerace` races again.
+  Solve, and the Mastery of an unsolved Time Trial, are skipped (HTTP 409). Races stay
+  one at a time, each route once: hints.json keeps `raced_at`, `races` and
+  `best_on_clock_ms`; `--rerace` races again.
   `--wait-release S` (with `--day`) polls one lane until the day is listed.
 - An untimed "incorrect" (one wrong answer rejects the whole request) is resent kind by
   kind on the same open attempt (`learn.run_learn(open_only=True)`): the right kinds are
@@ -89,14 +92,26 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   Conventions the service accepted: dimensions "WxH"; u16 hex "0x%04x", u32 RVA
   "0x%08x"; .NET MVID lowercase; MSI ProductCode exactly as stored "{UPPER}"; Message-ID
   with <>; ffprobe codec names; OOXML external targets sorted; central-directory names
-  in order, compact JSON. "none" only when the parsed file lacks the field.
+  sorted (Day 23 rejected directory order; days 7-20 directories happened to be sorted),
+  compact JSON; Mach-O cpu_type_set sorted; SQLite page_size_bytes from header offset 16
+  (1 = 65536). "none" only when the parsed file lacks the field.
+  `formats_dfir.py` reads the forensic formats no day has used yet (EVTX, registry hive,
+  Prefetch, plist, WebP, TIFF, Matroska/WebM, AVI, VHD/VHDX, CAB, xz/bzip2/zstd/lz4,
+  ar/deb, pyc, RTF, CRX, ESE, OLE2 SummaryInformation) so `autoprop` can map a new property.
 - **A Mastery request is all-or-nothing:** one wrong answer makes the whole request
   "incorrect" with nothing accepted. To learn a new lane's conventions run
   `learn <id>` (spends one variant): the robot's answers go per question kind, and the
   report names the kinds that fail. Fix those, then race normally (one request).
-- **Mobile Android: done (day 21).** `solvers/mobile_puzzle.py` decodes each app's
+- **Mobile Android: done (day 23).** `solvers/mobile_puzzle.py` decodes each app's
   `assets/huntress_puzzle.json` by its codec (reverse, base64, hex, split, reflection,
   dynamic payload DEX, ...) into the `ANS-` answer code; all three day 21 modes CORRECT.
+  Day 23's puzzle v2 (`codec: analysis`, no data) is computed by `Release.code()`:
+  `dexvm.py` interprets that Dalvik bytecode in Python (exact int/long semantics, an
+  allow-list of pure platform methods, JNI `long f(long)` from lib/x86_64 by an x86-64
+  register subset). The app is never run; 8/8 Day 23 apps match the accepted codes.
+  Unknown codec names get a bounded two-step search (only an exact `ANS-` code is kept);
+  rot47, atbash, vigenere, string-key xor and base58 are ready. A question's
+  "in package X" must match the APK's manifest package.
 - **Script Analysis: partial.** `solvers/script_descriptors.py` answers every question of
   the specimens with a `HUNTRESS_ANALYSIS_V1` header (B64/HEX/HB64/FRAG): ~54% of a day,
   accepted in full on days 20 and 21 (Mastery sets kept apart by archive). The other
@@ -104,7 +119,11 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   `decimal_pipe|single_byte_xor|97`) and add syntax questions; owner Ilse.
   `solvers/script.py` (`script-rules`, Ilse, on `analysis/scriptrules.py`) decodes those
   families too: 1329/1329 (day 20) and 1373/1373 (day 21) offline, agreeing with every
-  descriptor answer; ~1.3 s per day. In the robot from day 22.
+  descriptor answer; ~1.3 s per day. In the robot from day 22. Day 23 added
+  `LYR-<layers>-<payload>` headers (layers in encoder order) and `<family>-<hex6>-<field>`
+  ids (style, indicator, campaign-token, url-host, path-leaf): 1495/1495 TT and
+  10465/10465 Mastery agree with the accepted answers. Layer names are read generically
+  (rot13, b85, a85, zlib, gzip, url, bin ready); an unknown layer yields nothing.
 - **Binary** (owner David): `solvers/binary.py` (`binary-static-facts`, stdlib only; reads
   only the members the questions name) answers per question property: 240/240 (day 20) and
   252/252 (day 21) offline in ~1.9 s and ~210 MB, agreeing in substance with Ilse's
@@ -207,10 +226,12 @@ Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants 
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds
-clearly (named like the property, e.g. `macho.uuid` -> `uuid`), formatted by the suffix
-convention. A CORRECT single stores the mapping as the hint's chain
-(`["autoprop", "macho.uuid=macho:uuid"]`); Time Trial, Mastery and later days use only
-confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
+clearly (named like the property, e.g. `macho.uuid` -> `uuid`; a unit suffix such as
+`_bytes` still names the field exactly), formatted by the suffix convention. A CORRECT
+single stores the mapping as the hint's chain (`["autoprop", "macho.uuid=macho:uuid"]`).
+Untimed Time Trial and Mastery make the same clear guess (a teammate often takes the
+Single Solve by hand, so nothing gets confirmed: Day 23); timed races and later days use
+only confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
 
 The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
 one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came

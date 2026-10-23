@@ -27,9 +27,18 @@ import threading
 import zipfile
 import zlib
 
-MAX_MEMBERS = 1000
-MAX_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_MEMBERS = 5000
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_DEPTH = 3
+# Packaged formats are files in their own right, not folders of evidence: one nested JAR's
+# 3,134 classes used up the member limit before Day 23 Binary's d08-d23 samples were reached.
+# Their solvers read them whole (binary, metadata apk/jar/ooxml, evidence docProps, mobile).
+PACKAGE_SUFFIXES = (
+    ".jar", ".war", ".ear", ".aar", ".apk", ".apks", ".xapk", ".aab", ".ipa", ".appx", ".msix",
+    ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm", ".odt", ".ods", ".odp", ".epub",
+    ".vsix", ".nupkg", ".whl", ".egg", ".xpi", ".crx",
+)
+_PACKAGE_MARKERS = ("META-INF/MANIFEST.MF", "AndroidManifest.xml", "[Content_Types].xml", "mimetype")
 # AGENTS.md: Script Analysis and Binary lessons may publish the archive password `infected`.
 DEFAULT_PASSWORDS = ("infected",)
 # Below this much encrypted data the pure-Python path is faster than starting a process.
@@ -98,6 +107,20 @@ def passwords_from(text: str) -> tuple[str, ...]:
 
 def _is_tar(data: bytes) -> bool:
     return len(data) > 262 and data[257:262] == b"ustar"
+
+
+def is_package(name: str, data: bytes) -> bool:
+    """A nested JAR/APK/Office-style ZIP, by extension or (when mislabeled) by its marker entry."""
+    if name.lower().endswith(PACKAGE_SUFFIXES):
+        return True
+    if not data.startswith(b"PK\x03\x04"):
+        return False
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            names = set(archive.namelist())
+    except (zipfile.BadZipFile, ValueError, OSError):
+        return False
+    return any(marker in names for marker in _PACKAGE_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -283,7 +306,8 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
         if len(members) >= MAX_MEMBERS:
             notes.append(f"Member limit {MAX_MEMBERS} reached; the rest was skipped.")
             return
-        if depth < MAX_DEPTH and (blob.startswith(_ZIP_MAGIC) or blob.startswith(b"\x1f\x8b") or _is_tar(blob)):
+        nested = blob.startswith(_ZIP_MAGIC) or blob.startswith(b"\x1f\x8b") or _is_tar(blob)
+        if depth < MAX_DEPTH and nested and not (blob.startswith(_ZIP_MAGIC) and is_package(name, blob)):
             visit(name, blob, depth + 1)
         else:
             members.append(Member(name, blob))

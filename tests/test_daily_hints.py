@@ -173,6 +173,18 @@ class ReleaseDayTests(unittest.TestCase):
         self.assertIn("live targets[]", summary["web-exploitation-day-21-y"]["reason"])
         self.assertEqual(code, UNRESOLVED)
 
+    def test_an_unsolved_time_trial_holds_back_its_mastery(self):
+        def fake(target, challenge_id, **kwargs):
+            return UNRESOLVED if challenge_id.endswith("/time_trial") else COMPLETE
+        client = DayClient()
+        with patch("huntress_ctf.daily.run_fast", side_effect=fake) as runs:
+            _, output = self.run_daily(client, day=21)
+        summary = {entry["challenge"]: entry for entry in
+                   json.loads(output.split("===== Summary =====")[1])["challenges"]}
+        self.assertEqual(summary["binary-day-21-x/time_trial"]["outcome"], "unresolved")
+        self.assertEqual(summary["binary-day-21-x/mastery"]["reason"], "its Time Trial is not solved yet")
+        self.assertNotIn("binary-day-21-x/mastery", [call.args[1] for call in runs.call_args_list])
+
     def test_web_routes_start_only_when_asked_for(self):
         web = DAY["challenges"][-1]
         self.assertIsNotNone(eligibility(web, False, {}))

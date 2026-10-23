@@ -6,7 +6,10 @@ the backend answer code is the data decoded by the codec ("reverse" on day 21:
 days' codecs: "split" puts parts[i] at position order[i], "reflection" carries the code
 as is, "dynamic" names a payload DEX that holds it. Unknown codecs get the value as is,
 reversed, and one strict layer from decoders.py.
-Only a value that is exactly an answer code ("ANS-" + 16 uppercase hex) is returned.
+Day 23 ("huntress.mobile.puzzle.v2", codec "analysis") carries no data: the code is computed
+by the app's Java (Release.code), so dexvm.py emulates that bytecode (and a JNI long f(long)
+from lib/x86_64) without running the app. A puzzle whose data decodes to nothing is tried the
+same way. Only a value that is exactly an answer code ("ANS-" + 16 uppercase hex) is returned.
 """
 
 from __future__ import annotations
@@ -19,10 +22,12 @@ import json
 import re
 import zipfile
 
+from .. import dexvm, formats
 from ..decoders import LAYERS
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
 
 ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
+_PACKAGE = re.compile(r"\bin package ([A-Za-z0-9_.]+)")
 _IN_TEXT = re.compile(rb"ANS-[0-9A-F]{16}")
 
 
@@ -84,13 +89,108 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
             found |= {"".join(placed), "".join(data[index] for index in order)}
     elif codec == "dynamic" and data in apk.namelist():
         found.update(match.decode() for match in _IN_TEXT.findall(apk.read(data)))
+    elif codec == "rot47":
+        found.add(_rot47(data))
+    elif codec == "atbash":
+        found.add(_atbash(data))
+    elif codec == "vigenere" and isinstance(puzzle.get("key"), str) and puzzle["key"].isalpha():
+        found |= {_vigenere(data, puzzle["key"], sign) for sign in (-1, 1)}
+    elif codec == "xor" and isinstance(puzzle.get("key"), str) and puzzle["key"]:
+        # Repeating string key over Base64 or hex bytes (anticipated: days so far used one key byte).
+        key = puzzle["key"].encode()
+        for raw in _raw_bytes(data):
+            found.add(bytes(byte ^ key[i % len(key)] for i, byte in enumerate(raw)).decode("latin-1"))
+    elif codec == "base58":
+        found.add(_base58(data))
     else:
-        for _, layer in LAYERS:
-            decoded = layer(data.encode())
-            if decoded:
-                found.add(decoded.decode("utf-8", "replace"))
-        found |= {data, data[::-1]} | _split(puzzle)
+        found |= _search(data) | _split(puzzle)
     return {value.strip() for value in found}
+
+
+# --- Codecs no day has used yet, and a bounded search for unknown codec names --------------------
+# Only a result that is exactly an answer code is ever kept, so trying more never invents one.
+
+def _rot47(text: str) -> str:
+    return "".join(chr(33 + (ord(c) - 33 + 47) % 94) if 33 <= ord(c) <= 126 else c for c in text)
+
+
+def _atbash(text: str) -> str:
+    return "".join(chr(ord("Z") - ord(c) + ord("A")) if "A" <= c <= "Z" else
+                   chr(ord("z") - ord(c) + ord("a")) if "a" <= c <= "z" else c for c in text)
+
+
+def _vigenere(text: str, key: str, sign: int) -> str:
+    out, index = [], 0
+    for char in text:
+        if char.isascii() and char.isalpha():
+            base = ord("A") if char.isupper() else ord("a")
+            shift = ord(key[index % len(key)].upper()) - ord("A")
+            out.append(chr((ord(char) - base + sign * shift) % 26 + base))
+            index += 1
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _base58(text: str) -> str:
+    if not text or any(c not in _BASE58 for c in text):
+        return ""
+    number = 0
+    for char in text:
+        number = number * 58 + _BASE58.index(char)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    return (b"\0" * (len(text) - len(text.lstrip("1"))) + raw).decode("latin-1")
+
+
+def _raw_bytes(text: str) -> list[bytes]:
+    out = []
+    try:
+        out.append(base64.b64decode(text + "=" * (-len(text) % 4), validate=True))
+    except (binascii.Error, ValueError):
+        pass
+    try:
+        out.append(bytes.fromhex(text))
+    except ValueError:
+        pass
+    return out
+
+
+def _steps(text: str) -> set[str]:
+    """One decoding step: every strict layer, plus the keyless text transforms."""
+    out = {text[::-1], codecs.decode(text, "rot13"), _rot47(text), _atbash(text), _base58(text)}
+    for _, layer in LAYERS:
+        decoded = layer(text.encode())
+        if decoded:
+            out.add(decoded.decode("utf-8", "replace"))
+    return {value for value in out if value and len(value) <= 4096}
+
+
+def _search(data: str) -> set[str]:
+    """Up to two steps, then every Caesar shift and single-byte XOR of the results' bytes."""
+    seen = {data}
+    frontier = {data}
+    for _ in range(2):
+        frontier = {value for text in frontier for value in _steps(text)} - seen
+        seen |= frontier
+    found = {value for value in seen if ANSWER.fullmatch(value.strip())}
+    if found:
+        return found
+    for text in seen:
+        if len(text) > 256:
+            continue
+        for shift in range(1, 26):
+            moved = "".join(chr((ord(c) - 65 + shift) % 26 + 65) if "A" <= c <= "Z" else c for c in text)
+            if ANSWER.fullmatch(moved):
+                found.add(moved)
+        for raw in _raw_bytes(text) + [text.encode("latin-1", "replace")]:
+            for key in range(1, 256):
+                candidate = bytes(byte ^ key for byte in raw)
+                if _IN_TEXT.fullmatch(candidate):
+                    found.add(candidate.decode())
+    return found
 
 
 def answer_code(apk_bytes: bytes) -> str | None:
@@ -101,12 +201,18 @@ def answer_code(apk_bytes: bytes) -> str | None:
             if len(names) != 1:
                 return None
             puzzle = json.loads(apk.read(names[0]))
-            if not isinstance(puzzle, dict) or not isinstance(puzzle.get("data"), str):
+            if not isinstance(puzzle, dict):
                 return None
-            codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
-                     if ANSWER.fullmatch(value)}
+            codes = set()
+            if isinstance(puzzle.get("data"), str):
+                codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
+                         if ANSWER.fullmatch(value)}
     except (zipfile.BadZipFile, ValueError, KeyError, UnicodeDecodeError):
         return None
+    if not codes:
+        manifest = formats.apk(apk_bytes) or {}
+        computed = dexvm.answer_code(apk_bytes, manifest.get("package_name"))
+        codes = {computed} if computed else set()
     return codes.pop() if len(codes) == 1 else None
 
 
@@ -122,7 +228,7 @@ def _apks(context: SolveContext) -> dict[str, bytes]:
             pass
     for member in context.members:
         if member.name.endswith(".apk"):
-            found[member.name.rsplit("/", 1)[-1]] = member.data
+            found[re.sub(r"^delivery \d+:\s*", "", member.name.rsplit("/", 1)[-1])] = member.data
     return found
 
 
@@ -138,14 +244,20 @@ class MobilePuzzleSolver:
         candidates = []
         for question in question_items(context):
             name = (question.artifact or "").rsplit("->", 1)[-1].strip().rsplit("/", 1)[-1]
+            name = re.sub(r"^delivery \d+:\s*", "", name)
             blob = apks.get(name) or (apks.get("artifact") if len(apks) == 1 or name not in apks else None)
             if blob is None:
+                continue
+            # "For case ... in package <name>": never answer one app's question from another app
+            # (a Mastery delivery that is missing must not borrow the first app's code).
+            wanted = _PACKAGE.search(question.text)
+            if wanted and (formats.apk(blob) or {}).get("package_name") != wanted[1]:
                 continue
             code = answer_code(blob)
             if code and fits_format(code, question.answer_format):
                 candidates.append(AnswerCandidate(
                     question.answer_id, code, self.name,
-                    f"{name or 'the APK'}: assets/huntress_puzzle.json decodes to this answer code.",
+                    f"{name or 'the APK'}: assets/huntress_puzzle.json (or the code it names) gives this answer code.",
                 ))
         return candidates
 

@@ -309,10 +309,15 @@ def _run_families(
                     traceback.print_exc(file=sys.stdout)
                     entry = {"challenge": _id(record), "outcome": "error", "reason": repr(exc)}
                 entries[id(record)] = entry
-                single = "/" not in str(_id(record))
-                if single and entry["outcome"] not in ("complete", "skipped"):
-                    # Its Time Trial and Mastery answer HTTP 409 until it scores.
-                    blocked = "its Single Solve is not solved yet"
+                mode = str(_id(record)).rpartition("/")[2] if "/" in str(_id(record)) else ""
+                if entry["outcome"] not in ("complete", "skipped"):
+                    # Each mode unlocks the next: the Time Trial and Mastery of an unsolved
+                    # Single Solve, and the Mastery of an unsolved Time Trial (Day 23: three
+                    # lanes' Mastery starts were HTTP 409 after their Time Trials stayed open).
+                    if not mode:
+                        blocked = "its Single Solve is not solved yet"
+                    elif mode == "time_trial":
+                        blocked = "its Time Trial is not solved yet"
         finally:
             target.close()
             output.end()

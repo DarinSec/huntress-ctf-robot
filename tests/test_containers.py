@@ -139,6 +139,18 @@ class ContainerTests(unittest.TestCase):
         with patch("huntress_ctf.containers.MAX_MEMBERS", 2):
             self.assertEqual(len(unwrap(archive).members), 2)
 
+    def test_packages_stay_whole_so_later_samples_are_reached(self):
+        # Day 23 Binary: one JAR's 3,134 classes filled the member limit before d08-d23.
+        jar = zipped([("META-INF/MANIFEST.MF", b"Main-Class: a.B\n")] + [(f"c{i}.class", b"\xca\xfe") for i in range(9)])
+        mislabeled = zipped([("AndroidManifest.xml", b"\x03\x00"), ("classes.dex", b"dex\n")])
+        bundle = zipped([("d07--sample.jar", jar), ("d08--app.bin", mislabeled),
+                         ("d09--inner.zip", zipped([("x.txt", b"x")])), ("d10--sample.elf", b"\x7fELF")])
+        with patch("huntress_ctf.containers.MAX_MEMBERS", 4):
+            result = unwrap(bundle)
+        self.assertEqual([member.name for member in result.members],
+                         ["d07--sample.jar", "d08--app.bin", "d09--inner.zip/x.txt", "d10--sample.elf"])
+        self.assertEqual(result.members[0].data, jar)
+
     def test_plain_bytes_have_no_members(self):
         self.assertEqual(unwrap(b"just text").members, ())
 

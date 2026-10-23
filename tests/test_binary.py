@@ -257,9 +257,11 @@ class BinarySolverTests(unittest.TestCase):
     def test_machine_field_answers_the_decimal_code_for_any_architecture(self):
         # The accepted machine-label spelling is grader-defined (Day 22 rejected "x86" for a
         # managed i386 DLL), but the equivalent decimal machine code is accepted for every
-        # machine-field question -- so answer the decimal code for any architecture, not just i386.
+        # machine-field question -- so answer the decimal code for any architecture, except i386:
+        # Day 23 rejected 332 for the managed F# DLLs (d22/d23) and accepted "i386" for every
+        # 0x14c machine field, d03 included (Time Trial and Mastery CORRECT, 23 Oct 2026).
         machine = "Report the processor architecture identified by its executable-header machine field."
-        self.assertEqual(solve(pe_fixture(32), machine), {"0": "332"})       # 0x14c
+        self.assertEqual(solve(pe_fixture(32), machine), {"0": "i386"})      # 0x14c
         self.assertEqual(solve(pe_fixture(64), machine), {"0": "34404"})     # 0x8664
         self.assertEqual(solve(elf_fixture(64), machine), {"0": "62"})       # EM_X86_64
         self.assertEqual(solve(elf_fixture(32, ">", 20), machine), {"0": "20"})  # a PowerPC ELF
@@ -299,7 +301,8 @@ class BinarySolverTests(unittest.TestCase):
 
     def test_zip_directory_order_and_separate_delivery(self):
         data = bundle(**{"z.txt": b"z", "a.txt": b"a"})
-        self.assertEqual(solve(data, "Determine zip.central_directory_member_names for sample."), {"0": '["z.txt","a.txt"]'})
+        # Shared with Metadata, where Day 23 accepted only the sorted names (no Binary day has asked it yet).
+        self.assertEqual(solve(data, "Determine zip.central_directory_member_names for sample."), {"0": '["a.txt","z.txt"]'})
         attempt = {"artifacts": [{"filename": "first.exe"}, {"filename": "second.exe"}]}
         members = (Member("delivery 2: second.exe", pe_fixture(32)),)
         self.assertEqual(solve(pe_fixture(), "What is the architecture?", reference="delivery 2: second.exe", members=members, attempt=attempt), {"0": "x86"})

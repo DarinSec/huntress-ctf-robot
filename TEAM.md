@@ -21,8 +21,8 @@ on the same challenge collide. Build and test on your own machine; Darin deploys
 | Robot, deploys, Homebase | Darin | Runs daily from 15:00, sweeps again within a minute of a deploy |
 | Warmups | Darin | Automatic: 3/3 flags 12 s after the release |
 | Metadata Forensics | Darin | Automatic; most new property types too (`solvers/autoprop.py`) |
-| Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`) |
-| Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min |
+| Mobile Android | Darin | Automatic (`solvers/mobile_puzzle.py`; day 23 computed codes via `dexvm.py`) |
+| Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 all three modes by 3.3 min; day 23 LYR layers merged |
 | Binary | David | Automatic (`solvers/binary.py`); new types still need code: day 22's primary DLL and machine field |
 | Web Exploitation | Parsa | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP and keep-alive reuse |
 

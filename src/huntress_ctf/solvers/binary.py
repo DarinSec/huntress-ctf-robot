@@ -310,7 +310,13 @@ def _structured(question: Question, analysis: Analysis) -> str | None:
             # label spelling is not derivable from the bytes, so for a single image we answer
             # the machine field with its decimal code for ANY architecture -- not just i386, and
             # even when its arch label is unmapped (so this must run before the arch-None guard).
-            return str(images[0].machine)
+            # Day 23 exception: the managed F# i386 assemblies (d22/d23) reject the decimal 332
+            # and require the IMAGE_FILE_MACHINE label "i386"; that label is accepted everywhere
+            # the decimal was (incl. day 3's managed i386), so map 0x14c -> "i386" specifically.
+            machine = images[0].machine
+            if machine == 0x14C:
+                return "i386"
+            return str(machine)
         if any(i.arch is None for i in images):
             return None
         values = sorted({i.arch for i in images})

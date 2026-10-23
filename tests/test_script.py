@@ -73,6 +73,34 @@ class ScriptSolverTest(unittest.TestCase):
         self.assertEqual(got, {"set1.polyglot-php-stager-campaign": "TEST-set1",
                                "set2.polyglot-php-stager-campaign": "TEST-set2"})
 
+    def test_day23_layered_header_and_derived_fields(self):
+        # LYR lists its layers in encoder order (b64, then rev, then hex); decoding undoes them last-to-first.
+        layered = base64.b64encode(DESCRIPTOR.encode())[::-1].hex()
+        name = "5f33a0.php"
+        art = f"evidence.zip -> {name}"
+        fields = ("campaign", "campaign-token", "url-host", "path-leaf", "steps", "obfuscation")
+        questions = [{"id": f"polyglot-php-5f33a0-{f}", "question": "?", "artifact": art,
+                      "answer_format": {"kind": "exact_text"}} for f in fields]
+        ctx = context(name, questions)
+        member = Member(name, f"<?php // HUNTRESS_ANALYSIS_V1:LYR-b64_rev_hex-{layered}\n".encode())
+        ctx = SolveContext(ctx.challenge_id, ctx.challenge, ctx.attempt, ctx.artifact,
+                           ctx.artifact_path, ctx.answer_ids, members=(member,))
+        got = {c.answer_id.rsplit("5f33a0-", 1)[1]: c.answer for c in ScriptSolver().solve(ctx)}
+        self.assertEqual(got["campaign"], "TEST-abc123")
+        self.assertEqual(got["campaign-token"], "abc123")
+        self.assertEqual(got["url-host"], "test-abc123.example.invalid")
+        self.assertEqual(got["path-leaf"], "x.stage")
+        self.assertEqual(got["obfuscation"], "base64")
+
+    def test_layers_no_day_has_used_yet(self):
+        import zlib
+        from huntress_ctf.analysis import scriptrules
+        packed = base64.b64encode(zlib.compress(DESCRIPTOR.encode())).decode()
+        record = scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-zlib_b64-{packed}\n")
+        self.assertEqual((record["campaign_id"], record["_lyr"]), ("TEST-abc123", "zlib_b64"))
+        # An unknown layer name is not guessed at: the header yields nothing rather than a wrong record.
+        self.assertIsNone(scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-mystery_b64-{packed}\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,11 +11,15 @@ Writes {answer_id: [candidate, ...]} (best first), the same shape day17_submit.p
 """
 import base64
 import binascii
+import codecs
 import functools
+import gzip
 import hashlib
 import json
 import os
 import re
+import urllib.parse
+import zlib
 
 
 from . import answers, scripts  # noqa: E402
@@ -274,9 +278,76 @@ def family_graph(field, text, fam):
 ANALYSIS = re.compile(r"HUNTRESS_ANALYSIS_V1:([A-Z0-9]+)-([A-Za-z0-9+/=.]+)")
 
 
+# Day 23: `HUNTRESS_ANALYSIS_V1:LYR-<l1_l2_..>-<payload>`; the layers are listed in encoder order.
+# Layer names are read generically: days after 23 may add layers (an unknown one makes the header
+# fall back to the other decoders rather than guess).
+LYR = re.compile(r"HUNTRESS_ANALYSIS_V1:LYR-([a-z0-9]+(?:_[a-z0-9]+)*)-([A-Za-z0-9+/=.]+)")
+
+
+def _undo(layer, data):
+    if layer == "frag":
+        return data.replace(b".", b"")
+    if layer == "rev":
+        return data[::-1]
+    if layer in ("hex", "b16"):
+        return bytes.fromhex(data.decode())
+    if layer in ("b64", "base64"):
+        return base64.b64decode(data + b"=" * (-len(data) % 4), validate=True)
+    if layer in ("b64u", "b64url"):
+        return base64.urlsafe_b64decode(data + b"=" * (-len(data) % 4))
+    if layer in ("b32", "base32"):
+        return base64.b32decode(data + b"=" * (-len(data) % 8))
+    # Not seen yet (anticipated):
+    if layer == "rot13":
+        return codecs.decode(data.decode("latin-1"), "rot13").encode("latin-1")
+    if layer == "b85":
+        return base64.b85decode(data)
+    if layer == "a85":
+        return base64.a85decode(data, adobe=data.startswith(b"<~"))
+    if layer == "zlib":
+        return zlib.decompress(data)
+    if layer in ("gz", "gzip"):
+        return gzip.decompress(data)
+    if layer == "url":
+        return urllib.parse.unquote_to_bytes(data)
+    if layer == "bin":
+        bits = data.decode().replace(" ", "")
+        return int(bits, 2).to_bytes(len(bits) // 8, "big")
+    raise ValueError(layer)
+
+
+def lyr_decode(spec, payload):
+    """Undo the layers last-to-first."""
+    data = payload.encode()
+    for layer in reversed(spec.split("_")):
+        data = _undo(layer, data)
+    return data
+
+
+def _layered_header(text):
+    """The LYR record (with its layer spec as `_lyr`), also when spread over a SPLIT string array."""
+    m = LYR.search(text)
+    split = re.search(r"HUNTRESS_ANALYSIS_V1:SPLIT\b(.*?)[\]\)\}]", text, re.S)
+    if split and not m:
+        joined = "".join(re.findall(r"[\"']([A-Za-z0-9+/=._\-]+)[\"']", split.group(1)))
+        m = LYR.search("HUNTRESS_ANALYSIS_V1:" + joined)
+    if not m:
+        return None
+    try:
+        rec = scripts.parse_record(lyr_decode(*m.groups()))
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, zlib.error, OSError, EOFError):
+        return None
+    if isinstance(rec, dict):
+        rec.setdefault("_lyr", m.group(1))
+    return rec
+
+
 @functools.lru_cache(maxsize=None)
 def analysis_header(text):
-    """`HUNTRESS_ANALYSIS_V1:<KIND>-<payload>` (B64, HEX, FRAG dot-split hex, HB64) -> pipe k=v dict."""
+    """`HUNTRESS_ANALYSIS_V1:<KIND>-<payload>` (B64, HEX, FRAG dot-split hex, HB64, LYR) -> pipe k=v dict."""
+    layered = _layered_header(text)
+    if layered is not None:
+        return layered
     m = ANALYSIS.search(text)
     split = re.search(r"HUNTRESS_ANALYSIS_V1:SPLIT\b(.*?)[\]\)\}]", text, re.S)
     if split:                                                # payload spread over a string array
@@ -376,7 +447,7 @@ FAMILIES = {
 }
 
 
-def solve(source, qs, only=None):
+def _solve_families(source, qs, only=None):
     """source: a directory with setN/ members, or an in-memory {(set, member): text} map."""
     out, missing = {}, []
     cache = {}
@@ -410,3 +481,113 @@ def solve(source, qs, only=None):
     return out, missing
 
 
+# ---- Day 23: `<family>-<hex6>-<field>` ids, combined style fields, indicator/campaign-token ----------
+
+ID = re.compile(r"^(?:set\d+\.)?([a-z_]+(?:-[a-z_]+)?)-([0-9a-f]{6})-(.+)$")
+PY_PAIRS = {"carrier": ("carrier", "windows_chain"), "obfuscation": ("syntax", "obfuscation")}
+OVERRIDE = {("python", "carrier"), ("python", "obfuscation")}   # day 18 answers these with one label
+GRAPH = {"jscript", "batch", "vbscript"}
+IND_ORDER = ["url", "upload_url", "next_stage", "next_stage_file", "file_path", "schedule_path",
+             "note_name", "recovery_note", "host_id"]
+STYLE = {"jscript": ["function-style", "invocation-style", "property-style"],
+         "vbscript": ["representation", "transform", "control"]}
+
+
+def flat_record(text, fam):
+    if fam in GRAPH:
+        flat, _ = descriptor(text, fam)
+        return flat
+    return record_of(text)
+
+
+def base(field, text, fam):
+    if fam in GRAPH:
+        v = family_graph("chain-" + field, text, fam)
+        if field == "steps" and isinstance(v, list):
+            v = ">".join(v)                                  # a list here cost ~27 rejections on Day 23
+        return v
+    return FAMILIES[fam](field, text, fam)
+
+
+def batch_style(text):
+    """graph topology (descriptor `graph`) | control wrapper | expansion form."""
+    flat, _ = descriptor(text, "batch")
+    parts = [flat.get("graph") or flat.get("topology"), bat_style("control", text), bat_style("expansion", text)]
+    return "|".join(parts) if all(parts) else None
+
+
+def answer(fam, field, text):
+    if fam == "powershell":
+        sf = sample_fields(text)
+        sc = sf["scenario"]
+        if field == "secondary":
+            return {"resource_hijacking": sf["wallet"], "synthetic_collection": sf["file"],
+                    "synthetic_impact": sf["note"]}.get(sc)
+        if field == "tertiary":
+            return {"resource_hijacking": sf["mutex"], "synthetic_collection": sf["user-agent"],
+                    "synthetic_impact": sf["extension"]}.get(sc)
+        return sf.get(field)
+    fam_key = "bash" if fam.startswith("bash") else fam
+    if fam_key not in FAMILIES:
+        return None
+    if fam_key == "python" and field in PY_PAIRS:
+        rec = record_of(text)
+        parts = [rec.get(k) for k in PY_PAIRS[field]]
+        return "|".join(parts) if all(parts) else None
+    if field == "campaign-token":
+        c = answer(fam, "campaign", text)
+        c = c[0] if isinstance(c, tuple) else c
+        return c.split("-", 1)[1] if c and "-" in c else None
+    if field == "indicator":
+        rec = flat_record(text, fam_key)
+        for k in IND_ORDER:
+            if rec.get(k) not in (None, ""):
+                return rec[k]
+        return None
+    if field == "url-host":
+        u = answer(fam, "url", text)
+        m = re.match(r"^[a-z]+://([^/:?#]+)", u or "")
+        return m.group(1) if m else None
+    if field == "path-leaf":
+        p = answer(fam, "file-path", text)
+        return re.split(r"[\\/]", p)[-1] if p else None
+    if field == "style" and fam_key in STYLE:
+        parts = [base(f, text, fam_key) for f in STYLE[fam_key]]
+        return "|".join(parts) if all(parts) else None
+    if field == "style" and fam_key == "batch":
+        return batch_style(text)
+    if fam_key == "polyglot" and field == "obfuscation":
+        rec = record_of(text)
+        if rec.get("obfuscation") or rec.get("obfuscation_profile"):
+            return rec.get("obfuscation") or rec.get("obfuscation_profile")
+        return rec.get("_lyr")
+    return base(field, text, fam_key)
+
+
+def solve(source, qs, only=None):
+    """The per-family rules (days 18-22), then the Day 23 id shapes for what they could not answer."""
+    out, _ = _solve_families(source, qs, only)
+    for q in qs:
+        m = ID.match(q["id"])
+        if q["id"] in out and not (m and (m.group(1).split("-")[0], m.group(3)) in OVERRIDE):
+            continue
+        a = ARTIFACT.search(q.get("artifact", ""))
+        if not m or not a:
+            continue
+        key = (int(a.group(1) or 1), a.group(2).strip())
+        if isinstance(source, dict):
+            text = source.get(key)
+        else:
+            path = os.path.join(source, f"set{key[0]}", key[1])
+            text = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else None
+        if text is None:
+            continue
+        try:
+            v = answer(m.group(1).split("-")[0], m.group(3), text)
+        except (KeyError, ValueError, TypeError, IndexError, AttributeError):
+            v = None
+        if v is None:
+            continue
+        cands = v if isinstance(v, tuple) else (v,)
+        out[q["id"]] = [answers.format_answer(c, q.get("answer_format") or {}) for c in cands]
+    return out, [q["id"] for q in qs if q["id"] not in out]

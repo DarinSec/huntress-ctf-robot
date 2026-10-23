@@ -158,16 +158,25 @@ class AutoPropertyTests(unittest.TestCase):
             archive.writestr("macos-001.bin", macho_with_commands())
         self.bundle = buffer.getvalue()
 
-    def solve(self, challenge_id, prop):
+    def solve(self, challenge_id, prop, timed=None, name="macos-001.bin", data=None):
         from huntress_ctf.solvers import SolveContext
         from huntress_ctf.solvers.autoprop import AutoPropertySolver
-        question = {"id": "q", "question": f"Determine {prop} for macos-001.bin.",
-                    "artifact": "metadata-day-21-evidence.zip -> macos-001.bin"}
+        timed = "/" in challenge_id if timed is None else timed
+        question = {"id": "q", "question": f"Determine {prop} for {name}.",
+                    "artifact": f"metadata-day-21-evidence.zip -> {name}"}
+        inner = self.bundle
+        if data is not None:
+            buffer = BytesIO()
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr(name, data)
+            inner = buffer.getvalue()
         bundle = BytesIO()
         with zipfile.ZipFile(bundle, "w") as archive:
-            archive.writestr("metadata-day-21-evidence.zip", self.bundle)
-        context = SolveContext(challenge_id, {"lane": "metadata-forensics"},
-                               {"answer_ids": ["q"], "questions": [question]}, bundle.getvalue(), None, ("q",))
+            archive.writestr("metadata-day-21-evidence.zip", inner)
+        attempt = {"answer_ids": ["q"], "questions": [question]}
+        if timed:
+            attempt.update(run_for_time=True, deadline="2026-10-23T13:00:50Z")
+        context = SolveContext(challenge_id, {"lane": "metadata-forensics"}, attempt, bundle.getvalue(), None, ("q",))
         return AutoPropertySolver().solve(context)
 
     def test_single_solve_answers_a_clear_new_property_and_records_the_mapping(self):
@@ -183,6 +192,22 @@ class AutoPropertyTests(unittest.TestCase):
         found = self.solve("metadata-forensics-day-21-x/mastery", "macho.uuid")
         self.assertEqual([c.answer for c in found], ["385DB3EB-80F9-2D37-68A1-01BF9A83EA22"])
         self.assertIn("confirmed", found[0].evidence)
+
+    def test_untimed_time_trial_and_mastery_guess_clearly_too(self):
+        # Day 23: the Single Solve was taken by hand, so no mapping was confirmed for the TT.
+        for route in ("metadata-forensics-day-21-x/time_trial", "metadata-forensics-day-21-x/mastery"):
+            found = self.solve(route, "macho.uuid", timed=False)
+            self.assertEqual([c.answer for c in found], ["385DB3EB-80F9-2D37-68A1-01BF9A83EA22"])
+
+    def test_a_unit_suffix_names_the_field_exactly(self):
+        # Day 23: page_size and database_size_pages both share "page" and "size" with the
+        # property; the unit "_bytes" must not hide that page_size is the exact field.
+        from huntress_ctf.suggest import confident
+        header = bytearray(b"SQLite format 3\0" + bytes(84))
+        header[16:18] = (4096).to_bytes(2, "big")
+        header[28:32] = (3).to_bytes(4, "big")
+        database = bytes(header) + bytes(4096 * 3 - 100)
+        self.assertEqual(confident("sqlite.page_size_bytes", database), ("sqlite", "page_size", "4096"))
 
     def test_known_or_unclear_properties_are_left_alone(self):
         self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.cpu_type_set"), [])  # Has a parser.
