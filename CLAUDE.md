@@ -212,6 +212,11 @@ time than it saves. Delegate only the heavy reversing lanes.
 
 ## Solver rules
 
+- `question_items(context)` is where every lane starts, and the parsed list is built once
+  per run and shared (the context's one-slot `cache`). It used to match each question
+  against the `answer_ids` tuple, which is quadratic: on a Mastery of ~10,000 questions
+  (day 23 Script: 10,465) that was 365 ms of a 446 ms solve, paid again by every solver.
+  A 20,000-question test in `test_solvers_state.py` fails if that comes back.
 - Deterministic, no network, no AI in the loop; milliseconds per artifact. Check with
   `triage <file> --time --question "..."` (cold-cache median per solver). On the clock,
   extract only what the question needs: one full regex pass per IOC kind adds up.

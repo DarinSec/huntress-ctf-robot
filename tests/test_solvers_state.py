@@ -1,5 +1,6 @@
 import base64
 from pathlib import Path
+import time
 import unittest
 
 from huntress_ctf.client import GameMasterError
@@ -7,6 +8,7 @@ from huntress_ctf.display import safe_value
 from huntress_ctf.solvers import (
     Base64AnswerSolver, CluedTextDecoderSolver, JsonAnswerMapSolver, SolveContext,
 )
+from huntress_ctf.solvers.base import question_items
 from huntress_ctf.state import AttemptState, ensure_same_attempt, mode_name, remember_identity
 
 
@@ -71,6 +73,36 @@ class SolverTests(unittest.TestCase):
             prompt, b'[{"answer_id":"a","answer":"one"},{"answer_id":"unknown","answer":"bad"}]'
         ))
         self.assertEqual([(item.answer_id, item.answer) for item in answers], [("a", "one")])
+
+
+class QuestionItemsTests(unittest.TestCase):
+    """A Mastery assignment issues thousands of questions and every solver reads them."""
+
+    def assignment(self, count):
+        questions = [{"id": f"set1.q{n:05}", "question": f"question {n}?", "artifact": f"f{n}.bin",
+                      "answer_format": {"kind": "exact_text"}} for n in range(count)]
+        ids = tuple(q["id"] for q in questions)
+        return SolveContext("c/mastery", {}, {"questions": questions}, b"", Path("x"), ids)
+
+    def test_thousands_of_questions_parse_in_one_pass(self):
+        # Day 23's Script Mastery issued 10,465. Matching each one against the answer_ids
+        # tuple instead of a set was 365 ms of a 446 ms solve, paid by every solver.
+        context = self.assignment(20000)
+        started = time.perf_counter()
+        items = question_items(context)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(items), 20000)
+        # Linear takes ~0.1 s here and the quadratic scan took 2.3 s, so this sits well
+        # clear of both: it is a shape check, not a benchmark.
+        self.assertLess(elapsed, 1.0, "question_items is scanning the answer_ids per question again")
+
+    def test_the_parse_is_shared_by_every_solver_of_one_run(self):
+        context = self.assignment(3)
+        first = question_items(context)
+        context.challenge["questions"] = [{"id": "set1.q00000", "question": "changed?"}]
+        self.assertEqual([item.answer_id for item in question_items(context)],
+                         [item.answer_id for item in first])  # Read from the memo, not re-parsed.
+        self.assertIsNot(question_items(context), question_items(context))  # A copy each time.
 
 
 class StateTests(unittest.TestCase):
