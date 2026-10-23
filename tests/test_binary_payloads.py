@@ -104,6 +104,8 @@ class BinaryPayloadTests(unittest.TestCase):
             self.assertEqual(self.solve(bytes(blob), [("present", predicate)]), {"present": expected})
         got = self.solve(elf_fixture(), [("sections", "Submit every section name in section-header-table index order as a JSON string array.")])
         self.assertEqual(json.loads(got["sections"]), ["", ".text", ".dynstr", ".dynsym", ".dynamic", ".shstrtab"])
+        got = self.solve(elf_fixture(), [("sections", "Submit every ELF section name in section-header-table index order as a JSON string array, including the leading empty name for section index 0.")])
+        self.assertEqual(json.loads(got["sections"]), ["", ".text", ".dynstr", ".dynsym", ".dynamic", ".shstrtab"])
 
     def test_exact_elf_section_predicate_does_not_return_a_name_list(self):
         predicate = "Evaluate this public predicate and submit lowercase true or false: true exactly when the parsed ELF section names contain .hcfg."

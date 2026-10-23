@@ -1,4 +1,5 @@
 """Generated instruction/data layouts for the narrow HCFG array-reference reader."""
+import base64
 import struct
 import unittest
 
@@ -93,6 +94,35 @@ class NativeReferenceTests(unittest.TestCase):
         damaged = bytearray(data)
         damaged[0x308] ^= 1
         self.assertEqual(answers(bytes(damaged)), {})
+
+    def test_storage_takes_the_carrier_rule_its_siblings_name(self):
+        # Day 19 wording: no "top-level" sibling, and the storage rules themselves mention
+        # the .hcfg section, so the carrier must come from the sibling questions.
+        record_text = ("Locate the unique CRC32-valid HCFG record. Submit the exact JSON string at "
+                       "decoded HCFG JSON config.domain, without JSON quotes.")
+        storage = ("Locate the unique CRC32-valid HCFG record. Apply these mutually exclusive rules in order: "
+                   "base64 when the winning HCFG appears only after decoding a printable Base64 carrier; "
+                   "raw_hcfg_section when literal HCFG begins in a native section named exactly .hcfg; "
+                   "raw_const_array when instruction evidence resolves a decoder reference; otherwise raw.")
+        literal = "Use all unit-- members. Scan the specified member for literal HCFG magic and accept the first record whose bounds, CRC32, and decoded JSON validate. "
+        encoded = "Use all unit-- members. Test every non-overlapping Latin-1 run matching [A-Za-z0-9+/]{100,}={0,2} by Base64-decoding it. "
+
+        def answers(blob, *rules):
+            prompts = [(f"unit_analysis_config_{field}", rule + record_text.replace("domain", field))
+                       for field, rule in zip(("domain", "campaign"), rules)]
+            prompts.append(("unit_analysis_hcfg_storage", "Use all unit-- members. " + storage))
+            return {c.answer_id: c.answer for c in BinarySolver().solve(archive_context({"unit--native.elf": blob}, prompts))}
+
+        data, _ = native_fixture()
+        self.assertEqual(answers(data, literal)["unit_analysis_hcfg_storage"], "raw_const_array")
+        record = config_record({"campaign": "synthetic-campaign", "domain": "example.invalid", "padding": "fixture" * 12})
+        carried = data + b"\0" + base64.b64encode(record) + b"\0"
+        damaged = bytearray(carried)
+        damaged[0x308] ^= 1  # Only the encoded record stays valid.
+        got = answers(bytes(damaged), encoded)
+        self.assertEqual((got["unit_analysis_hcfg_storage"], got["unit_analysis_config_domain"]),("base64", "example.invalid"))
+        # Siblings naming different carriers settle nothing; no .hcfg section either.
+        self.assertNotIn("unit_analysis_hcfg_storage", answers(bytes(damaged), encoded, literal))
 
     def test_overlapping_allocated_virtual_mapping_is_not_evidence(self):
         data, _ = native_fixture()

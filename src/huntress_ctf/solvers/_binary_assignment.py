@@ -410,18 +410,16 @@ class AssignedArchive:
             raise ParseError("Cached unsupported executable")
         return self.images[id(data)]
 
-    def config(self, question: Question, data: bytes) -> Config:
-        q = question.text
-        if "Apply these mutually exclusive rules" in q:
-            q = next((other.text for other in self.family(question) if "top-level" in other.text), q)
-        section_scope = "section named exactly .hcfg" in q
+    @staticmethod
+    def scope(q: str) -> str | None:
+        """The carrier rule a question names, or None for a wording no rule knows."""
         if "Find the final PK19 overlay" in q:
             scope_key = "packed_overlay"
         elif "Find the final RS20 overlay" in q:
             scope_key = "resource_overlay"
         elif "Parse the WebAssembly section stream" in q:
             scope_key = "wasm_data_segment"
-        elif section_scope:
+        elif "section named exactly .hcfg" in q:
             scope_key = "section"
         elif "classfile constant pool" in q:
             scope_key = "jar"
@@ -436,14 +434,32 @@ class AssignedArchive:
             scope_key = "base64"
         elif "literal HCFG" in q and ("Scan" in q or "scan" in q):
             scope_key = "first_literal" if "first record" in q else "unique_literal"
-        elif not self.timed:
+        else:
+            return None
+        return scope_key
+
+    def config(self, question: Question, data: bytes) -> Config:
+        q = question.text
+        scope_key = None
+        if "Apply these mutually exclusive rules" in q:
+            # The storage question lists every rule (.hcfg included); the carrier is the one
+            # its siblings name: a "top-level" one (day 22), else the one rule all agree on
+            # (day 19: "Test every non-overlapping Latin-1 run ..." beside the storage rules).
+            q = next((other.text for other in self.family(question) if "top-level" in other.text), q)
+            if q is question.text:
+                named = {self.scope(other.text) for other in self.family(question)
+                         if "HCFG" in other.text and "Apply these mutually exclusive rules" not in other.text}
+                if len(named) == 1 and None not in named:
+                    scope_key = named.pop()
+        scope_key = scope_key or self.scope(q)
+        if scope_key is None:
+            if self.timed:
+                raise ParseError("No implemented HCFG storage rule matches the public question")
             # A storage worded in a way no rule knows (a new day): search every carrier, keep
             # only a CRC32/JSON-valid record that all of them agree on (see discover()). Untimed
             # only: there an "incorrect" is resent kind by kind, so a wrong record costs one
             # kind; a timed race keeps to the public storage rules.
             scope_key = "discover"
-        else:
-            raise ParseError("No implemented HCFG storage rule matches the public question")
         key = (id(data), scope_key)
         if key not in self.configs:
             self.configs[key] = None  # Cache failed validation as well as success.
@@ -467,7 +483,7 @@ class AssignedArchive:
                 node = found[0]
             elif scope_key == "discover":
                 node = self.discover(data)
-            elif section_scope:
+            elif scope_key == "section":
                 sections = [s for s in self.image(data).sections if s.name == ".hcfg"]
                 if len(sections) != 1:
                     raise ParseError("No unique .hcfg section")
@@ -607,7 +623,7 @@ class AssignedArchive:
         if data.startswith(b"\0asm"):
             return False, None  # Generic question-directed Wasm metadata below.
         image = self.image(data)
-        if "every section name in section-header-table index order" in q:
+        if re.search(r"every (?:ELF )?section name in section-header-table index order", q):
             return True, json.dumps([s.name for s in image.sections], separators=(",", ":"))
         if "true exactly when any parsed executable section name contains the lowercase substring hcfg" in q:
             return True, str(any("hcfg" in s.name for s in image.sections)).lower()
