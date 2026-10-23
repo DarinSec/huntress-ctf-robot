@@ -29,7 +29,11 @@ run_agent() {  # <challenge-id> [--push]
   dir="${AGENT_WORKTREES:-$HOME/agent-worktrees}/$safe-$stamp"
   mkdir -p "$(dirname "$dir")"
   git -C "$repo" worktree add -q -b "$branch" "$dir" HEAD || return 1
-  (cd "$repo" && python3 -m huntress_ctf prepare "$id" --work-dir "$dir/work") || { echo "Nothing to prepare for $id."; return 1; }
+  if ! (cd "$repo" && python3 -m huntress_ctf prepare "$id" --work-dir "$dir/work"); then
+    echo "Nothing to prepare for $id (wrong ID, or not started yet)."
+    git -C "$repo" worktree remove --force "$dir"; git -C "$repo" branch -q -D "$branch"
+    return 1
+  fi
   work="work/$safe"
   echo "== $id: before"; (cd "$dir" && PYTHONPATH=src python3 scripts/solve_offline.py "$work" | sed -n '/answered/,$p' | head -30)
   prompt=$(sed -e "s|{ID}|$id|g" -e "s|{WORK}|$work|g" "$repo/scripts/release-agent.md")
