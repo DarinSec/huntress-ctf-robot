@@ -231,6 +231,18 @@ Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants 
 
 ## Release day: a new question type
 
+Three tools since Day 23 (all offline except `prepare`, which is read-only):
+- `python -m huntress_ctf prepare <id>` writes `work/<id>/` (assignment, every delivery,
+  triage.md) for any started route, from any machine with the token.
+- `scripts/solve_offline.py work/<id>` lists per question kind what the robot answers.
+- `scripts/release-agent.sh <id>` (or `--watch <day> --max N` after the release) lets
+  headless Claude Code write the missing solver on branch `agent/<id>-<stamp>` in its own
+  worktree, without the token and without submitting; the script then re-checks tests,
+  replay and coverage itself. A human reviews, merges and deploys.
+- `scripts/replay.py` re-solves every scored assignment in `~/.huntress/corpus` (the robot
+  records them after each CORRECT/accepted submit); `homebase.sh deploy` refuses a
+  deploy that regresses an accepted answer (`SKIP_REPLAY=1` overrides).
+
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds
 clearly (named like the property, e.g. `macho.uuid` -> `uuid`; a unit suffix such as
