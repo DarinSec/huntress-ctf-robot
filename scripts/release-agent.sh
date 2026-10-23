@@ -4,6 +4,7 @@
 # the branch and deploys it (scripts/homebase.sh deploy), and the robot sweeps again.
 #
 #   scripts/release-agent.sh <challenge-id> [--push]     one route
+#   scripts/release-agent.sh <id> --from <work folder>   a saved folder instead of prepare (offline)
 #   scripts/release-agent.sh --watch <day> [--max N]     after the release: every unsolved,
 #                                                        started route of the day, one by one
 #
@@ -20,8 +21,12 @@ state="${HUNTRESS_STATE_DIR:-$repo/.huntress}"
 export PYTHONPATH="$repo/src"
 lanes="${AGENT_LANES:-binary-reverse-engineering,metadata-forensics,mobile-android,script-analysis,warmups}"
 
-run_agent() {  # <challenge-id> [--push]
-  id="$1"; push="${2:-}"
+run_agent() {  # <challenge-id> [--push] [--from <work folder>]
+  id="$1"; shift; push=""; from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --push) push="--push" ;; --from) from="$2"; shift ;; esac
+    shift
+  done
   command -v claude > /dev/null || { echo "claude (Claude Code) is not installed here."; return 1; }
   safe=$(printf '%s' "$id" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-64)
   stamp=$(date +%Y%m%d-%H%M%S)
@@ -29,7 +34,9 @@ run_agent() {  # <challenge-id> [--push]
   dir="${AGENT_WORKTREES:-$HOME/agent-worktrees}/$safe-$stamp"
   mkdir -p "$(dirname "$dir")"
   git -C "$repo" worktree add -q -b "$branch" "$dir" HEAD || return 1
-  if ! (cd "$repo" && python3 -m huntress_ctf prepare "$id" --work-dir "$dir/work"); then
+  if [ -n "$from" ]; then  # A saved work folder (no network): assignment.json, artifact.bin, triage.md.
+    mkdir -p "$dir/work" && cp -r "$from" "$dir/work/$safe" && echo "Copied $from"
+  elif ! (cd "$repo" && python3 -m huntress_ctf prepare "$id" --work-dir "$dir/work"); then
     echo "Nothing to prepare for $id (wrong ID, or not started yet)."
     git -C "$repo" worktree remove --force "$dir"; git -C "$repo" branch -q -D "$branch"
     return 1
@@ -102,4 +109,4 @@ if at and s.get("questions"):
   exit 0
 fi
 
-run_agent "${1:?usage: release-agent.sh <challenge-id> [--push] | --watch <day> [--max N]}" "${2:-}"
+run_agent "${1:?usage: release-agent.sh <challenge-id> [--push] [--from <work folder>] | --watch <day> [--max N]}" "${@:2}"
