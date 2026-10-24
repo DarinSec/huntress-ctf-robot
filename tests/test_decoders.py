@@ -4,7 +4,7 @@ import time
 import unittest
 
 from huntress_ctf.decoders import (
-    MORSE, binary, decimal, extract_answer, hexadecimal, morse, peel, rot13,
+    MORSE, binary, decimal, extract_answer, hexadecimal, morse, peel, rot13, runlength,
 )
 from huntress_ctf.solvers import CluedTextDecoderSolver, LayeredDecodeSolver, SolveContext
 
@@ -39,6 +39,22 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(decimal(b"104, 105"), b"hi")
         self.assertIsNone(decimal(b"104 999"))
         self.assertEqual(rot13(rot13("Answer: x")), "Answer: x")
+
+    def test_runlength_count_char_pairs(self):
+        # Day 24 Warmups: "1:N,1:i,1:c,1:e" -> "Nice". A comma can be a character too.
+        self.assertEqual(runlength(b"1:N,1:i,1:c,1:e"), b"Nice")
+        self.assertEqual(runlength(b"3:a,2:b"), b"aaabb")
+        self.assertEqual(runlength(b"2:x,1:,,1:y"), b"xx,y")  # Comma as a character.
+        # Rejects anything that is not wholly count:char pairs.
+        self.assertIsNone(runlength(b"hello, world"))
+        self.assertIsNone(runlength(b"12:34 is the time"))
+        self.assertIsNone(runlength(b"1:a;1:b"))  # Wrong separator.
+        self.assertIsNone(runlength(b"0:a"))      # A zero count is not a run.
+        # End to end: the decoded line states the slug, and peel finds it via runlength.
+        blob = ",".join(f"1:{char}" for char in
+                         "To solve, submit this exact answer to the Game Master: jaunty-compass-mosaic-76").encode()
+        chains = {chain for chain, _, answer in peel(blob) if answer == "jaunty-compass-mosaic-76"}
+        self.assertIn(("runlength",), chains)
 
     def test_extract_answer_requires_one_explicit_statement(self):
         for text, expected in (

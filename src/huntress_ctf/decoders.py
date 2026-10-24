@@ -366,6 +366,40 @@ def nato(data: bytes) -> bytes | None:
     return " ".join("".join(_NATO[token] for token in word) for word in words).encode("ascii")
 
 
+_RL_TOKEN = re.compile(r"(\d{1,4}):(.)", re.S)
+
+
+def runlength(data: bytes) -> bytes | None:
+    """Run-length `count:char` pairs joined by commas (Day 24 Warmups):
+    "1:N,1:i,1:c,1:e" -> "Nice". A comma can itself be a character ("1:,"), so the tokens
+    are scanned left to right rather than split, and the whole text must be these pairs,
+    so this never fires on ordinary text."""
+    text = as_text(data)
+    if text is None or ":" not in text:
+        return None
+    pieces: list[str] = []
+    position = 0
+    while position < len(text):
+        match = _RL_TOKEN.match(text, position)
+        if not match:
+            return None
+        count = int(match.group(1))
+        if count < 1:
+            return None
+        pieces.append(match.group(2) * count)
+        position = match.end()
+        if position < len(text):  # A single comma separates tokens.
+            if text[position] != ",":
+                return None
+            position += 1
+    if not pieces:
+        return None
+    try:
+        return "".join(pieces).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
 def codepoints(data: bytes) -> bytes | None:
     """Unicode code points: "U+004E U+0069"."""
     text = as_text(data)
@@ -434,6 +468,7 @@ LAYERS = (
     # Not used by days 1-20; after the known ones, so they never crowd a known chain out.
     ("ascii85", ascii85), ("base85", base85), ("qp", quoted_printable), ("uu", uuencoded),
     ("zlib", inflated), ("braille", braille), ("nato", nato), ("unicode", codepoints),
+    ("runlength", runlength),  # Day 24: "1:N,1:i,1:c,1:e" -> "Nice".
 )
 # Letter rotations apply to any text, so they are tried only as a last step.
 FINAL_STEPS = (("rot13", rot13), ("rot47", rot47))
