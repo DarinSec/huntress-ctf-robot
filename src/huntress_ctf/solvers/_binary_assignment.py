@@ -155,6 +155,17 @@ class AssignedArchive:
         for index, match in enumerate(re.finditer(patterns[codec], data)):
             if index >= 4096 or len(match.group()) > 1024 * 1024:
                 raise ParseError("Encoded HCFG scan exceeds bound")
+            # A record is only ever read from byte 0 of the carrier (`record(raw, 0)`) and
+            # begins with b"HCFG", so a candidate must start with that magic encoded:
+            # "48434647" in hex, or "SENG" in both Base64 alphabets (base64(b"HCF")).
+            # A megabyte of binary is full of runs that look like hex or Base64; rejecting
+            # them on four bytes skips decoding each one. Day 23's Binary Single Solve
+            # spent 369 ms in four of these scans, a quarter of the whole solve.
+            if codec == "hex":
+                if match.group()[:8].lower() != b"48434647":
+                    continue
+            elif match.group()[:4] != b"SENG":  # Base64 is case-sensitive.
+                continue
             try:
                 encoded = match.group()
                 if codec == "hex":

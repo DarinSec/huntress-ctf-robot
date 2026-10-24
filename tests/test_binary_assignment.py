@@ -11,7 +11,7 @@ import zlib
 import zipfile
 
 from huntress_ctf.solvers.binary import BinarySolver
-from huntress_ctf.solvers._binary_assignment import config_at
+from huntress_ctf.solvers._binary_assignment import AssignedArchive, config_at
 from huntress_ctf.solvers._binary_formats import Neko, ParseError, PE
 from huntress_ctf.solvers._binary_managed import JavaClass, Jar, clr_version
 from tests.test_binary import pe_fixture, elf_fixture, bundle, context
@@ -216,3 +216,24 @@ class AssignedBinaryTests(unittest.TestCase):
         ])
         ctx=replace(ctx,attempt={**ctx.attempt,'artifacts':[{'filename':'evidence.zip'}]})
         self.assertEqual(BinarySolver().solve(ctx), [])
+
+    def test_an_encoded_record_is_found_past_a_megabyte_of_lookalike_runs(self):
+        # A record is read from byte 0 of its carrier and starts with b"HCFG", so a
+        # candidate must begin with "48434647" (hex) or "SENG" (both Base64 alphabets).
+        # Binary members are full of runs that only look like hex or Base64, and day 23's
+        # Single Solve spent 369 ms decoding them in four scans, so they are now rejected
+        # on those bytes. This pins the result of that shortcut, not its speed: with and
+        # without it the record is found and noise alone answers nothing.
+        import base64 as b64
+        record = config_record({"campaign": "synthetic-campaign-0001", "domain": "example.invalid",
+                                "url": "https://example.invalid/stage/one"})
+        noise = (b"0123456789abcdefABCDEF" * 40 + b"\0") * 400  # Long hex/Base64-looking runs.
+        archive = AssignedArchive.__new__(AssignedArchive)
+        for codec, carrier in (("hex", record.hex().encode()), ("base64", b64.b64encode(record)),
+                               ("base64url", b64.urlsafe_b64encode(record))):
+            archive.records, archive.digests = {}, {}
+            found = archive.encoded_config(noise + b"\0" + carrier + b"\0" + noise, codec, False)
+            self.assertIsNotNone(found, codec)
+            self.assertEqual(found.values["campaign"], "synthetic-campaign-0001", codec)
+            archive.records = {}
+            self.assertIsNone(archive.encoded_config(noise, codec, False), codec)  # Noise alone.
