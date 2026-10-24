@@ -28,7 +28,12 @@ import zipfile
 import zlib
 
 ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
-MAX_STEPS = 20_000_000
+# An answer-code method is short: day 24's apps run ~55k steps (63 ms) at ~0.9M steps/s.
+# A runaway or adversarial method that only hits the cap wins nothing anyway (the question
+# then falls back to the literal scan), and the old 20M cap let it mill for ~23 s first --
+# two such apps in a Mastery made its timed race 52 s and unresolved. 3M keeps ~55x headroom
+# over a real app and fails a runaway in ~3.4 s instead.
+MAX_STEPS = 3_000_000
 M32, M64 = 0xFFFFFFFF, (1 << 64) - 1
 ACC_STATIC, ACC_NATIVE = 0x8, 0x100
 
