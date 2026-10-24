@@ -125,6 +125,41 @@ class AssignedBinaryTests(unittest.TestCase):
         got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context(differ, prompts))}
         self.assertEqual(got, {'u_analysis_corrected_config_campaign': 'synthetic-campaign'})
 
+    def test_untimed_fallbacks_answer_wording_no_rule_knows(self):
+        # A new day's wording, anticipated (the fallbacks are untimed only, CRC32/JSON-checked):
+        # a named carrier that finds nothing is searched like an unknown one; a selector no rule
+        # knows answers the config every member agrees on; a role pair is picked by the answer
+        # ID's role word (<prefix>...-<role>.<ext>), as days 15, 16, 21 and 24 name them.
+        def native(campaign):
+            return pe_fixture() + b'\0' + config_record({'campaign': campaign, 'padding': 'fixture' * 12})
+        field = " Submit the exact string value of the decoded HCFG JSON object's top-level campaign property."
+        literal = 'Scan the specified member for literal HCFG magic and accept the first record whose bounds, CRC32, and decoded JSON are valid.'
+        def solve(files, prompts, timed=False):
+            ctx = archive_context(files, prompts)
+            if timed:
+                ctx = replace(ctx, attempt=dict(ctx.attempt, deadline='2026-10-24T13:00:00Z'))
+            return {c.answer_id: c.answer for c in BinarySolver().solve(ctx)}
+
+        # The named Base64 rule finds nothing (the record is literal): untimed, the search finds it.
+        named = [('d97_analysis_config_campaign', 'In evidence.zip, Use all d97-- members in ZIP central-directory order. '
+                  'Test every non-overlapping Latin-1 run matching [A-Za-z0-9+/]{100,}={0,2} by Base64-decoding it.' + field)]
+        files = {'d97--sample.exe': native('carrier-fallback')}
+        self.assertEqual(solve(files, named), {'d97_analysis_config_campaign': 'carrier-fallback'})
+        self.assertEqual(solve(files, named, timed=True), {})
+
+        shared = [('d98_analysis_config_campaign', 'In evidence.zip, Compare the d98-- builds and use the config they have in common. ' + literal + field)]
+        same = {'d98--sample-alpha.exe': native('shared'), 'd98--sample-beta.exe': native('shared')}
+        self.assertEqual(solve(same, shared), {'d98_analysis_config_campaign': 'shared'})
+        self.assertEqual(solve(same, shared, timed=True), {})
+        self.assertEqual(solve({'d98--sample-alpha.exe': native('one'), 'd98--sample-beta.exe': native('two')}, shared), {})
+
+        role = [('d99_analysis_patched_config_campaign', 'In evidence.zip, Read the d99-- patched build. ' + literal + field),
+                ('d99_analysis_unpatched_config_campaign', 'In evidence.zip, Read the d99-- unpatched build. ' + literal + field)]
+        pair = {'d99--sample-unpatched.exe': native('before'), 'd99--sample-patched.exe': native('after')}
+        expected = {'d99_analysis_patched_config_campaign': 'after', 'd99_analysis_unpatched_config_campaign': 'before'}
+        self.assertEqual(solve(pair, role), expected)
+        self.assertEqual(solve(pair, role, timed=True), expected)  # The role rule is exact, not a guess.
+
     def test_base64_config_records_keep_carrier_offset(self):
         original=pe_fixture()
         record=config_record({'campaign':'synthetic-campaign','domain':'example.invalid','padding':'fixture'*12})
