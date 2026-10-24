@@ -256,6 +256,53 @@ def _hedged_download(
 
 GATE_SAMPLES = 3
 GATE_PAUSE_SECONDS = 30.0
+
+# A web start answers before its live target is up: it reports `preparing`, with targets[]
+# listed but no answer_ids and no deadline yet (AGENTS guidance). Polling status until the
+# target is ready is read-only (no variant) and happens before the clock, like the gate.
+TARGET_READY_BUDGET_S = 120.0
+TARGET_POLL_INTERVAL_S = 3.0
+
+
+def _target_not_ready(attempt: Any) -> bool:
+    """True while a web start reports its target is still being prepared.
+
+    Signalled by a `preparing` status/state, or by targets[] with no answer_ids yet: in
+    either case a handler has nothing to read, so the run would report unresolved at once.
+    """
+    fields = current_fields(attempt)
+    labels = {str(fields.get(key)).casefold() for key in ("status", "state", "result", "target_status")}
+    if "preparing" in labels or fields.get("preparing") is True:
+        return True
+    targets = fields.get("targets")
+    return bool(isinstance(targets, list) and targets) and not fields.get("answer_ids")
+
+
+def _await_target_ready(
+    client: GameMasterClient, challenge_id: str, run: Run, sleep: Callable[[float], None],
+    *, budget_s: float = TARGET_READY_BUDGET_S, interval_s: float = TARGET_POLL_INTERVAL_S,
+) -> None:
+    """Poll status until the web target is prepared or the budget runs out (read-only).
+
+    The clock has not started yet (no deadline while preparing), so this is free the way
+    the gate is. A poll also counts as activity, which keeps the untimed attempt alive.
+    """
+    waited = 0.0
+    while _target_not_ready(run.attempt) and waited < budget_s:
+        sleep(interval_s)
+        waited += interval_s
+        try:
+            run.attempt = client.status(challenge_id)
+        except GameMasterError:
+            break
+        run.started = AttemptState.parse(run.attempt)
+        fresh = current_fields(run.attempt).get("targets")
+        if isinstance(fresh, list) and fresh:
+            run.targets = fresh
+    run.notes.append(
+        f"Web target ready after ~{waited:.0f} s of polling." if not _target_not_ready(run.attempt)
+        else f"Web target still preparing after {waited:.0f} s; nothing was submitted."
+    )
 HEDGE_MAX_BYTES = 4 * 1024 * 1024
 GATE_BYTES_PER_MS = 4000  # ~4 MB/s through the Homebase proxy.
 
@@ -302,9 +349,13 @@ def _workable(state: AttemptState) -> bool:
 def _race(
     client: GameMasterClient, challenge_id: str, challenge: dict[str, Any],
     run: Run, artifact_dir: Path, hint: dict[str, Any] | None,
-    clock: Callable[[], float],
+    clock: Callable[[], float], sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """The on-clock critical path. No output, no disk, no extra requests."""
+    """The on-clock critical path. No output, no disk, no extra requests.
+
+    The one exception is a web target still `preparing`: status is polled until it is
+    ready, which happens before the clock (there is no deadline yet), like the gate.
+    """
     retry = run.route == "retry"
     early: Any = None
     run.wall["start sent"] = time.time()
@@ -321,6 +372,9 @@ def _race(
     if isinstance(targets, list) and targets and not listed:
         # Web: there is no file to download. A handler reads the flag from the target.
         run.targets = targets
+        if _target_not_ready(run.attempt):
+            # The start came back before the target was up; wait for it (read-only).
+            _await_target_ready(client, challenge_id, run, sleep)
         _solve_targets(client, challenge_id, challenge, run, clock)
         return
     if not _workable(run.started):
@@ -712,7 +766,7 @@ def run_fast(
     if collecting:
         gc.disable()
     try:
-        _race(client, challenge_id, challenge, run, artifact_dir, hint, clock)
+        _race(client, challenge_id, challenge, run, artifact_dir, hint, clock, sleep)
     finally:
         if collecting:
             gc.enable()

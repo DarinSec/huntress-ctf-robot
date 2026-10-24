@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Any, Mapping, Protocol
@@ -29,6 +29,9 @@ class SolveContext:
     answer_ids: tuple[str, ...]
     members: tuple[Member, ...] = ()
     hint: Mapping[str, Any] | None = None
+    # One slot for the parsed question list, shared by every solver of one run. The
+    # context is frozen, so the list it holds is the only mutable part.
+    cache: list[list[Any]] = field(default_factory=list, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ TEXT_FIELDS = ("description", "instructions", "prompt", "question", "text")
 
 def questions(context: SolveContext) -> list[tuple[str, str]]:
     """(answer_id, question text) pairs when the service ties questions to answer IDs."""
+    issued = frozenset(context.answer_ids)  # O(1) membership; a Mastery issues thousands.
     pairs: dict[str, str] = {}
     for source in (context.challenge, current_fields(context.attempt)):
         items = source.get("questions")
@@ -66,7 +70,7 @@ def questions(context: SolveContext) -> list[tuple[str, str]]:
                 continue
             answer_id = item.get("answer_id", item.get("id"))
             text = " ".join(item[key] for key in TEXT_FIELDS if isinstance(item.get(key), str))
-            if answer_id in context.answer_ids and text:
+            if answer_id in issued and text:
                 pairs[answer_id] = text
     return list(pairs.items())
 
@@ -84,14 +88,22 @@ def question_items(context: SolveContext) -> list[Question]:
     """Issued questions with the artifact each names and its answer format.
 
     Live shape: questions[{id, question, artifact, answer_format{kind, syntax|...}}].
+
+    Every lane's solver starts here, and a Mastery assignment issues thousands of
+    questions, so the result is built once per context and read from `cache` after that:
+    on a 9,310-question corpus the first call is ~70 ms and the rest are free (before,
+    each call scanned the answer_ids tuple per question - 365 ms, paid by every solver).
     """
+    if context.cache:
+        return list(context.cache[0])
+    issued = frozenset(context.answer_ids)
     items: dict[str, Question] = {}
     for source in (context.challenge, current_fields(context.attempt)):
         for item in source.get("questions") or ():
             if not isinstance(item, dict):
                 continue
             answer_id = item.get("answer_id", item.get("id"))
-            if answer_id not in context.answer_ids:
+            if answer_id not in issued:
                 continue
             text = " ".join(item[key] for key in TEXT_FIELDS if isinstance(item.get(key), str))
             artifact = item.get("artifact")
@@ -100,7 +112,9 @@ def question_items(context: SolveContext) -> list[Question]:
                 answer_id, text, artifact if isinstance(artifact, str) else None,
                 answer_format if isinstance(answer_format, dict) else {}, item.get("set"),
             )
-    return list(items.values())
+    questions = list(items.values())
+    context.cache.append(questions)  # The one-slot memo of a frozen context.
+    return list(questions)
 
 
 # Answer-format syntaxes seen live, as the patterns they describe.

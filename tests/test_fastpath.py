@@ -442,5 +442,64 @@ class FastPathTests(unittest.TestCase):
         self.assertIn("HTTP 404", self.output.getvalue())
 
 
+class WebClient(FakeClient):
+    """A web start that reports `preparing` for a few polls, then issues answer_ids."""
+
+    def __init__(self, stdout, *, prepares=2):
+        super().__init__(stdout)
+        self.prepares = prepares
+        self.target = [{"url": "https://target.example/app"}]
+        self.preparing = {"attempt_id": "w", "status": "preparing", "targets": self.target}
+        self.ready = {"attempt_id": "w", "answer_ids": ["flag"], "state": "active", "targets": self.target}
+
+    def start(self, challenge_id, timed=False):
+        self.calls.append(("start", timed))
+        return deepcopy(self.preparing)
+
+    def status(self, challenge_id):
+        self.calls.append("status")
+        if self.prepares > 0:
+            self.prepares -= 1
+            return deepcopy(self.preparing)
+        return deepcopy(self.ready)
+
+
+class _StubHandler:
+    name = "stub"
+
+    def solve(self, context):
+        return [AnswerCandidate("flag", "flag{ready}", self.name, "read from the prepared target")]
+
+
+class WebTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = StringIO()
+
+    def run_web(self, client, **kwargs):
+        root = Path(self.directory.name)
+        with redirect_stdout(self.output), patch("huntress_ctf.solvers.web.WEB_SOLVERS", (_StubHandler(),)):
+            return run_fast(
+                client, "c", challenge={"id": "c", "lane": "web-exploitation"},
+                artifact_dir=root, work_dir=root / "work", hints_path=root / "hints.json",
+                ntp=lambda: None, clock=lambda: 0.0, sleep=lambda _s: None, **kwargs,
+            )
+
+    def test_a_preparing_target_is_polled_until_ready_then_solved(self):
+        client = WebClient(self.output, prepares=2)
+        self.assertEqual(self.run_web(client), COMPLETE)
+        # Three polls in the loop (two preparing, one ready) plus the post-run status read.
+        self.assertEqual(client.calls.count("status"), 4)
+        self.assertIn(("submit_many", {"flag": "flag{ready}"}), client.calls)
+        self.assertIn("Web target ready", self.output.getvalue())
+
+    def test_a_target_that_never_readies_submits_nothing(self):
+        client = WebClient(self.output, prepares=10_000)  # Always preparing.
+        self.assertEqual(self.run_web(client), UNRESOLVED)
+        self.assertNotIn(True, [isinstance(c, tuple) and c[0] == "submit_many" for c in client.calls])
+        self.assertIn("still preparing", self.output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
