@@ -59,6 +59,7 @@ TEXT_FIELDS = ("description", "instructions", "prompt", "question", "text")
 
 def questions(context: SolveContext) -> list[tuple[str, str]]:
     """(answer_id, question text) pairs when the service ties questions to answer IDs."""
+    issued = frozenset(context.answer_ids)  # O(1) membership; a Mastery issues thousands.
     pairs: dict[str, str] = {}
     for source in (context.challenge, current_fields(context.attempt)):
         items = source.get("questions")
@@ -69,7 +70,7 @@ def questions(context: SolveContext) -> list[tuple[str, str]]:
                 continue
             answer_id = item.get("answer_id", item.get("id"))
             text = " ".join(item[key] for key in TEXT_FIELDS if isinstance(item.get(key), str))
-            if answer_id in context.answer_ids and text:
+            if answer_id in issued and text:
                 pairs[answer_id] = text
     return list(pairs.items())
 

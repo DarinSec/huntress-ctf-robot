@@ -142,10 +142,11 @@ class JsonAnswerMapSolver:
             ]
         else:
             return []
+        issued = frozenset(context.answer_ids)  # O(1) per entry; the map can be large.
         candidates = []
         for answer_id, value in items:
             if (
-                answer_id in context.answer_ids
+                answer_id in issued
                 and type(value) in (str, int)
                 and str(value)
             ):
