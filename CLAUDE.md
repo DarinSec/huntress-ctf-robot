@@ -88,7 +88,11 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   grader-chosen spelling (a machine field as a label, a decimal or a hex code) heals
   itself within the day; `report["alternatives"]` names the one that was accepted.
 - Web routes return `targets[]` and no file: nothing is downloaded, and `daily` skips
-  them unless asked with `--lane web-exploitation`.
+  them unless asked with `--lane web-exploitation`. A web start can answer before its
+  live target is up (`preparing`, with `targets[]` but no answer_ids and no deadline);
+  the robot then polls status (read-only, no variant, before the clock) up to
+  `TARGET_READY_BUDGET_S` until answer_ids are issued, then a handler reads the flag. A
+  target that never readies submits nothing (`fastpath._target_not_ready`/`_await_target_ready`).
 
 ## Lane status
 
