@@ -29,9 +29,10 @@ def archive_context(files, prompts):
     return replace(ctx, attempt={"questions": qs}, answer_ids=tuple(q["id"] for q in qs))
 
 
-def java_fixture():
-    strings = ["Fixture", "java/lang/Object", "<init>", "()V", "main", "([Ljava/lang/String;)V",
-               base64.b64encode(config_record()).decode()]
+def java_fixture(name="Fixture", record=b"default"):
+    strings = [name, "java/lang/Object", "<init>", "()V", "main", "([Ljava/lang/String;)V"]
+    if record:
+        strings.append(base64.b64encode(config_record() if record == b"default" else record).decode())
     constants = []
     indices = {}
     for text in strings:
@@ -39,7 +40,7 @@ def java_fixture():
         raw = text.encode()
         constants.append(b"\x01" + struct.pack(">H", len(raw)) + raw)
     this = len(constants) + 1
-    constants.append(b"\x07" + struct.pack(">H", indices['Fixture']))
+    constants.append(b"\x07" + struct.pack(">H", indices[name]))
     parent = len(constants) + 1
     constants.append(b"\x07" + struct.pack(">H", indices['java/lang/Object']))
     header = struct.pack(">IHHH", 0xcafebabe, 0, 52, len(constants) + 1)
@@ -99,6 +100,30 @@ class AssignedBinaryTests(unittest.TestCase):
         got={c.answer_id:c.answer for c in BinarySolver().solve(archive_context({'unit--java.jar':jar},prompts))}
         self.assertEqual(got,{'unit_analysis_format':'JAR','unit_analysis_methods':'["<init>","main"]','unit_analysis_flags':'33','unit_analysis_codecs':'[0,8]','unit_analysis_campaign':'synthetic-campaign'})
         with self.assertRaises(ValueError): JavaClass(java_fixture()[:-1])
+
+    def test_jar_config_in_companion_class_and_role_pair(self):
+        # Day 24: Scala builds keep the HCFG constant in Main$ (not the Main-Class), and the
+        # shared config questions name both role members and require equal configs.
+        def jar(record):
+            blob = BytesIO()
+            with zipfile.ZipFile(blob, 'w') as archive:
+                archive.writestr('META-INF/MANIFEST.MF', b'Manifest-Version: 1.0\r\nMain-Class: Main\r\n\r\n')
+                archive.writestr('Main$.class', java_fixture('Main$', record))
+                archive.writestr('Main.class', java_fixture('Main', None))
+            return blob.getvalue()
+        rule = ('Parse every JAR classfile constant pool; for Base64-alphabet UTF-8 constants of at least 80 characters, '
+                'Base64-decode and accept the first CRC32-valid HCFG JSON record. Submit the exact string value of the '
+                'decoded HCFG JSON object\'s top-level campaign property, without JSON quotes.')
+        prompts = [('u_analysis_config_campaign', 'In evidence.zip, Decode both unit-- role members and require their config objects to be byte-for-byte equal before using the common value. ' + rule),
+                   ('u_analysis_corrected_config_campaign', 'In evidence.zip, Use the unique unit-- member whose basename ends corrected.jar. ' + rule)]
+        padded = config_record({'campaign': 'synthetic-campaign', 'padding': 'fixture' * 12})
+        same = {'unit--sample-vulnerable.jar': jar(padded), 'unit--sample-corrected.jar': jar(padded)}
+        got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context(same, prompts))}
+        self.assertEqual(got, {'u_analysis_config_campaign': 'synthetic-campaign', 'u_analysis_corrected_config_campaign': 'synthetic-campaign'})
+        other = config_record({'campaign': 'other-campaign', 'padding': 'fixture' * 12})
+        differ = {'unit--sample-vulnerable.jar': jar(other), 'unit--sample-corrected.jar': jar(padded)}
+        got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context(differ, prompts))}
+        self.assertEqual(got, {'u_analysis_corrected_config_campaign': 'synthetic-campaign'})
 
     def test_base64_config_records_keep_carrier_offset(self):
         original=pe_fixture()

@@ -397,9 +397,17 @@ class AssignedArchive:
                 configs = {PurePosixPath(x.filename).name for x in infos if x.filename.endswith(".runtimeconfig.json")}
                 chosen = [(i, x) for i, x in chosen
                           if PurePosixPath(x.filename).name.rsplit(".", 1)[0] + ".runtimeconfig.json" in configs]
+        if len(chosen) == 2 and "require their config objects to be byte-for-byte equal" in q:
+            # Day 24: "Decode both d24-- role members" (vulnerable and corrected build) and
+            # answer only the config they share; a mismatch has no common value.
+            members = [self.member(reference, blob, index, info) for index, info in chosen]
+            shared = {(c.crc, json.dumps(c.values, sort_keys=True)) for c in (self.config(question, m) for m in members)}
+            return members[0] if len(shared) == 1 else None
         if len(chosen) != 1:
             return None
-        index, info = chosen[0]
+        return self.member(reference, blob, *chosen[0])
+
+    def member(self, reference: str, blob: bytes, index: int, info: zipfile.ZipInfo) -> bytes:
         key = (id(blob), index)
         if key in self.content:
             return self.content[key]
@@ -504,16 +512,19 @@ class AssignedArchive:
                     node = Config(section.offset, node.version, node.key, node.crc, node.values, "raw_hcfg_section")
             elif scope_key == "jar":
                 node = None
-                for offset, text in self.jar(data).main.utf8:
-                    if len(text) < 80 or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", text):
-                        continue
-                    try:
-                        raw = base64.b64decode(text, validate=True)
-                    except binascii.Error:
-                        continue
-                    candidate = self.record(raw, 0)
-                    if candidate:
-                        node = Config(offset, candidate.version, candidate.key, candidate.crc, candidate.values, "base64")
+                for javaclass in self.jar(data).classes():
+                    for offset, text in javaclass.utf8:
+                        if len(text) < 80 or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", text):
+                            continue
+                        try:
+                            raw = base64.b64decode(text, validate=True)
+                        except binascii.Error:
+                            continue
+                        candidate = self.record(raw, 0)
+                        if candidate:
+                            node = Config(offset, candidate.version, candidate.key, candidate.crc, candidate.values, "base64")
+                            break
+                    if node:
                         break
             elif scope_key.startswith(("hex_", "base64url_")):
                 codec = scope_key.split("_")[0]
