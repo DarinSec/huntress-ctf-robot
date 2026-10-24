@@ -9,6 +9,7 @@ import json
 import struct
 import unittest
 import zipfile
+from types import SimpleNamespace
 
 from huntress_ctf import dexvm
 from huntress_ctf.solvers.mobile_puzzle import answer_code
@@ -138,6 +139,23 @@ class DexVmTests(unittest.TestCase):
     def test_day23_analysis_puzzle_goes_through_the_emulator(self):
         puzzle = {"schema": "huntress.mobile.puzzle.v2", "day": 23, "codec": "analysis", "build": "x"}
         self.assertEqual(answer_code(apk(release_dex(), puzzle)), expected())
+
+    def test_step_cap_fails_a_runaway_fast_without_losing_real_apps(self):
+        # A real answer-code method runs ~55k steps; the release fixture above proves one
+        # still solves under the cap. The cap only bounds a runaway (which wins nothing),
+        # and at ~0.9M steps/s it must fail in a few seconds, not the 23 s the old 20M cap
+        # cost -- two such apps made day 24's Android Mastery race 52 s and unresolved.
+        self.assertLessEqual(dexvm.MAX_STEPS, 5_000_000)
+        machine = dexvm.Machine.__new__(dexvm.Machine)
+        machine.steps = 0
+        machine.classes = {}
+        machine.dexes = [SimpleNamespace(classes={})]  # _dex_of falls back to this; goto needs no dex.
+        loop = dexvm.Method.__new__(dexvm.Method)
+        loop.insns = [0x0028]  # goto 0: a one-instruction infinite loop.
+        loop.cls = None
+        with self.assertRaises(dexvm.Unsupported):
+            machine._run(loop, [])
+        self.assertGreater(machine.steps, dexvm.MAX_STEPS)  # It ran to the cap, then stopped.
 
     def test_platform_calls_outside_the_allow_list_stop_the_run(self):
         with self.assertRaises(dexvm.Unsupported):
