@@ -102,5 +102,90 @@ class ScriptSolverTest(unittest.TestCase):
         self.assertIsNone(scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-mystery_b64-{packed}\n"))
 
 
+RECORD = b"v=1|steps=acquire_remote,write_file|campaign_id=CAMP-ab12cd|url=https://stage.example.invalid/x"
+
+
+def _cbc_encrypt(key, iv, plain):
+    from huntress_ctf import ciphers
+    pad = 16 - len(plain) % 16
+    plain, keys, out, prior = plain + bytes([pad]) * pad, ciphers.expand_key(key), b"", iv
+    for i in range(0, len(plain), 16):
+        prior = ciphers.encrypt_block(keys, bytes(a ^ b for a, b in zip(plain[i:i + 16], prior)))
+        out += prior
+    return out
+
+
+class AnticipatedScriptTest(unittest.TestCase):
+    """Days 26+: RC4/AES with the key the script carries, obfuscators, layers and families no day used."""
+
+    def test_rc4_and_aes_records_with_the_scripts_own_key(self):
+        from huntress_ctf import ciphers
+        from huntress_ctf.analysis import scripts
+        key, iv = b"Sup3rS3cretKey!!", bytes(range(16))
+        cases = {
+            "rc4": '$key = "rc4-loader-key"\n$blob = "%s"\n' % base64.b64encode(ciphers.rc4(b"rc4-loader-key", RECORD)).decode(),
+            "aes_cbc": 'KEY = b"%s"\ndata = "%s"\n' % (key.decode(), base64.b64encode(iv + _cbc_encrypt(key, iv, RECORD)).decode()),
+            "aes_ctr": 'secret_key = "%s"\nnonce = "%s"\nmaterial = "%s"\n' % (
+                base64.b64encode(key).decode(), iv.hex(), base64.b64encode(ciphers.ctr(key, iv, RECORD)).decode()),
+        }
+        for name, text in cases.items():
+            found = scripts.recover(text)
+            self.assertEqual((found["plaintext"].encode(), found["chain"].split("|")[1]), (RECORD, name))
+        # A declared AES codec may name its key array anything.
+        declared = 'CODEC = "base64|aes_cbc"\n$k = [byte[]](%s)\n$v = [byte[]](%s)\nMATERIAL = "%s"\n' % (
+            ",".join(map(str, key)), ",".join(map(str, iv)), base64.b64encode(_cbc_encrypt(key, iv, RECORD)).decode())
+        self.assertEqual(scripts.recover(declared)["plaintext"].encode(), RECORD)
+
+    def test_wrong_key_and_xor_days_unchanged(self):
+        from huntress_ctf import ciphers
+        from huntress_ctf.analysis import scripts
+        wrong = '$key = "not-the-key"\n$blob = "%s"\n' % base64.b64encode(ciphers.rc4(b"rc4-loader-key", RECORD)).decode()
+        self.assertIsNone(scripts.recover(wrong))
+        xor = 'MATERIAL = "%s"\nCODEC = "hex_pairs|xor_5a"\n' % bytes(b ^ 0x5A for b in RECORD).hex()
+        self.assertEqual(scripts.recover(xor)["chain"], "hex_pairs|single_byte_xor|5a")
+        self.assertEqual(scripts.harvest_secrets('private_key = "abcd1234"')[0], (b"abcd1234", None))
+
+    def test_deobfuscators(self):
+        from huntress_ctf.analysis.deobfuscate import deobfuscate, unpack_packer
+        self.assertIn('"Hi"', deobfuscate("var a = String.fromCharCode(72, 0x69);"))
+        self.assertIn('"Hi"', deobfuscate("$a = [char]72+[char]105"))
+        self.assertIn('"Hi"', deobfuscate("$a = -join [char[]](72,105)"))
+        self.assertIn('"Hi"', deobfuscate('a = Chr(72) & Chr(105)'))
+        self.assertIn('"Hi"', deobfuscate("a = bytes([72, 105]).decode()"))
+        self.assertIn("'ab'", deobfuscate('$a = ("{1}{0}" -f \'b\',\'a\')'))
+        self.assertIn("IEX", deobfuscate("I`E`X $x"))
+        self.assertIn("echo ell", deobfuscate("set v=hello\necho %v:~1,3%\n"))
+        packed = "eval(function(p,a,c,k,e,d){}('0 1=\\'2\\';',3,3,'var|x|hidden'.split('|'),0,{}))"
+        self.assertEqual(unpack_packer(packed), "var x='hidden';")
+        encoded = base64.b64encode("Write-Host secret".encode("utf-16-le")).decode()
+        self.assertIn("Write-Host secret", deobfuscate(f"powershell -enc {encoded}"))
+        self.assertEqual(deobfuscate("plain text"), "plain text")
+
+    def test_obfuscated_header_and_unknown_family_answer(self):
+        # A family no day used yet (lua), whose HUNTRESS header is built with string.char codes.
+        header = f"HUNTRESS_ANALYSIS_V1:B64-{base64.b64encode(DESCRIPTOR.encode()).decode()}"
+        name = "5f33a0.js"
+        text = f"var h = String.fromCharCode({','.join(str(ord(c)) for c in header)});\n"
+        art = f"evidence.zip -> {name}"
+        questions = [{"id": f"lua-5f33a0-{f}", "question": "?", "artifact": art,
+                      "answer_format": {"kind": "exact_text"}} for f in ("campaign", "campaign-token", "url")]
+        ctx = context(name, questions)
+        ctx = SolveContext(ctx.challenge_id, ctx.challenge, ctx.attempt, ctx.artifact,
+                           ctx.artifact_path, ctx.answer_ids, members=(Member(name, text.encode()),))
+        got = {c.answer_id.rsplit("5f33a0-", 1)[1]: c.answer for c in ScriptSolver().solve(ctx)}
+        self.assertEqual(got, {"campaign": "TEST-abc123", "campaign-token": "abc123",
+                               "url": "https://test-abc123.example.invalid/stage"})
+
+    def test_more_layers(self):
+        import bz2
+        from huntress_ctf.analysis import scriptrules
+        packed = base64.b64encode(bz2.compress(DESCRIPTOR.encode())).decode()
+        self.assertEqual(scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-bz2_b64-{packed}\n")["campaign_id"], "TEST-abc123")
+        xored = base64.b64encode(bytes(b ^ 0x3C for b in DESCRIPTOR.encode())).decode()
+        self.assertEqual(scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-xor3c_b64-{xored}\n")["campaign_id"], "TEST-abc123")
+        broken = base64.b64encode(b"\xfd7zXZ\x00broken").decode()  # lzma.LZMAError: no data, no crash
+        self.assertIsNone(scriptrules.analysis_header(f"# HUNTRESS_ANALYSIS_V1:LYR-xz_b64-{broken}\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
