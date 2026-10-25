@@ -87,6 +87,10 @@ def statuses(outcomes):
 
 @unittest.skipUnless("fork" in __import__("multiprocessing").get_all_start_methods(), "needs fork")
 class ForkedWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        STOP.clear()  # A child inherits STOP as it is at the fork: set, a hang would just return.
+        self.addCleanup(release_hangs)
+
     def test_a_hang_is_killed_after_its_budget_and_the_others_still_answer(self):
         began = time.monotonic()
         found, outcomes = watchdog.run_solvers(

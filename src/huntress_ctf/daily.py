@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
+import json
 from pathlib import Path
 import sys
 import threading
@@ -23,6 +24,7 @@ from .display import print_result
 from .fastpath import TARGET_LANES, lane_of, run_fast
 from .hints import TURNED_DOWN_KEYS, load_hints, record_outcome, record_race
 from .learn import run_learn
+from .solvers import LOAD_ERRORS
 from .state import AttemptState, mode_name
 
 # Lanes whose solver answers every variant of a day once its Single Solve scored
@@ -246,6 +248,7 @@ def run_daily(
     if lanes:
         records = [record for record in records if lane_of(record, str(_id(record))) in lanes]
     hints = load_hints(hints_path)
+    problems: dict[Any, list[dict[str, Any]]] = {}  # Per route: solvers the watchdog left out.
 
     def run_one(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
         challenge_id = _id(record)
@@ -257,10 +260,12 @@ def run_daily(
             return entry
         began = clock()
         on_clock: list[float] = []
+        reports: list[dict[str, Any]] = []
         try:
             for number in range(1, (max(repeat, 1) if timed else 1) + 1):
                 print(f"\n===== {challenge_id} ({'timed race ' + str(number) if timed else 'untimed'}) =====")
                 report: dict[str, Any] = {}
+                reports.append(report)
                 # The record from this list is passed on, so no run fetches the list again.
                 code = run_fast(
                     target, challenge_id, timed=timed, challenge=record,
@@ -290,6 +295,9 @@ def run_daily(
                 print(note)
         except GameMasterError as exc:
             entry = {"challenge": challenge_id, "outcome": "error", "reason": str(exc)}
+        found = [problem for report in reports for problem in report.get("solver_problems", ())]
+        if found:  # Each race of a --repeat names the same left-out solver: once is enough.
+            problems[challenge_id] = list({json.dumps(p, sort_keys=True): p for p in found}.values())
         if on_clock:
             entry["on_clock_ms"] = on_clock
             entry["best_on_clock_ms"] = min(on_clock)
@@ -303,13 +311,40 @@ def run_daily(
         summary = [entries[id(record)] for record in records]
     else:
         summary = _run_families(client, records, run_one, workers)
-    print("\n===== Summary =====")
-    print_result({
+    result: dict[str, Any] = {
         "mode": "timed" if timed else "untimed", "challenges": summary,
         "wall_seconds": round(clock() - began_all, 3),
-    })
+    }
+    safe = safe_mode(summary, problems)
+    if safe:
+        result["safe_mode"] = safe
+    print("\n===== Summary =====")
+    print_result(result)
     ran = [entry for entry in summary if entry["outcome"] != "skipped"]
     return COMPLETE if all(entry["outcome"] == "complete" for entry in ran) else UNRESOLVED
+
+
+def safe_mode(summary: list[dict[str, Any]], problems: dict[Any, list[dict[str, Any]]]) -> dict[str, Any]:
+    """What the sweep left out and why (ROBUSTNESS.md workstream 6), {} when nothing was.
+
+    One place to look on a new day: solver modules that did not load (their lane answers
+    without them), solvers the watchdog left out, killed or skipped, and routes held back by
+    an error or by a mode before them. Routine skips (already solved, raced, web) stay out.
+    It stays inside the summary's one JSON object, which release_report.py parses whole, and
+    names no "outcome", so homebase-day.sh's retry grep sees only the routes' own.
+    """
+    block: dict[str, Any] = {}
+    if LOAD_ERRORS:
+        block["load_errors"] = list(LOAD_ERRORS)
+    found = [{"challenge": entry["challenge"], **problem}
+             for entry in summary for problem in problems.get(entry["challenge"], ())]
+    if found:
+        block["solver_problems"] = found
+    held = [{"challenge": entry["challenge"], "reason": entry.get("reason", "")} for entry in summary
+            if entry["outcome"] == "error" or entry.get("blocked_by") or entry.get("blocks_family")]
+    if held:
+        block["held_back"] = held
+    return block
 
 
 def _run_group(
@@ -326,7 +361,8 @@ def _run_group(
     blocked = None
     for record in group:
         if blocked:
-            entries[id(record)] = {"challenge": _id(record), "outcome": "skipped", "reason": blocked}
+            entries[id(record)] = {"challenge": _id(record), "outcome": "skipped",
+                                   "reason": f"{blocked} is not solved yet", "blocked_by": blocked}
             continue
         try:
             entry = run_one(target, record)
@@ -335,7 +371,7 @@ def _run_group(
             entry = {"challenge": _id(record), "outcome": "error", "reason": repr(exc)}
         entries[id(record)] = entry
         if entry["outcome"] not in ("complete", "skipped") or entry.get("blocks_family"):
-            blocked = f"{_id(record)} is not solved yet"
+            blocked = _id(record)
 
 
 def _run_families(
@@ -348,11 +384,20 @@ def _run_families(
 
     def run_family(group: list[dict[str, Any]]) -> None:
         output.begin()
-        target = client.clone()
         try:
-            _run_group(target, group, run_one, entries)
+            target = client.clone()
+            try:
+                _run_group(target, group, run_one, entries)
+            finally:
+                target.close()
+        except Exception as exc:
+            # A connection that cannot open costs this family alone (its routes are errors, so
+            # day.sh sweeps again); one that fails to close keeps the results already in.
+            traceback.print_exc(file=sys.stdout)
+            for record in group:
+                entries.setdefault(id(record), {"challenge": _id(record), "outcome": "error",
+                                                "reason": f"this family's connection failed: {exc!r}"})
         finally:
-            target.close()
             output.end()
 
     sys.stdout = output

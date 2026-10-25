@@ -65,6 +65,11 @@ class Outcome:
         return f"watchdog: {self.solver} {self.status} after {self.seconds:.1f} s" + (
             f" ({self.detail})" if self.detail else "")
 
+    def report(self, stage: str) -> dict[str, Any]:
+        """This outcome for the sweep summary's safe-mode block; `stage` is warm-up or race."""
+        return {"stage": stage, "solver": self.solver, "status": self.status,
+                "seconds": round(self.seconds, 1), "detail": self.detail}
+
 
 def solver_name(solver: Any) -> str:
     return getattr(solver, "name", None) or type(solver).__name__

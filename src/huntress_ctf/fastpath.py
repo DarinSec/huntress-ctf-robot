@@ -37,7 +37,7 @@ from . import corpus, network
 from .solvers import LOAD_ERRORS, SOLVERS, AnswerCandidate, Solver, SolveContext
 from .solvers.base import question_items
 from .state import AttemptState, current_fields, deliveries, mode_name, remember_identity
-from .watchdog import race_deadline, run_solvers
+from .watchdog import Outcome, race_deadline, run_solvers
 from .workspace import write_workspace
 
 KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
@@ -72,6 +72,8 @@ class Run:
     pipeline_failure: str | None = None
     marks: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Solvers the watchdog left out, killed or skipped (Outcome.report), for daily's summary.
+    problems: list[dict[str, Any]] = field(default_factory=list)
     attempt: Any = None
     started: AttemptState | None = None
     artifact: bytes | None = None
@@ -117,14 +119,15 @@ def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tupl
     return "start", None
 
 
-def warm_up(solvers: tuple[Solver, ...]) -> tuple[Solver, ...]:
+def warm_up(solvers: tuple[Solver, ...], left_out: list[Outcome] | None = None) -> tuple[Solver, ...]:
     """Run every code path once before the clock: imports, regex caches, allocations.
 
     Returns the solvers fit to race. Each warm-up is tried first in a forked child the
     watchdog can kill: a solver that hangs even on this tiny dummy is broken, not slow, so it
-    is reported and left out of this run (a crash on the dummy was always fine: many solvers
-    reject it). The rest then warm up here, in this process, because the race's solver
-    children inherit what this process has warmed. Without fork, a watched thread does both.
+    is reported (and added to `left_out`) and left out of this run (a crash on the dummy was
+    always fine: many solvers reject it). The rest then warm up here, in this process, because
+    the race's solver children inherit what this process has warmed. Without fork, a watched
+    thread does both.
     """
     dummy = SolveContext(
         "warm-up", {}, {"answer_ids": ["warm-up"]}, b"d2FybS11cA==", Path("warm-up"), ("warm-up",),
@@ -144,6 +147,8 @@ def warm_up(solvers: tuple[Solver, ...]) -> tuple[Solver, ...]:
         fit = tuple(s for s in fit if all(s is not h for h, _ in stuck))
         for _, outcome in hung + stuck:
             print(f"warm-up: {outcome.note()}; left out of this run")
+            if left_out is not None:
+                left_out.append(outcome)
     prepare_tools()
     hashlib.sha256(b"warm-up").hexdigest()
     json.loads(json.dumps({"warm": "up"}))
@@ -467,6 +472,7 @@ def _race(
         run.notes.clear()
         run.selected, run.conflict = select_candidates(candidates, answer_ids, run.notes)
     run.notes.extend(outcome.note() for outcome in outcomes if outcome.status != "ok")
+    run.problems += [outcome.report("race") for outcome in outcomes if outcome.status != "ok"]
     run.submitted = {
         candidate.answer_id: candidate.answer for candidate in run.selected
         if candidate.answer_id in needed
@@ -799,7 +805,9 @@ def run_fast(
                 helper.close()
         run.clock_offset = ntp()
     hint = get_hint(challenge_id, hints_path)
-    run.solvers = warm_up(SOLVERS)
+    left_out: list[Outcome] = []
+    run.solvers = warm_up(SOLVERS, left_out)
+    run.problems = [outcome.report("warm-up") for outcome in left_out]
     # No collector pauses on the clock; the race allocates little. Untimed runs leave the
     # collector alone: `daily` runs them in parallel threads, and gc is process-wide.
     collecting = timed and gc.isenabled()
@@ -821,6 +829,8 @@ def run_fast(
         if run.unpacked is not None:
             run.unpack_notes = run.unpacked.notes  # Unpacks now, off the clock, if no solver did.
         responses["attempt"], responses["result"] = run.attempt, run.result
+        if report is not None and run.problems:
+            report["solver_problems"] = list(run.problems)  # Before _report, which may fail.
         _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets,
                 corpus_root=(hints_path.parent / "corpus") if hints_path else None)
         if report is not None:

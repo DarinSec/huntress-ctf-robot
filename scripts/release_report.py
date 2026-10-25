@@ -83,6 +83,20 @@ def questions(challenge_id: str) -> list[str]:
             for index, line in enumerate(section.splitlines()[:60])]
 
 
+def safe_mode_lines(summary: dict) -> list[str]:
+    """The sweep's safe-mode block: lane modules not loaded, solvers the watchdog left out,
+    and routes held back (an error, or a mode before them). Other lanes' skips are hidden
+    above, so a blocked Binary Mastery is only seen here."""
+    block = summary.get("safe_mode") or {}
+    lines = [f"solver module not loaded: {error}" for error in block.get("load_errors", ())]
+    for problem in block.get("solver_problems", ()):
+        detail = f" ({problem['detail']})" if problem.get("detail") else ""
+        lines.append(f"{problem['challenge']}: {problem['stage']}: {problem['solver']} "
+                     f"{problem['status']} after {problem['seconds']} s{detail}")
+    lines += [f"{held['challenge']} held back: {held['reason']}" for held in block.get("held_back", ())]
+    return lines
+
+
 def main() -> None:
     day = int(sys.argv[1]) if len(sys.argv) > 1 else datetime.now(ZoneInfo("America/New_York")).day
     for kind in ("untimed", "timed"):
@@ -104,6 +118,10 @@ def main() -> None:
             print(f"   {entry['outcome']:10} {entry['challenge']}  {entry.get('wall_seconds', '')} {extra}")
             for line in blocked.get(str(entry["challenge"]), ()):
                 print(f"              {line}")
+        safe = safe_mode_lines(summary)
+        if safe:
+            print("   safe mode:")
+            print("\n".join(f"     {line}" for line in safe))
         if kind == "untimed":
             stuck = [entry["challenge"] for entry in summary["challenges"]
                      if str(entry["challenge"]).startswith(OWN_LANES)
