@@ -209,6 +209,26 @@ class AutoPropertyTests(unittest.TestCase):
         database = bytes(header) + bytes(4096 * 3 - 100)
         self.assertEqual(confident("sqlite.page_size_bytes", database), ("sqlite", "page_size", "4096"))
 
+    def test_an_unclear_new_property_still_answers_untimed_with_alternatives(self):
+        # Day 25: "registry.hive_root_name" ranked regf root_key_name first at score 1 only, so no
+        # clear guess was made and the whole lane waited for a human. Untimed, the best-ranked field
+        # goes out, the next ones as alternatives; on the clock nothing unclear is ever sent.
+        hive = bytearray(0x2000)
+        hive[:4] = b"regf"
+        struct.pack_into("<I", hive, 0x24, 0x20)
+        hive[0x1000:0x1004] = b"hbin"
+        name = b"SyntheticRoot"
+        struct.pack_into("<i2sH", hive, 0x1020, -0x60, b"nk", 0x2C)
+        struct.pack_into("<H", hive, 0x1024 + 0x48, len(name))
+        hive[0x1024 + 0x4C:0x1024 + 0x4C + len(name)] = name
+        prop = "registry.weird_root_name"
+        found = self.solve("metadata-forensics-day-21-x", prop, name="hive-001.hiv", data=bytes(hive))
+        self.assertEqual([c.answer for c in found], ["SyntheticRoot"])
+        self.assertTrue(found[0].alternatives)
+        self.assertIn("untimed only", found[0].evidence)
+        self.assertEqual(self.solve("metadata-forensics-day-21-x/time_trial", prop, timed=True,
+                                    name="hive-001.hiv", data=bytes(hive)), [])
+
     def test_known_or_unclear_properties_are_left_alone(self):
         self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.cpu_type_set"), [])  # Has a parser.
         self.assertEqual(self.solve("metadata-forensics-day-21-x", "macho.weird_unrelated_thing"), [])

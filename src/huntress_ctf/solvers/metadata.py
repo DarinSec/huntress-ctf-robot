@@ -646,6 +646,15 @@ def registry_hive_root_name(data: bytes) -> str | None:
     return None
 
 
+def evtx_record_count(data: bytes) -> str | None:
+    """EVTX: records over every ElfChnk (last - first record id + 1 per chunk), Day 24. A mapping
+    of its own, so the Day 24 kind no longer depends on an autoprop hint kept on one Homebase."""
+    for label, fields in formats_dfir.formats(data):
+        if label == "evtx" and fields and fields.get("record_count") is not None:
+            return str(fields["record_count"])
+    return None
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -669,6 +678,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "jar.main_class": jar_main_class,
     "sqlite.page_size_bytes": sqlite_page_size_bytes,
     "registry.hive_root_name": registry_hive_root_name,
+    "evtx.record_count": evtx_record_count,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
