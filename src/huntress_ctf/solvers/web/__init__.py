@@ -13,8 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.cookiejar
 import importlib
+import os
 import pkgutil
 import re
+import threading
+import time
 from typing import Any, Protocol, runtime_checkable
 import urllib.error
 import urllib.request
@@ -28,9 +31,61 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT = 10.0
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+# ROBUSTNESS.md workstream 2: the autonomous prober/crawler/fuzzer can fire many requests at
+# one target (fingerprint, then every handler, then the universal prober and a form crawl).
+# Each request already caps at DEFAULT_TIMEOUT, but hundreds in a row would blow the race
+# deadline, so a whole target's probing is also bounded: at most WEB_MAX_REQUESTS requests
+# inside WEB_TARGET_BUDGET_S wall-clock seconds. The budget must exceed the slowest single
+# legitimate solve (stored XSS polls up to ~18 s). Both are overridable for a tight maze test.
+WEB_TARGET_BUDGET_S = float(os.environ.get("HUNTRESS_WEB_BUDGET_S") or 45.0)
+WEB_MAX_REQUESTS = int(os.environ.get("HUNTRESS_WEB_MAX_REQUESTS") or 300)
+
 
 class HostNotAllowed(Exception):
     """A request aimed at a host the Game Master did not list for this attempt."""
+
+
+class BudgetExhausted(BaseException):
+    """A target's request count or wall-clock budget is spent; stop probing it.
+
+    Deliberately a BaseException, not an Exception: the ported handlers wrap almost every
+    request in `except Exception`, so a plain exception would be swallowed and the probing
+    cascade would run on regardless. This propagates straight out of the handler to the
+    adapter, which ends that target cleanly and reports no proof for it.
+    """
+
+
+class Budget:
+    """A per-target ceiling on probing: at most `max_requests` requests within `wall_s`
+    wall-clock seconds. The clock starts at the first request; `reset()` begins a fresh
+    allowance for the next target. `charge()` returns the seconds left so the caller can
+    clamp each request's own timeout and never overrun the ceiling by one slow request.
+    """
+
+    def __init__(self, *, max_requests: int = WEB_MAX_REQUESTS, wall_s: float = WEB_TARGET_BUDGET_S) -> None:
+        self.max_requests = max_requests
+        self.wall_s = wall_s
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.requests = 0
+            self._deadline: float | None = None
+
+    def charge(self) -> float:
+        """Count one request and return the seconds left; raise BudgetExhausted when spent."""
+        with self._lock:
+            now = time.monotonic()
+            if self._deadline is None:
+                self._deadline = now + self.wall_s
+            self.requests += 1
+            if self.requests > self.max_requests:
+                raise BudgetExhausted(f"request budget spent ({self.max_requests} requests)")
+            remaining = self._deadline - now
+            if remaining <= 0:
+                raise BudgetExhausted(f"time budget spent ({self.wall_s:.0f}s)")
+            return remaining
 
 
 @dataclass(frozen=True)
@@ -80,10 +135,11 @@ class ScopedHttp:
     """
 
     def __init__(self, allowed: frozenset[tuple[str, int]], *, timeout: float = DEFAULT_TIMEOUT,
-                 opener: Any = None, max_bytes: int = MAX_BODY_BYTES) -> None:
+                 opener: Any = None, max_bytes: int = MAX_BODY_BYTES, budget: Budget | None = None) -> None:
         self.allowed = allowed
         self.timeout = timeout
         self.max_bytes = max_bytes
+        self.budget = budget
         self.jar = http.cookiejar.CookieJar()
         self._opener = opener or urllib.request.build_opener(
             _NoRedirect(), urllib.request.HTTPCookieProcessor(self.jar)
@@ -99,9 +155,12 @@ class ScopedHttp:
                 headers: dict[str, str] | None = None) -> Response:
         if not self.allows(url):
             raise HostNotAllowed(url)
+        timeout = self.timeout
+        if self.budget is not None:  # One request at a time stays under the per-target ceiling.
+            timeout = min(timeout, self.budget.charge())
         request = urllib.request.Request(url, data=data, method=method.upper(), headers=headers or {})
         try:
-            response = self._opener.open(request, timeout=self.timeout)
+            response = self._opener.open(request, timeout=timeout)
             return Response(response.status, dict(response.headers), response.read(self.max_bytes), response.geturl())
         except urllib.error.HTTPError as error:  # A 4xx/5xx is a normal answer, not a failure.
             body = error.read(self.max_bytes) if hasattr(error, "read") else b""
@@ -115,13 +174,15 @@ class ScopedHttp:
 
 
 def scoped_http(targets: Any, **kwargs: Any) -> ScopedHttp:
-    """A client allowed to reach exactly the hosts in targets[] and nothing else."""
+    """A client allowed to reach exactly the hosts in targets[] and nothing else, with a
+    default per-target request/time Budget unless the caller passes its own (or None)."""
     allowed = set()
     for url in target_urls(targets):
         try:
             allowed.add(_host_port(url))
         except HostNotAllowed:
             continue
+    kwargs.setdefault("budget", Budget())
     return ScopedHttp(frozenset(allowed), **kwargs)
 
 

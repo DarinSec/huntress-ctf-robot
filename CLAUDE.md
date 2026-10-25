@@ -174,6 +174,11 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   blocks its 8-deep mastery pools). A brand-new vuln class the prober cannot crack is the
   only manual case -> Ilse or David take that single challenge by hand.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
+  Each target is probed under a `Budget` (ROBUSTNESS.md #2): at most `HUNTRESS_WEB_MAX_REQUESTS`
+  (300) requests in `HUNTRESS_WEB_BUDGET_S` (45 s), so the autonomous prober/crawl/fuzzer
+  (288 requests against a dead "maze") can't blow the race deadline. Spent, it stops that
+  target with no guess (`BudgetExhausted`, a BaseException so the handlers' `except Exception`
+  can't swallow it); `scoped_http` attaches the budget, the adapter resets it per target.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
   new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
 
