@@ -221,6 +221,16 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(len(server.hits), 3)
         self.assertEqual(server.connections, 3)
 
+    def test_many_answers_sharing_one_target_walk_it_once(self):
+        # Days 1-10 map every answer to the single target: the multi-step walk runs once and
+        # its proof is reused, so N answers cost one solve (3 requests), not N (3*N).
+        with _RoutedServer(_day1_routes(), http11=True) as server:
+            candidates = CurriculumWebSolver().solve(
+                _context(server.url, answer_ids=("a", "b", "c")))
+        self.assertEqual({c.answer_id for c in candidates}, {"a", "b", "c"})
+        self.assertTrue(all(c.answer == PROOF for c in candidates))
+        self.assertEqual(len(server.hits), 3)  # one walk, not three
+
 
 class _XssServer:
     """Stands in for the Day-7 stored-XSS target: GET /api/clues, POST the feedback route

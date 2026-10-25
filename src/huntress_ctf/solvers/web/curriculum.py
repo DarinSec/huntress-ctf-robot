@@ -211,47 +211,53 @@ class CurriculumWebSolver:
             target_list.append(context.url)
 
         questions = context.attempt.get("questions", []) if isinstance(context.attempt, dict) else []
+        # answer_id -> artifact (the target id it names), resolved once: the loop below is
+        # O(answers + questions), not O(answers x questions) as a per-answer scan would be.
+        artifact_of = {q["id"]: q.get("artifact") for q in questions
+                       if isinstance(q, dict) and "id" in q}
         candidates: list[AnswerCandidate] = []
+        # proof by target url: a route may map several answers to one target (every day 1-10
+        # answer shares the single target), and the multi-step network walk is the dominant
+        # on-clock cost, so each distinct target is solved once and its proof reused.
+        solved: dict[str, tuple[str, tuple[str, ...]]] = {}
 
         try:
             with _scope(context.http) as transport:
                 for i, answer_id in enumerate(context.answer_ids):
-                    turl = None
-                    for q in questions:
-                        if isinstance(q, dict) and q.get("id") == answer_id:
-                            art = q.get("artifact")
-                            if art in targets_map:
-                                turl = targets_map[art]
-                            break
+                    turl = targets_map.get(artifact_of.get(answer_id))
                     if not turl:
-                        if i < len(target_list):
-                            turl = target_list[i]
-                        elif target_list:
-                            turl = target_list[0]
+                        turl = target_list[i] if i < len(target_list) else (
+                            target_list[0] if target_list else None)
                     if not turl or not context.http.allows(turl):
                         continue
 
-                    seen_before = len(transport.seen_cookies)
-                    proof: str | None = None
-                    chain: tuple[str, ...] = ()
-                    try:
-                        result = handlers.detect_and_solve(turl, day_int)
-                    except Exception:
-                        # WebHandlerError, HostNotAllowed, transport errors: never guessed.
-                        result = None
-                    if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
-                        proof = result
-                        chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                    if turl in solved:
+                        proof, chain = solved[turl]
                     else:
-                        # No handler proof: the server may have stashed it in a signed
-                        # (readable) session cookie set during this target's run. Scan only
-                        # the cookies this target added, so the proof is credited to it.
-                        for found in sessions.proofs_in_cookies(
-                            transport.seen_cookies[seen_before:], handlers.PROOF_PATTERN
-                        ):
-                            if handlers.PROOF_PATTERN.fullmatch(found):
-                                proof, chain = found, ("web-cookie",)
-                                break
+                        seen_before = len(transport.seen_cookies)
+                        proof = None
+                        chain = ()
+                        try:
+                            result = handlers.detect_and_solve(turl, day_int)
+                        except Exception:
+                            # WebHandlerError, HostNotAllowed, transport errors: never guessed.
+                            result = None
+                        if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
+                            proof = result
+                            chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                        else:
+                            # No handler proof: the server may have stashed it in a signed
+                            # (readable) session cookie set during this target's run. Scan
+                            # only the cookies this target added, so the proof is credited
+                            # to it.
+                            for found in sessions.proofs_in_cookies(
+                                transport.seen_cookies[seen_before:], handlers.PROOF_PATTERN
+                            ):
+                                if handlers.PROOF_PATTERN.fullmatch(found):
+                                    proof, chain = found, ("web-cookie",)
+                                    break
+                        if proof is not None:
+                            solved[turl] = (proof, chain)
                     if proof is None:
                         continue  # Only a real proof string is real evidence (solver rules).
                     evidence = f"proof read from assigned target {turl}"
