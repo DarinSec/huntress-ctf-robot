@@ -88,6 +88,7 @@ def solve_entry(entry: Path) -> tuple[dict[str, str], tuple[str, ...]]:
     """The current solvers' selected answers for a saved assignment, fully offline."""
     from .autopilot import build_context, select_candidates
     from .solvers import SOLVERS
+    from .watchdog import run_solvers
     from .state import AttemptState
 
     saved = _read(entry / "assignment.json")
@@ -99,12 +100,10 @@ def solve_entry(entry: Path) -> tuple[dict[str, str], tuple[str, ...]]:
     extra = members if len(members) > 1 else ()
     context, _ = build_context(str(challenge.get("id") or entry.parent.name), challenge, attempt,
                                members[0].data, files[0], answer_ids, None, extra)
-    candidates = []
-    for solver in SOLVERS:
-        try:
-            candidates.extend(solver.solve(context))
-        except Exception as exc:  # One lane's crash is a finding, not the end of the replay.
-            print(f"  {getattr(solver, 'name', solver)} crashed: {type(exc).__name__}: {exc}")
+    candidates, outcomes = run_solvers(SOLVERS, context)
+    for outcome in outcomes:  # One lane's crash or hang is a finding, not the end of the replay.
+        if outcome.status != "ok":
+            print(f"  {outcome.note()}")
     selected, _ = select_candidates(candidates, answer_ids, [])
     return {candidate.answer_id: candidate.answer for candidate in selected}, answer_ids
 
