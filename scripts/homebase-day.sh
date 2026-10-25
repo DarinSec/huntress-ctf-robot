@@ -52,7 +52,12 @@ release=$(TZ=America/New_York date -d "08:59:30" +%s)
 now=$(date +%s)
 if [ "$now" -lt "$release" ]; then
   echo "$(date): day $day waits $(( (release - now) / 60 )) min for the release (09:00 New York = 15:00 Sweden)."
-  sleep $(( release - now ))
+  # Close fd 9 for the sleep child: this bash keeps day.lock while it waits, but if the
+  # bash is killed or swapped out mid-wait (a deploy, a stray `pkill day.sh`, an OOM), the
+  # orphaned sleep must not keep holding the lock -- that would block every later cron run
+  # and leave the release unswept. With fd 9 closed here, the lock frees the instant this
+  # bash dies, so the next cron minute arms a fresh waiter. (Verified: survives kill -9.)
+  sleep $(( release - now )) 9>&-
 fi
 cd "$HOME"
 robot() { python3 -m huntress_ctf --lock-wait 3600 "$@"; }
