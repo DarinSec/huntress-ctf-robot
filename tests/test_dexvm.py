@@ -223,6 +223,49 @@ class DexVmTests(unittest.TestCase):
         with self.assertRaises(dexvm.Unsupported):
             dexvm._platform("Ljava/lang/Class;", "getDeclaredMethod", "", [maze, "m9", [dexvm.JClass("J")]], vm)
 
+    def test_secondary_dex_from_assets_day20(self):
+        # Day 20's module (reused by Day 25 Mastery): getAssets().open("payload.dex"), read in a loop,
+        # ByteBuffer.wrap, new InMemoryDexClassLoader(buffer, parent).loadClass(..), reflective invoke.
+        payload = release_dex()
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("assets/payload.dex", payload)
+            archive.writestr("assets/huge.bin", bytes(dexvm.MAX_ASSET_BYTES + 1))
+        vm = dexvm.Machine([], apk=buffer.getvalue())
+        call = lambda cls, name, sig, *args: dexvm._platform(cls, name, sig, list(args), vm)
+        assets = call("Landroid/content/Context;", "getAssets", "()Landroid/content/res/AssetManager;", vm.context)
+        stream = call("Landroid/content/res/AssetManager;", "open", "(Ljava/lang/String;)Ljava/io/InputStream;",
+                      assets, "payload.dex")
+        chunk, data = [0] * 64, []
+        while (count := call("Ljava/io/InputStream;", "read", "([BII)I", stream, chunk, 0, len(chunk))) >= 0:
+            data += chunk[:count]
+        self.assertEqual(dexvm._bytes(data), payload)
+        parent = call("Ljava/lang/Class;", "getClassLoader", "()Ljava/lang/ClassLoader;", dexvm.JClass("LCore;"))
+        wrapped = call("Ljava/nio/ByteBuffer;", "wrap", "([BII)Ljava/nio/ByteBuffer;", data, 0, len(data))
+        loader = dexvm.Loader()
+        call("Ldalvik/system/InMemoryDexClassLoader;", "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+             loader, wrapped, parent)
+        self.assertNotIn("LRelease;", vm.classes)  # Nothing is loaded before loadClass.
+        module = call("Ljava/lang/ClassLoader;", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", loader, "Release")
+        mix = call("Ljava/lang/Class;", "getDeclaredMethod", "", module, "mix", [dexvm.JClass("J")])
+        value = call("Ljava/lang/reflect/Method;", "invoke", "", mix, None, [0x0123456789ABCDEF])
+        self.assertEqual(f"ANS-{value & M64:016X}", expected())
+        self.assertEqual(vm.invoke("LRelease;", "code", "(Landroid/content/Context;)Ljava/lang/String;",
+                                   [vm.context], False), expected())
+        sink = dexvm.Sink()
+        call("Ljava/io/ByteArrayOutputStream;", "write", "([BII)V", sink, [1, -1, 3], 1, 2)
+        self.assertEqual(call("Ljava/io/ByteArrayOutputStream;", "toByteArray", "()[B", sink), [-1, 3])
+        for name in ("missing.dex", "huge.bin"):  # A missing asset or one past the cap stops the run.
+            with self.assertRaises(dexvm.Unsupported):
+                call("Landroid/content/res/AssetManager;", "open", "(Ljava/lang/String;)Ljava/io/InputStream;",
+                     assets, name)
+        with self.assertRaises(dexvm.Unsupported):
+            call("Ljava/lang/ClassLoader;", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", loader, "Nope")
+        with self.assertRaises(dexvm.Unsupported):  # DexClassLoader-style: a path, not bytes in memory.
+            call("Ldalvik/system/DexClassLoader;", "<init>", "", dexvm.Loader(), "/data/x.dex", None, None, parent)
+        with self.assertRaises(dexvm.Unsupported):  # No APK, no assets.
+            dexvm.Context("a.b").asset("payload.dex")
+
     def test_jni_names(self):
         self.assertEqual(dexvm.jni_name("Lcom/a_b/C;", "f"), "Java_com_a_1b_C_f")
 

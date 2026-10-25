@@ -8,9 +8,11 @@ may sit in the chain.
 The app is never run. This module parses classes*.dex and interprets the bytecode of the
 methods that chain reaches, with exact Java int/long semantics, in pure Python. Calls into
 the platform are allowed only for a short list of pure library methods (StringBuilder,
-String, Long/Integer, Math, Character, CRC32, MessageDigest, Base64) and Context's package
-name; anything else (I/O, reflection, clocks, threads) stops the run with `Unsupported`, so
-an answer is either computed exactly or not at all. A native method is evaluated by a
+String, Long/Integer, Math, Character, CRC32, MessageDigest, Base64), Context's package
+name and the APK's own assets/ members (read from the bytes in memory; Day 20 loads a second
+DEX from there with InMemoryDexClassLoader, and its classes are interpreted like the app's);
+anything else (files, network, platform reflection, clocks, threads) stops the run with
+`Unsupported`, so an answer is either computed exactly or not at all. A native method is evaluated by a
 register-only x86-64 subset read from the APK's lib/x86_64 ELF (mov/add/sub/xor/and/or,
 imul, rotates and shifts, not/neg, bswap), again without executing anything.
 """
@@ -34,6 +36,8 @@ ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
 # two such apps in a Mastery made its timed race 52 s and unresolved. 3M keeps ~55x headroom
 # over a real app and fails a runaway in ~3.4 s instead.
 MAX_STEPS = 3_000_000
+# Day 20's payload.dex is ~700 bytes; an asset past this is not an answer-code module.
+MAX_ASSET_BYTES = 16 << 20
 M32, M64 = 0xFFFFFFFF, (1 << 64) - 1
 ACC_STATIC, ACC_NATIVE = 0x8, 0x100
 
@@ -255,10 +259,60 @@ class Crc:
 
 
 class Context:
-    """The only Context method modeled is getPackageName(); Day 23 only stores the argument."""
+    """getPackageName() and getAssets(); Day 23 only stores the argument. Assets are the APK's own
+    assets/ members, read from the bytes in memory (Day 20 ships its second DEX there)."""
 
-    def __init__(self, package: str | None) -> None:
+    def __init__(self, package: str | None, apk: bytes | None = None) -> None:
         self.package = package
+        self.apk = apk
+
+    def asset(self, name: str) -> bytes:
+        if self.apk is None:
+            raise Unsupported("Context.getAssets() without the APK")
+        try:
+            with zipfile.ZipFile(BytesIO(self.apk)) as apk:
+                info = apk.getinfo("assets/" + name.lstrip("/"))
+                if info.file_size > MAX_ASSET_BYTES:
+                    raise Unsupported(f"asset {name} of {info.file_size} bytes")
+                return apk.read(info)
+        except KeyError:
+            raise Unsupported(f"no asset {name}") from None
+
+
+class Assets:
+    """android.content.res.AssetManager of a Context."""
+
+    def __init__(self, context: Context) -> None:
+        self.context = context
+
+
+class Stream:
+    """An InputStream over bytes in memory (AssetManager.open)."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.at = data, 0
+
+
+class Sink:
+    """java.io.ByteArrayOutputStream."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+
+class Buffer:
+    """java.nio.ByteBuffer.wrap(byte[]); only ever handed to a class loader."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+
+class Loader:
+    """The app's class loader (Class.getClassLoader) or an InMemoryDexClassLoader over DEX bytes the
+    app read itself. Its classes are parsed like classes.dex and interpreted, never run."""
+
+    def __init__(self) -> None:
+        self.dexes: list[Dex] = []
 
 
 def _chars(value: Any) -> str:
@@ -558,16 +612,17 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
         return this.package
     if cls == "Landroid/content/Context;" and name == "getPackageName" and vm.context.package:
         return vm.context.package
-    reflected = _reflection(cls, name, args, vm)
-    if reflected is not _NOT_REFLECTION:
-        return reflected
+    for handler in (_secondary_dex, _reflection):
+        handled = handler(cls, name, sig, args, vm)
+        if handled is not _UNHANDLED:
+            return handled
     raise Unsupported(f"{cls}->{name}{sig}")
 
 
 _PRIMITIVE_TYPES = {"Ljava/lang/Long;": "J", "Ljava/lang/Integer;": "I", "Ljava/lang/Short;": "S",
                     "Ljava/lang/Byte;": "B", "Ljava/lang/Character;": "C", "Ljava/lang/Boolean;": "Z",
                     "Ljava/lang/Double;": "D", "Ljava/lang/Float;": "F", "Ljava/lang/Void;": "V"}
-_NOT_REFLECTION = object()
+_UNHANDLED = object()
 
 
 class JMethod:
@@ -575,11 +630,78 @@ class JMethod:
         self.method = method
 
 
-def _reflection(cls: str, name: str, args: list[Any], vm: "Machine") -> Any:
+def _secondary_dex(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> Any:
+    """Day 20's module loading (reused by Day 25 Mastery): Context.getAssets().open(name), read into a
+    byte[] (InputStream or ByteArrayOutputStream), ByteBuffer.wrap, then new InMemoryDexClassLoader(
+    buffer, parent).loadClass(name). The bytes are the APK's own asset; the loaded classes join the
+    app's, and a class the app already defines keeps its definition (a loader asks its parent first)."""
+    this = args[0] if args else None
+    if isinstance(this, Context) and name == "getAssets":
+        return Assets(this)
+    if isinstance(this, Assets) and name == "open" and isinstance(args[1], str):
+        return Stream(this.context.asset(args[1]))
+    if isinstance(this, Stream):
+        rest = this.data[this.at:]
+        if name == "read" and sig.startswith("()"):
+            this.at += bool(rest)
+            return rest[0] if rest else -1
+        if name == "read":
+            start, count = (args[2], args[3]) if len(args) > 3 else (0, len(args[1]))
+            chunk = rest[:count]
+            if count and not chunk:
+                return -1
+            args[1][start:start + len(chunk)] = _signed_bytes(chunk)
+            this.at += len(chunk)
+            return len(chunk)
+        if name == "readAllBytes":
+            this.at = len(this.data)
+            return _signed_bytes(rest)
+        if name == "available":
+            return len(rest)
+        if name == "close":
+            return None
+    if isinstance(this, Sink):
+        if name in ("<init>", "close", "flush"):
+            return None
+        if name == "write":
+            if sig.startswith("(I)"):
+                this.data.append(args[1] & 0xFF)
+            else:
+                start, count = (args[2], args[3]) if len(args) > 3 else (0, len(args[1]))
+                this.data += _bytes(args[1][start:start + count])
+            return None
+        if name == "toByteArray":
+            return _signed_bytes(bytes(this.data))
+        if name == "size":
+            return len(this.data)
+    if cls == "Ljava/nio/ByteBuffer;" and name == "wrap" and isinstance(this, list):
+        start, count = (args[1], args[2]) if len(args) > 2 else (0, len(this))
+        return Buffer(_bytes(this[start:start + count]))
+    if cls == "Ljava/lang/Class;" and name == "getClassLoader" and isinstance(this, JClass):
+        return Loader()
+    if isinstance(this, Loader):
+        if name == "<init>":
+            buffers = args[1] if isinstance(args[1], list) else [args[1]]
+            if not buffers or not all(isinstance(buffer, Buffer) for buffer in buffers):
+                raise Unsupported(f"{cls} from a file")  # DexClassLoader/PathClassLoader read a path
+            this.dexes = [Dex(buffer.data) for buffer in buffers]
+            return None
+        if name == "loadClass" and isinstance(args[1], str):
+            vm.load(this.dexes)
+            target = "L" + args[1].replace(".", "/") + ";"
+            if target not in vm.classes:
+                raise Unsupported(f"loadClass {target}")
+            return JClass(target)
+    return _UNHANDLED
+
+
+def _reflection(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> Any:
     """Day 19's reflection maze (reused by Day 25 Mastery): Class.forName / getDeclaredMethod /
     Method.invoke, but only into the app's own classes; reflection into the platform stays Unsupported."""
     this = args[0] if args else None
     if cls == "Ljava/lang/Class;" and name == "forName" and isinstance(this, str):
+        if len(args) > 2 and isinstance(args[2], Loader):  # forName(name, initialize, loader)
+            vm.load(args[2].dexes)
         target = "L" + this.replace(".", "/") + ";"
         if target not in vm.classes:
             raise Unsupported(f"reflection into {target}")
@@ -607,7 +729,7 @@ def _reflection(cls: str, name: str, args: list[Any], vm: "Machine") -> Any:
             static = bool(method.flags & ACC_STATIC)
             sig = "(" + "".join(method.params) + ")" + method.ret
             return vm.invoke(method.cls, method.name, sig, values if static else [args[1]] + values, not static)
-    return _NOT_REFLECTION
+    return _UNHANDLED
 
 
 # --- x86-64 subset for JNI `long f(long)` -------------------------------------------------------
@@ -872,17 +994,24 @@ _ARRAY_KINDS = "ijozbcs"  # aget, -wide, -object, -boolean, -byte, -char, -short
 
 
 class Machine:
-    def __init__(self, dexes: list[Dex], natives: dict[str, bytes] | None = None, package: str | None = None) -> None:
+    def __init__(self, dexes: list[Dex], natives: dict[str, bytes] | None = None, package: str | None = None,
+                 apk: bytes | None = None) -> None:
         self.classes: dict[str, ClassDef] = {}
-        for dex in dexes:
-            for name, definition in dex.classes.items():
-                self.classes.setdefault(name, definition)
-        self.dexes = dexes
+        self.dexes: list[Dex] = []
+        self.load(dexes)
         self.natives = natives or {}
-        self.context = Context(package)
+        self.context = Context(package, apk)
         self.statics: dict[tuple[str, str], Any] = {}
         self.initialized: set[str] = set()
         self.steps = 0
+
+    def load(self, dexes: list[Dex]) -> None:
+        """classes*.dex, or a DEX the app loads itself: a class already defined keeps its definition."""
+        for dex in dexes:
+            if not any(known is dex for known in self.dexes):
+                self.dexes.append(dex)
+                for name, definition in dex.classes.items():
+                    self.classes.setdefault(name, definition)
 
     def _init_class(self, cls: str) -> None:
         if cls in self.initialized or cls not in self.classes:
@@ -1024,6 +1153,10 @@ class Machine:
                     regs[a] = Builder()
                 elif kind == "Ljava/util/zip/CRC32;":
                     regs[a] = Crc()
+                elif kind == "Ljava/io/ByteArrayOutputStream;":
+                    regs[a] = Sink()
+                elif kind == "Ldalvik/system/InMemoryDexClassLoader;":
+                    regs[a] = Loader()
                 elif kind in self.classes:
                     self._init_class(kind)
                     regs[a] = JObject(kind)
@@ -1313,7 +1446,7 @@ def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
                         if body:
                             natives[symbol] = body
                             break
-    machine = Machine(dexes, natives, package)
+    machine = Machine(dexes, natives, package, apk_bytes)
     candidates = []
     for definition in machine.classes.values():
         for method in definition.methods.values():
