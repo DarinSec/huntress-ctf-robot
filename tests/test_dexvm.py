@@ -188,6 +188,84 @@ class DexVmTests(unittest.TestCase):
         with self.assertRaises(dexvm.Unsupported):
             dexvm.run_x64(b"\x48\x8b\x07\xc3", [0, 0, 0])        # mov rax,[rdi]: memory is never modeled
 
+    def test_x86_64_branches_day25_length_gate(self):
+        # Day 25 Mastery's day-16 libarena.so: a Java int narrowed to u16 gates the mix
+        # (cmp ecx,0xffff; jle 0; movzx esi,cx; cmp esi,K; jne 0; ...mix...; ret; xor eax,eax; ret).
+        def movabs_rcx(value):
+            return b"\x48\xb9" + value.to_bytes(8, "little")
+        mix = (b"\x48\x89\xd0" + movabs_rcx(K1) + b"\x48\x31\xc8" + b"\x48\xc1\xc0\x2d"
+               + movabs_rcx(K2) + b"\x48\x0f\xaf\xc1" + b"\xc3")
+        tail = b"\x0f\xb7\xf1" + b"\x81\xfe\xde\x97\x00\x00" + b"\x75" + bytes([len(mix)]) + mix
+        code = b"\x81\xf9\xff\xff\x00\x00" + b"\x7e" + bytes([len(tail)]) + tail + b"\x31\xc0\xc3"
+        argument = 0x0123456789ABCDEF
+        value = argument ^ K1
+        value = ((value << 45) | (value >> 19)) & M64
+        value = value * K2 & M64
+        self.assertEqual(dexvm.run_x64(code, [0, 0, argument, 0x197DE]), value)
+        self.assertEqual(dexvm.run_x64(code, [0, 0, argument, 0x97DE]), 0)     # not above 0xffff: jle taken
+        self.assertEqual(dexvm.run_x64(code, [0, 0, argument, 0x197DF]), 0)    # wrong low 16 bits: jne taken
+        with self.assertRaises(dexvm.Unsupported):
+            dexvm.run_x64(b"\x7f\x00\xc3", [0, 0, 0])                          # a branch before any compare
+
+    def test_reflection_reaches_only_app_classes(self):
+        # Day 19's maze: Class.forName("a.Maze").getDeclaredMethod("m3", Long.TYPE).invoke(null, j).
+        method = SimpleNamespace(cls="La/Maze;", name="m3", params=["J"], ret="J", flags=dexvm.ACC_STATIC)
+        calls = []
+        vm = SimpleNamespace(
+            classes={"La/Maze;": SimpleNamespace(methods={("m3", "(J)J"): method}, superclass=None)},
+            invoke=lambda cls, name, sig, args, virtual: calls.append((cls, name, sig, args)) or args[0] + 1)
+        maze = dexvm._platform("Ljava/lang/Class;", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", ["a.Maze"], vm)
+        found = dexvm._platform("Ljava/lang/Class;", "getDeclaredMethod", "", [maze, "m3", [dexvm.JClass("J")]], vm)
+        self.assertEqual(dexvm._platform("Ljava/lang/reflect/Method;", "invoke", "", [found, None, [41]], vm), 42)
+        self.assertEqual(calls, [("La/Maze;", "m3", "(J)J", [41])])
+        with self.assertRaises(dexvm.Unsupported):
+            dexvm._platform("Ljava/lang/Class;", "forName", "", ["java.lang.Runtime"], vm)
+        with self.assertRaises(dexvm.Unsupported):
+            dexvm._platform("Ljava/lang/Class;", "getDeclaredMethod", "", [maze, "m9", [dexvm.JClass("J")]], vm)
+
+    def test_secondary_dex_from_assets_day20(self):
+        # Day 20's module (reused by Day 25 Mastery): getAssets().open("payload.dex"), read in a loop,
+        # ByteBuffer.wrap, new InMemoryDexClassLoader(buffer, parent).loadClass(..), reflective invoke.
+        payload = release_dex()
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("assets/payload.dex", payload)
+            archive.writestr("assets/huge.bin", bytes(dexvm.MAX_ASSET_BYTES + 1))
+        vm = dexvm.Machine([], apk=buffer.getvalue())
+        call = lambda cls, name, sig, *args: dexvm._platform(cls, name, sig, list(args), vm)
+        assets = call("Landroid/content/Context;", "getAssets", "()Landroid/content/res/AssetManager;", vm.context)
+        stream = call("Landroid/content/res/AssetManager;", "open", "(Ljava/lang/String;)Ljava/io/InputStream;",
+                      assets, "payload.dex")
+        chunk, data = [0] * 64, []
+        while (count := call("Ljava/io/InputStream;", "read", "([BII)I", stream, chunk, 0, len(chunk))) >= 0:
+            data += chunk[:count]
+        self.assertEqual(dexvm._bytes(data), payload)
+        parent = call("Ljava/lang/Class;", "getClassLoader", "()Ljava/lang/ClassLoader;", dexvm.JClass("LCore;"))
+        wrapped = call("Ljava/nio/ByteBuffer;", "wrap", "([BII)Ljava/nio/ByteBuffer;", data, 0, len(data))
+        loader = dexvm.Loader()
+        call("Ldalvik/system/InMemoryDexClassLoader;", "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+             loader, wrapped, parent)
+        self.assertNotIn("LRelease;", vm.classes)  # Nothing is loaded before loadClass.
+        module = call("Ljava/lang/ClassLoader;", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", loader, "Release")
+        mix = call("Ljava/lang/Class;", "getDeclaredMethod", "", module, "mix", [dexvm.JClass("J")])
+        value = call("Ljava/lang/reflect/Method;", "invoke", "", mix, None, [0x0123456789ABCDEF])
+        self.assertEqual(f"ANS-{value & M64:016X}", expected())
+        self.assertEqual(vm.invoke("LRelease;", "code", "(Landroid/content/Context;)Ljava/lang/String;",
+                                   [vm.context], False), expected())
+        sink = dexvm.Sink()
+        call("Ljava/io/ByteArrayOutputStream;", "write", "([BII)V", sink, [1, -1, 3], 1, 2)
+        self.assertEqual(call("Ljava/io/ByteArrayOutputStream;", "toByteArray", "()[B", sink), [-1, 3])
+        for name in ("missing.dex", "huge.bin"):  # A missing asset or one past the cap stops the run.
+            with self.assertRaises(dexvm.Unsupported):
+                call("Landroid/content/res/AssetManager;", "open", "(Ljava/lang/String;)Ljava/io/InputStream;",
+                     assets, name)
+        with self.assertRaises(dexvm.Unsupported):
+            call("Ljava/lang/ClassLoader;", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", loader, "Nope")
+        with self.assertRaises(dexvm.Unsupported):  # DexClassLoader-style: a path, not bytes in memory.
+            call("Ldalvik/system/DexClassLoader;", "<init>", "", dexvm.Loader(), "/data/x.dex", None, None, parent)
+        with self.assertRaises(dexvm.Unsupported):  # No APK, no assets.
+            dexvm.Context("a.b").asset("payload.dex")
+
     def test_jni_names(self):
         self.assertEqual(dexvm.jni_name("Lcom/a_b/C;", "f"), "Java_com_a_1b_C_f")
 
