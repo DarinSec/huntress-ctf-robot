@@ -29,6 +29,8 @@ class CipherVectorTest(unittest.TestCase):
 
     def test_padding_and_bad_input(self):
         self.assertEqual(ciphers.unpad(b"abc" + bytes([13]) * 13), b"abc")
+        for size in (0, 1, 15, 16, 17):
+            self.assertEqual(ciphers.unpad(ciphers.pad(bytes(size))), bytes(size))
         for bad in (b"", b"abc" + bytes([2]) * 12 + b"\x05", bytes(16)):
             with self.assertRaises(ValueError):
                 ciphers.unpad(bad)
@@ -57,6 +59,10 @@ class CipherModeTest(unittest.TestCase):
                                       (modes.CTR(iv), text, lambda c: ciphers.ctr(key, iv, c))):
                 encryptor = Cipher(algorithms.AES(key), mode).encryptor()
                 self.assertEqual(ours(encryptor.update(plain) + encryptor.finalize()), plain)
+            for mode, ours in ((modes.ECB(), lambda p: ciphers.ecb_encrypt(key, p)),
+                               (modes.CBC(iv), lambda p: ciphers.cbc_encrypt(key, iv, p))):
+                encryptor = Cipher(algorithms.AES(key), mode).encryptor()
+                self.assertEqual(ours(blocks), encryptor.update(blocks) + encryptor.finalize())
             nonce = os.urandom(12)
             self.assertEqual(ciphers.gcm_decrypt(key, nonce, AESGCM(key).encrypt(nonce, text, None)), text)
 

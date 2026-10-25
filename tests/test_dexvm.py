@@ -28,10 +28,10 @@ def uleb(value):
             return bytes(out)
 
 
-def build_dex(strings, types, protos, methods, class_type, direct_methods):
-    """types: string indexes; protos: (return type, [param types]); methods: (class, proto, name)."""
+def build_dex(strings, types, protos, methods, class_type, direct_methods, fields=()):
+    """types: string indexes; protos: (return type, [param types]); methods and fields: (class, proto or type, name)."""
     header = 0x70
-    sizes = [len(strings), len(types), len(protos), 0, len(methods), 1]
+    sizes = [len(strings), len(types), len(protos), len(fields), len(methods), 1]
     offsets, at = [], header
     for count, width in zip(sizes, (4, 4, 12, 8, 8, 32)):
         offsets.append(at if count else 0)
@@ -55,6 +55,8 @@ def build_dex(strings, types, protos, methods, class_type, direct_methods):
     for index, (ret, params) in enumerate(protos):
         params_at = place(struct.pack("<I", len(params)) + b"".join(struct.pack("<H", p) for p in params), 4) if params else 0
         struct.pack_into("<III", data, offsets[2] + 12 * index, 0, ret, params_at)
+    for index, (cls, kind, name) in enumerate(fields):
+        struct.pack_into("<HHI", data, offsets[3] + 8 * index, cls, kind, name)
     for index, (cls, proto, name) in enumerate(methods):
         struct.pack_into("<HHI", data, offsets[4] + 8 * index, cls, proto, name)
     codes = []
@@ -129,6 +131,198 @@ def apk(dex, puzzle):
         archive.writestr("classes.dex", dex)
         archive.writestr("assets/huntress_puzzle.json", json.dumps(puzzle))
     return buffer.getvalue()
+
+
+def der(tag, body):
+    size = len(body)
+    length = bytes([size]) if size < 128 else bytes([0x80 | (size.bit_length() + 7) // 8]) + size.to_bytes((size.bit_length() + 7) // 8, "big")
+    return bytes([tag]) + length + body
+
+
+def manifest(package, version_code, version_name):
+    """Android binary XML: <manifest package=.. versionCode=.. versionName=..>; an int name is a resource reference."""
+    strings = ["manifest", "package", package, "versionCode", "versionName", version_name if isinstance(version_name, str) else ""]
+    encoded = [struct.pack("<H", len(text)) + text.encode("utf-16-le") + b"\0\0" for text in strings]
+    offsets = [sum(len(item) for item in encoded[:index]) for index in range(len(strings))]
+    body = b"".join(encoded)
+    body += b"\0" * (-len(body) % 4)
+    pool = struct.pack("<HHIIIIII", 1, 28, 28 + 4 * len(strings) + len(body), len(strings), 0, 0,
+                       28 + 4 * len(strings), 0) + struct.pack(f"<{len(strings)}I", *offsets) + body
+    attributes = [(1, 2, 0x03, 2), (3, 0xFFFFFFFF, 0x10, version_code),
+                  (4, 5, 0x03, 5) if isinstance(version_name, str) else (4, 0xFFFFFFFF, 0x01, version_name)]
+    attrs = b"".join(struct.pack("<IIIHxBI", 0xFFFFFFFF, key, raw, 8, kind, value) for key, raw, kind, value in attributes)
+    ext = struct.pack("<IIHHHHHH", 0xFFFFFFFF, 0, 20, 20, len(attributes), 0, 0, 0)
+    element = struct.pack("<HHIII", 0x0102, 16, 16 + len(ext) + len(attrs), 1, 0xFFFFFFFF) + ext + attrs
+    return struct.pack("<HHI", 3, 8, 8 + len(pool) + len(element)) + pool + element
+
+
+def signed_apk(certificate, package="com.example.signed", version_name="1.4.2"):
+    """An APK whose META-INF/CERT.RSA is a PKCS#7 SignedData carrying `certificate`."""
+    signed_data = der(0x30, der(0x02, b"\x01") + der(0x31, b"") + der(0x30, der(0x06, bytes.fromhex("2a864886f70d010701")))
+                      + der(0xA0, certificate) + der(0x31, b""))
+    pkcs7 = der(0x30, der(0x06, bytes.fromhex("2a864886f70d010702")) + der(0xA0, signed_data))
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("AndroidManifest.xml", manifest(package, 42, version_name))
+        archive.writestr("classes.dex", release_dex())
+        archive.writestr("META-INF/CERT.RSA", pkcs7)
+    return buffer.getvalue()
+
+
+class LaterDayPlatformTests(unittest.TestCase):
+    """Platform APIs no day 1-25 app used, computed from the APK bytes (or refused)."""
+
+    def setUp(self):
+        import base64
+        from tests.test_formats_dfir import CERT_B64
+
+        self.certificate = base64.b64decode(CERT_B64)
+        self.apk = signed_apk(self.certificate)
+        self.vm = dexvm.Machine([], package="com.example.signed", apk=self.apk)
+
+    def call(self, cls, name, sig, *args):
+        return dexvm._platform(cls, name, sig, list(args), self.vm)
+
+    def new(self, kind, sig, *args):
+        made = dexvm._PLATFORM_NEW[kind]()
+        self.call(kind, "<init>", sig, made, *args)
+        return made
+
+    def test_charsets(self):
+        utf8, latin = dexvm._PLATFORM_STATICS[("Ljava/nio/charset/StandardCharsets;", "UTF_8")], dexvm.Charset("ISO-8859-1")
+        get = lambda text, charset: self.call("Ljava/lang/String;", "getBytes", "(Ljava/nio/charset/Charset;)[B", text, charset)
+        self.assertEqual((get("é", utf8), get("é", latin), get("é", "UTF-16")), ([-61, -87], [-23], [-2, -1, 0, -23]))
+        decode = lambda sig, *args: self.call("Ljava/lang/String;", "<init>", sig, None, *args)
+        self.assertEqual(decode("([BIILjava/nio/charset/Charset;)V", [0x41, -23, 0x42], 1, 2, latin), "éB")
+        self.assertEqual(decode("([BLjava/lang/String;)V", [0, 0x41], "UTF-16"), "A")
+        self.assertEqual(decode("([BII)V", [0x41, 0x42, 0x43], 1, 1), "B")  # Offset and length are honoured.
+        with self.assertRaises(dexvm.Unsupported):
+            self.call("Ljava/nio/charset/Charset;", "forName", "", "Shift_JIS")
+
+    def test_cipher_modes_like_javax_crypto(self):
+        from huntress_ctf import ciphers
+
+        key, iv, plain = bytes(range(16)), bytes(range(16, 32)), b"ANS-0123456789ABCDEF and some more"
+        spec = self.new("Ljavax/crypto/spec/SecretKeySpec;", "([BLjava/lang/String;)V", dexvm._signed_bytes(key), "AES")
+        ivspec = self.new("Ljavax/crypto/spec/IvParameterSpec;", "([B)V", dexvm._signed_bytes(iv))
+        sealed = ciphers.cbc_encrypt(key, iv, ciphers.pad(plain))
+
+        def cipher(transformation, mode, params, *chunks):
+            state = self.call("Ljavax/crypto/Cipher;", "getInstance", "", transformation)
+            self.call("Ljavax/crypto/Cipher;", "init", "", state, mode, spec, *([params] if params else []))
+            out = []
+            for chunk in chunks[:-1]:
+                out += self.call("Ljavax/crypto/Cipher;", "update", "([B)[B", state, dexvm._signed_bytes(chunk))
+            return dexvm._bytes(out + self.call("Ljavax/crypto/Cipher;", "doFinal", "([B)[B", state, dexvm._signed_bytes(chunks[-1])))
+
+        self.assertEqual(cipher("AES/CBC/PKCS5Padding", 2, ivspec, sealed), plain)
+        self.assertEqual(cipher("AES/CBC/PKCS5Padding", 2, ivspec, sealed[:20], sealed[20:32], sealed[32:]), plain)
+        self.assertEqual(cipher("AES/CBC/PKCS5Padding", 1, ivspec, plain[:5], plain[5:]), sealed)
+        self.assertEqual(cipher("AES", 2, None, cipher("AES/ECB/PKCS5Padding", 1, None, plain)), plain)
+        self.assertEqual(cipher("AES/CTR/NoPadding", 2, ivspec, plain[:7], plain[7:]), ciphers.ctr(key, iv, plain))
+        nonce = self.new("Ljavax/crypto/spec/GCMParameterSpec;", "(I[B)V", 128, dexvm._signed_bytes(iv[:12]))
+        gcm = ciphers.ctr(key, iv[:12] + b"\0\0\0\2", plain, width=32) + bytes(16)  # The tag is not checked.
+        self.assertEqual(cipher("AES/GCM/NoPadding", 2, nonce, gcm), plain)
+        rc4 = cipher("RC4", 1, None, bytes(16))
+        self.assertEqual(rc4, ciphers.rc4(key, bytes(16)))
+        for bad in (lambda: cipher("AES/CBC/PKCS5Padding", 2, ivspec, sealed[:-1] + bytes([sealed[-1] ^ 1])),  # BadPadding
+                    lambda: cipher("AES/CBC/PKCS5Padding", 1, None, plain),  # Java would pick a random IV.
+                    lambda: cipher("DESede/CBC/PKCS5Padding", 2, ivspec, sealed),
+                    lambda: self.call("Ljavax/crypto/Cipher;", "doFinal", "([BI)I",
+                                      self.call("Ljavax/crypto/Cipher;", "getInstance", "", "AES"), [0] * 16, 0)):
+            with self.assertRaises(dexvm.Unsupported):
+                bad()
+
+    def test_mac_pbkdf2_and_biginteger(self):
+        key = self.new("Ljavax/crypto/spec/SecretKeySpec;", "([BLjava/lang/String;)V", dexvm._signed_bytes(b"Jefe"), "HmacSHA256")
+        mac = self.call("Ljavax/crypto/Mac;", "getInstance", "", "HmacSHA256")
+        self.call("Ljavax/crypto/Mac;", "init", "", mac, key)
+        self.call("Ljavax/crypto/Mac;", "update", "([B)V", mac, dexvm._signed_bytes(b"what do ya want "))
+        digest = self.call("Ljavax/crypto/Mac;", "doFinal", "([B)[B", mac, dexvm._signed_bytes(b"for nothing?"))
+        self.assertEqual(dexvm._bytes(digest).hex(), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")  # RFC 4231 #2
+        again = self.call("Ljavax/crypto/Mac;", "doFinal", "([B)[B", mac, dexvm._signed_bytes(b"what do ya want for nothing?"))
+        self.assertEqual(again, digest)  # doFinal resets to the initialized key.
+        spec = self.new("Ljavax/crypto/spec/PBEKeySpec;", "([C[BII)V", [ord(c) for c in "password"],
+                        dexvm._signed_bytes(b"salt"), 2, 160)
+        factory = self.call("Ljavax/crypto/SecretKeyFactory;", "getInstance", "", "PBKDF2WithHmacSHA1")
+        derived = self.call("Ljavax/crypto/SecretKeyFactory;", "generateSecret", "", factory, spec)
+        self.assertEqual(dexvm._bytes(self.call("Ljavax/crypto/SecretKey;", "getEncoded", "()[B", derived)).hex(),
+                         "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957")  # RFC 6070, c = 2
+        number = self.new("Ljava/math/BigInteger;", "(I[B)V", 1, [0, 0x0F, -1])
+        self.assertEqual(self.call("Ljava/math/BigInteger;", "toString", "(I)Ljava/lang/String;", number, 16), "fff")
+        negative = self.new("Ljava/math/BigInteger;", "([B)V", [-1, 0])
+        self.assertEqual(self.call("Ljava/math/BigInteger;", "toString", "()Ljava/lang/String;", negative), "-256")
+        self.assertEqual(self.call("Ljava/math/BigInteger;", "toByteArray", "()[B", negative), [-1, 0])
+        seven = self.call("Ljava/math/BigInteger;", "valueOf", "(J)Ljava/math/BigInteger;", -7)
+        three = self.call("Ljava/math/BigInteger;", "valueOf", "(J)Ljava/math/BigInteger;", 3)
+        results = [self.call("Ljava/math/BigInteger;", op, "", seven, three).value for op in ("divide", "remainder", "mod", "xor")]
+        self.assertEqual(results, [-2, -1, 2, -7 ^ 3])  # Java truncates; mod is never negative.
+
+    def test_own_package_signature_and_apk(self):
+        pm = self.call("Landroid/content/Context;", "getPackageManager", "", self.vm.context)
+        info = self.call("Landroid/content/pm/PackageManager;", "getPackageInfo", "", pm, "com.example.signed", 0x40)
+        self.assertEqual((info.fields["versionName"], info.fields["versionCode"]), ("1.4.2", 42))
+        self.assertEqual(self.call("Landroid/content/pm/PackageInfo;", "getLongVersionCode", "()J", info), 42)
+        signature = info.fields["signatures"][0]
+        self.assertEqual(dexvm._bytes(self.call("Landroid/content/pm/Signature;", "toByteArray", "()[B", signature)),
+                         self.certificate)
+        self.assertEqual(self.call("Landroid/content/pm/Signature;", "toCharsString", "", signature), self.certificate.hex())
+        self.assertEqual(self.call("Landroid/content/pm/Signature;", "hashCode", "()I", signature),
+                         self.call("Ljava/util/Arrays;", "hashCode", "([B)I", dexvm._signed_bytes(self.certificate)))
+        rotated = self.call("Landroid/content/pm/PackageManager;", "getPackageInfo", "", pm, "com.example.signed", 0x08000000)
+        signers = self.call("Landroid/content/pm/SigningInfo;", "getApkContentsSigners", "", rotated.fields["signingInfo"])
+        self.assertEqual(signers[0].data, self.certificate)
+        self.assertIsNone(info.fields["signingInfo"])  # Not asked for: null, as on a device.
+        stream = self.new("Ljava/io/ByteArrayInputStream;", "([B)V", dexvm._signed_bytes(self.certificate + b"tail"))
+        factory = self.call("Ljava/security/cert/CertificateFactory;", "getInstance", "", "X.509")
+        cert = self.call("Ljava/security/cert/CertificateFactory;", "generateCertificate", "", factory, stream)
+        self.assertEqual(self.call("Ljava/security/cert/Certificate;", "getEncoded", "()[B", cert),
+                         dexvm._signed_bytes(self.certificate))
+        path = self.call("Landroid/content/Context;", "getPackageCodePath", "", self.vm.context)
+        archive = self.new("Ljava/util/zip/ZipFile;", "(Ljava/lang/String;)V", path)
+        entry = self.call("Ljava/util/zip/ZipFile;", "getEntry", "", archive, "classes.dex")
+        with zipfile.ZipFile(BytesIO(self.apk)) as real:
+            info_dex = real.getinfo("classes.dex")
+        self.assertEqual((self.call("Ljava/util/zip/ZipEntry;", "getCrc", "()J", entry),
+                          self.call("Ljava/util/zip/ZipEntry;", "getSize", "()J", entry)), (info_dex.CRC, info_dex.file_size))
+        self.assertIsNone(self.call("Ljava/util/zip/ZipFile;", "getEntry", "", archive, "missing.bin"))
+        source = self.call("Landroid/content/Context;", "getApplicationInfo", "", self.vm.context).fields["sourceDir"]
+        handle = self.new("Ljava/io/File;", "(Ljava/lang/String;)V", source)
+        self.assertEqual(self.call("Ljava/io/File;", "length", "()J", handle), len(self.apk))
+        for bad in (lambda: self.call("Landroid/content/pm/PackageManager;", "getPackageInfo", "", pm, "com.android.vending", 0),
+                    lambda: self.new("Ljava/util/zip/ZipFile;", "(Ljava/lang/String;)V", "/data/app/other.apk"),
+                    lambda: self.call("Ljava/lang/StringBuilder;", "append", "(Ljava/lang/Object;)", dexvm.Builder(), path),
+                    lambda: dexvm._signers(apk(release_dex(), {}))):  # No v1 certificate.
+            with self.assertRaises(dexvm.Unsupported):
+                bad()
+        # versionName="@string/..." is resolved by the device from resources: using it stops the run.
+        self.vm = dexvm.Machine([], package="com.example.signed", apk=signed_apk(self.certificate, version_name=0x7F0D0001))
+        pm = self.call("Landroid/content/Context;", "getPackageManager", "", self.vm.context)
+        name = self.call("Landroid/content/pm/PackageManager;", "getPackageInfo", "", pm, "com.example.signed", 0).fields["versionName"]
+        with self.assertRaises(dexvm.Unsupported):
+            self.call("Ljava/lang/StringBuilder;", "append", "(Ljava/lang/String;)", dexvm.Builder(), name)
+
+    def test_bytecode_reaches_platform_new_and_static_fields(self):
+        # static String code(Context c) { return new BigInteger(1, "abc".getBytes(StandardCharsets.UTF_8)).toString(16); }
+        strings = ["LCode;", "Landroid/content/Context;", "Ljava/lang/String;", "Ljava/nio/charset/Charset;",
+                   "Ljava/nio/charset/StandardCharsets;", "Ljava/math/BigInteger;", "[B", "I", "V", "UTF_8",
+                   "getBytes", "<init>", "toString", "code", "abc"]
+        s = {text: index for index, text in enumerate(strings)}
+        types = [s[name] for name in strings[:9]]
+        t = {strings[string]: index for index, string in enumerate(types)}
+        protos = [(t["Ljava/lang/String;"], [t["Landroid/content/Context;"]]), (t["[B"], [t["Ljava/nio/charset/Charset;"]]),
+                  (t["V"], [t["I"], t["[B"]]), (t["Ljava/lang/String;"], [t["I"]])]
+        methods = [(t["LCode;"], 0, s["code"]), (t["Ljava/lang/String;"], 1, s["getBytes"]),
+                   (t["Ljava/math/BigInteger;"], 2, s["<init>"]), (t["Ljava/math/BigInteger;"], 3, s["toString"])]
+        fields = [(t["Ljava/nio/charset/StandardCharsets;"], t["Ljava/nio/charset/Charset;"], s["UTF_8"])]
+        code = ([0x62 | 0 << 8, 0, 0x1A | 1 << 8, s["abc"]]                 # sget-object v0, UTF_8; const-string v1, "abc"
+                + [0x6E | 2 << 12, 1, 0x0001, 0x0C | 1 << 8]                # invoke-virtual {v1, v0}, getBytes; move-result-object v1
+                + [0x22 | 2 << 8, t["Ljava/math/BigInteger;"], 0x12 | 3 << 8 | 1 << 12]  # new-instance v2; const/4 v3, 1
+                + [0x70 | 3 << 12, 2, 0x0132, 0x13 | 3 << 8, 16]            # invoke-direct {v2, v3, v1}, <init>; const/16 v3, 16
+                + [0x6E | 2 << 12, 3, 0x0032, 0x0C | 0 << 8, 0x11 | 0 << 8])  # toString(v2, v3); return-object v0
+        vm = dexvm.Machine([dexvm.Dex(build_dex(strings, types, protos, methods, t["LCode;"], [(0, 0x9, 5, 1, code)], fields))])
+        self.assertEqual(vm.invoke("LCode;", "code", "(Landroid/content/Context;)Ljava/lang/String;", [vm.context], False),
+                         b"abc".hex())
 
 
 class DexVmTests(unittest.TestCase):

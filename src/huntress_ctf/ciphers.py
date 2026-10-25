@@ -1,9 +1,10 @@
-"""AES and RC4 in pure Python (the package has no dependencies), decryption side only.
+"""AES and RC4 in pure Python (the package has no dependencies), for samples that carry their key.
 
 Real loaders replace a script's XOR with RC4 or AES, and an Android app's javax.crypto Cipher
-decrypts its own constants. Both lanes need the same two ciphers, so they live here. Only
-what a sample that carries its own key needs: the AES key schedule, the forward and inverse
-block cipher (ECB, CBC, CTR, GCM without the tag check), PKCS#7 unpadding, and RC4.
+decrypts its own constants (or encrypts a token it then hashes). Both lanes need the same two
+ciphers, so they live here. Only what a sample that carries its own key needs: the AES key
+schedule, the forward and inverse block cipher (ECB and CBC both ways, CTR, GCM decryption
+without the tag check), PKCS#7 padding, and RC4.
 Checked against FIPS-197 Appendix C and RFC 6229 in tests/test_ciphers.py.
 """
 
@@ -109,6 +110,27 @@ def unpad(data: bytes) -> bytes:
     if not data or len(data) % 16 or not 1 <= data[-1] <= 16 or data[-data[-1]:] != bytes([data[-1]]) * data[-1]:
         raise ValueError("bad padding")
     return data[:-data[-1]]
+
+
+def pad(data: bytes) -> bytes:
+    return data + bytes([16 - len(data) % 16]) * (16 - len(data) % 16)
+
+
+def ecb_encrypt(key: bytes, data: bytes) -> bytes:
+    if len(data) % 16:
+        raise ValueError("ECB data is not whole blocks")
+    keys = expand_key(bytes(key))
+    return b"".join(encrypt_block(keys, data[i:i + 16]) for i in range(0, len(data), 16))
+
+
+def cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    if len(iv) != 16 or len(data) % 16:
+        raise ValueError("CBC needs a 16-byte IV and whole blocks")
+    keys, out, prior = expand_key(bytes(key)), bytearray(), iv
+    for i in range(0, len(data), 16):
+        prior = encrypt_block(keys, bytes(a ^ b for a, b in zip(data[i:i + 16], prior)))
+        out += prior
+    return bytes(out)
 
 
 def ecb_decrypt(key: bytes, data: bytes) -> bytes:
