@@ -273,12 +273,11 @@ class Context:
             raise Unsupported("Context.getAssets() without the APK")
         try:
             with zipfile.ZipFile(BytesIO(self.apk)) as apk:
-                info = apk.getinfo("assets/" + name.lstrip("/"))
-                if info.file_size > MAX_ASSET_BYTES:
-                    raise Unsupported(f"asset {name} of {info.file_size} bytes")
-                return apk.read(info)
+                return read_member(apk, "assets/" + name.lstrip("/"), MAX_ASSET_BYTES)
         except KeyError:
             raise Unsupported(f"no asset {name}") from None
+        except ZIP_ERRORS as error:  # Past the cap (TooLarge) or damaged: no data, never a crash.
+            raise Unsupported(f"asset {name}: {error}") from None
 
 
 class Assets:

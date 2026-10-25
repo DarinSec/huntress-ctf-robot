@@ -266,6 +266,20 @@ class DexVmTests(unittest.TestCase):
         with self.assertRaises(dexvm.Unsupported):  # No APK, no assets.
             dexvm.Context("a.b").asset("payload.dex")
 
+    def test_damaged_asset_is_no_answer_not_a_crash(self):
+        # A flipped byte in a stored asset fails its CRC (BadZipFile); like every bounded read
+        # (ROBUSTNESS.md workstreams 3 and 4) that is no data, so the run stops with Unsupported.
+        content = b"payload-" * 64
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("assets/payload.dex", content)
+        damaged = bytearray(buffer.getvalue())
+        at = damaged.index(content)
+        damaged[at + 10] ^= 0xFF
+        with self.assertRaises(dexvm.Unsupported):
+            dexvm.Context("a.b", bytes(damaged)).asset("payload.dex")
+        self.assertEqual(dexvm.Context("a.b", buffer.getvalue()).asset("payload.dex"), content)
+
     def test_jni_names(self):
         self.assertEqual(dexvm.jni_name("Lcom/a_b/C;", "f"), "Java_com_a_1b_C_f")
 
