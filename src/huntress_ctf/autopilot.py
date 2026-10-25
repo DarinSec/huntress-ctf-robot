@@ -68,6 +68,8 @@ def lookup_challenge(client: Any, challenge_id: str) -> tuple[dict[str, Any], An
     day, lane = list_filters(challenge_id)
     if day is not None:
         # Cheapest first; later entries only run when an earlier one does not hold it.
+        # The lane-only fallback also resolves a web challenge the day filter hides,
+        # so the web lane needs no special case here.
         tries = [{"day": day, "lane": lane}, {"lane": lane}, {"day": day}, {}]
     else:
         tries = [{}]

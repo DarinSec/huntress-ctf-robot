@@ -186,40 +186,82 @@ class CurriculumWebSolver:
     def solve(self, context: Any) -> list[AnswerCandidate]:
         if handlers is None or not context.answer_ids:
             return []
-        url = context.url
-        if not url or not context.http.allows(url):
-            return []
         day = context.curriculum_day
         try:
             day_int: int | None = int(day)
         except (TypeError, ValueError):
             day_int = None
-        proof: str | None = None
-        chain: tuple[str, ...] = ()
-        with _scope(context.http) as transport:
-            try:
-                result = handlers.detect_and_solve(url, day_int)
-            except Exception:
-                # WebHandlerError, HostNotAllowed, transport errors: never guessed.
-                result = None
-            if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
-                proof = result
-                chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
-            else:
-                # No handler recovered a proof: the server may have stashed it in a signed
-                # (readable) session cookie it set during the run. Read it -- no new request.
-                for found in sessions.proofs_in_cookies(transport.seen_cookies, handlers.PROOF_PATTERN):
-                    if handlers.PROOF_PATTERN.fullmatch(found):
-                        proof, chain = found, ("web-cookie",)
-                        break
-        if proof is None:
-            return []  # Only a real proof string is real evidence (solver rules).
-        evidence = f"proof read from assigned target {url}"
-        return [
-            AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
-                            evidence=evidence, chain=chain)
-            for answer_id in context.answer_ids
-        ]
+        # Each answer gets its own assigned target: a day 11-15 mastery route lists several
+        # in `targets[]` and names them per question (artifact -> target id); days 1-10 list
+        # one. Build an id->url map plus an ordered list, and fall back to context.url (the
+        # first target) so a single-target route with no per-question mapping still solves.
+        targets_map: dict[str, str] = {}
+        target_list: list[str] = []
+        for t in context.targets or ():
+            if isinstance(t, dict):
+                tid = t.get("id")
+                turl = t.get("url") or t.get("target") or t.get("endpoint") or ""
+                if tid and turl:
+                    targets_map[tid] = turl
+                if turl:
+                    target_list.append(turl)
+            elif isinstance(t, str) and t:
+                target_list.append(t)
+        if not target_list and context.url:
+            target_list.append(context.url)
+
+        questions = context.attempt.get("questions", []) if isinstance(context.attempt, dict) else []
+        candidates: list[AnswerCandidate] = []
+
+        try:
+            with _scope(context.http) as transport:
+                for i, answer_id in enumerate(context.answer_ids):
+                    turl = None
+                    for q in questions:
+                        if isinstance(q, dict) and q.get("id") == answer_id:
+                            art = q.get("artifact")
+                            if art in targets_map:
+                                turl = targets_map[art]
+                            break
+                    if not turl:
+                        if i < len(target_list):
+                            turl = target_list[i]
+                        elif target_list:
+                            turl = target_list[0]
+                    if not turl or not context.http.allows(turl):
+                        continue
+
+                    seen_before = len(transport.seen_cookies)
+                    proof: str | None = None
+                    chain: tuple[str, ...] = ()
+                    try:
+                        result = handlers.detect_and_solve(turl, day_int)
+                    except Exception:
+                        # WebHandlerError, HostNotAllowed, transport errors: never guessed.
+                        result = None
+                    if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
+                        proof = result
+                        chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                    else:
+                        # No handler proof: the server may have stashed it in a signed
+                        # (readable) session cookie set during this target's run. Scan only
+                        # the cookies this target added, so the proof is credited to it.
+                        for found in sessions.proofs_in_cookies(
+                            transport.seen_cookies[seen_before:], handlers.PROOF_PATTERN
+                        ):
+                            if handlers.PROOF_PATTERN.fullmatch(found):
+                                proof, chain = found, ("web-cookie",)
+                                break
+                    if proof is None:
+                        continue  # Only a real proof string is real evidence (solver rules).
+                    evidence = f"proof read from assigned target {turl}"
+                    candidates.append(
+                        AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
+                                        evidence=evidence, chain=chain)
+                    )
+        except Exception:
+            return []
+        return candidates
 
 
 WEB_SOLVERS = (CurriculumWebSolver(),)
