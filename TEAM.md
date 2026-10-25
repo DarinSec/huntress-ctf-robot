@@ -33,7 +33,7 @@ cannot, and the values of the kinds a regex matches.
 | Mobile Android | Darin | Automatic; day 23's computed codes come from `dexvm.py` emulating the app's bytecode |
 | Script Analysis | Ilse | Automatic (`solvers/script.py` + `script_descriptors.py`): day 22 in 3.3 min, day 23's LYR layers and `<family>-<hex6>-<field>` ids merged |
 | Binary | David | Automatic (`solvers/binary.py`); day 23: a machine field of 0x14c answers the label `i386`, not 332 |
-| Web Exploitation | Parsa | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP and keep-alive reuse. Day 23 never ran - the lane was in `main` at 11:57 but the Homebase still had the day before's code |
+| Web Exploitation | Robot (Darin runs it); Parsa handlers, backups Ilse + David | Automatic (`solvers/web/`): curriculum handlers with scoped HTTP, keep-alive reuse, and solve-once-per-target. Days 1-15 (all vuln classes) solve live and are raced for Hall of Fame (30 routes, 25 Oct); day.sh races a new web day at release. Not in hof.sh (slow targets would hog the lock; `--reserve 8` blocks its masteries anyway). Backup is only for a brand-new vuln class the autonomous prober can't crack - Ilse or David take that single challenge by hand |
 
 ## Set up (Windows, macOS or Linux)
 

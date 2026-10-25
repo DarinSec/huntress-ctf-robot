@@ -166,7 +166,13 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   label `i386` (day 23 rejected 332 for the managed F# assemblies). Where a spelling is
   refused again, the split names the single answer and `_spellings` offers the label, the
   decimal and the hex code on an untimed attempt.
-- **Web Exploitation** (owner Parsa, live targets): manual.
+- **Web Exploitation: done (robot-owned).** `solvers/web/` (Parsa's curriculum handlers,
+  merged and extended): scoped HTTP, keep-alive reuse, solve-once-per-target, signed-cookie
+  proof fallback, autonomous prober. Days 1-15 (every vuln class) solve live and are raced
+  for Hall of Fame (30 routes, 25 Oct 2026). `day.sh` races a new web day at release; web is
+  deliberately left out of `hof.sh` (slow targets hog the robot lock, and `--reserve 8`
+  blocks its 8-deep mastery pools). A brand-new vuln class the prober cannot crack is the
+  only manual case -> Ilse or David take that single challenge by hand.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
   new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
