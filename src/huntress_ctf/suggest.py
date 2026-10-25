@@ -105,7 +105,8 @@ def ranked(prop: str, data: bytes) -> list[tuple[int, str, str, Any]]:
             continue
         for key, value in fields.items():
             joined = key.replace("_", "").lower()
-            score = (len(wanted & _words(key)) + (2 if key in (name, _bare(name)) else 0)
+            # The exact name beats the unit-stripped one: time_date_stamp_utc over time_date_stamp.
+            score = (len(wanted & _words(key)) + (3 if key == name else 2 if key == _bare(name) else 0)
                      # "cputype" is one word in the header but "cpu_type" in a property.
                      + (1 if len(joined) > 3 and joined in _bare(name).replace("_", "") else 0))
             if score:

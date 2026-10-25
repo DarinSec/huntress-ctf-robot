@@ -95,6 +95,43 @@ class BinaryPayloadTests(unittest.TestCase):
         self.assertEqual(self.solve(b"\0asm\x02\0\0\0", [("format", FORMAT)]), {})
         self.assertEqual(self.solve(b"NEKO", [("format", FORMAT)]), {})
 
+    def test_new_container_kinds_take_only_offered_tokens(self):
+        import io
+        import zipfile
+        from tests.test_binary import fat_fixture, macho_fixture
+
+        def zipped(*names):
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w") as archive:
+                for name in names:
+                    archive.writestr(name, b"synthetic")
+            return out.getvalue()
+
+        def classify(data, accepted=None, text=FORMAT):
+            ctx = archive_context({"unit--sample.bin": data}, [("unit_analysis_format", PREFIX + text)])
+            if accepted is not None:
+                ctx.attempt["questions"][0]["answer_format"] = {"kind": "enum", "accepted_values": accepted}
+            return {c.answer_id: c.answer for c in BinarySolver().solve(ctx)}.get("unit_analysis_format")
+
+        tokens = ["elf", "pe", "jar", "wasm", "macho", "macho_universal", "java_class", "dex", "pyc",
+                  "lua_bytecode", "beam", "apk", "zip"]
+        samples = {
+            "macho": macho_fixture(), "macho_universal": fat_fixture(),
+            "java_class": bytes.fromhex("cafebabe00000034") + bytes(16),
+            "dex": b"dex\n035\0" + bytes(0x70), "pyc": b"\xcb\r\r\n" + bytes(28),
+            "lua_bytecode": b"\x1bLuaT\0" + bytes(16), "beam": b"FOR1\0\0\0\x10BEAMAtU8" + bytes(8),
+            "apk": zipped("AndroidManifest.xml", "classes.dex"), "zip": zipped("readme.txt"), "pe": pe_fixture(),
+        }
+        for expected, blob in samples.items():
+            with self.subTest(kind=expected):
+                self.assertEqual(classify(blob, tokens), expected)
+        self.assertEqual(classify(macho_fixture(), ["elf", "pe", "mach-o"]), "mach-o")
+        self.assertIsNone(classify(macho_fixture(), ["elf", "pe", "jar"]))  # Not offered: no guess.
+        self.assertIsNone(classify(macho_fixture()))  # Day 25 wording lists no Mach-O token.
+        listed = FORMAT.replace("or neko_bytecode for NEKO bytecode", "neko_bytecode for NEKO bytecode, or macho for Mach-O")
+        self.assertEqual(classify(macho_fixture(), text=listed), "macho")
+        self.assertIsNone(classify(zipped("a/B.class"), tokens))  # Classfiles without Main-Class: skipped as before.
+
     def test_case_sensitive_section_predicate_and_order(self):
         blob = bytearray(pe_fixture())
         at = 0x98 + 0xf0

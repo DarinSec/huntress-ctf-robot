@@ -19,7 +19,7 @@ import zlib
 
 from ..containers import ZIP_ERRORS, decompress, read_member
 from ..state import GameMasterError, current_fields, deliveries
-from ._binary_formats import ELF, Neko, PE, ParseError, parse_images
+from ._binary_formats import ELF, MachO, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
 from ._binary_files import BinaryFiles, MAX_BINARY_MEMBER_BYTES
 from ._binary_managed import Jar, clr_version
@@ -99,6 +99,42 @@ def _config_field(question: Question, values: dict | None):
     if wanted:
         hits = [value for key, value in leaves.items() if key.rsplit(".", 1)[-1] == wanted]
         return hits[0] if len(hits) == 1 else None
+    return None
+
+
+# Container kinds by the tokens a classification question may list for them, the token days
+# 19-25 accepted first. A later day can add a kind (Mach-O, DEX, .pyc, ...) or rename one;
+# the question's accepted_values says which, so only a token the grader offers is sent.
+CONTAINER_TOKENS = {
+    "elf": ("elf",), "pe": ("pe", "native_pe"), "pe_cli": ("pe_cli", "dotnet", "pe_dotnet", "clr", "managed_pe"),
+    "jar": ("jar", "java_archive"), "wasm": ("wasm", "webassembly"), "neko": ("neko_bytecode", "neko"),
+    "macho": ("macho", "mach_o", "mach-o"),
+    "macho_fat": ("macho_fat", "macho_universal", "fat_macho", "universal_macho", "macho", "mach_o", "mach-o"),
+    "java_class": ("java_class", "class", "classfile", "jvm_class"), "dex": ("dex", "dalvik_dex", "dalvik"),
+    "apk": ("apk", "android_apk"), "zip": ("zip",), "pyc": ("pyc", "python_bytecode", "python_pyc"),
+    "lua": ("lua_bytecode", "luac", "lua"), "beam": ("beam", "erlang_beam", "beam_bytecode"),
+}
+_DAY25_KINDS = {"elf", "pe", "pe_cli", "jar", "wasm", "neko"}
+
+
+def _offered(question: Question) -> set[str] | None:
+    """The question's accepted_values, or None when its format lists none."""
+    accepted = question.answer_format.get("accepted_values")
+    if isinstance(accepted, (list, tuple)):
+        return {value for value in accepted if isinstance(value, str)}
+    return None
+
+
+def _bytecode_kind(data: bytes) -> str | None:
+    """Kinds that need only their magic and one header check (none parses as an image)."""
+    if data[:4] == b"dex\n" and data[7:8] == b"\0" and len(data) >= 0x70:
+        return "dex"
+    if len(data) >= 16 and data[2:4] == b"\r\n" and 3000 <= int.from_bytes(data[:2], "little") < 4000:
+        return "pyc"
+    if data[:4] == b"\x1bLua" and len(data) >= 12:
+        return "lua"
+    if data[:4] == b"FOR1" and data[8:12] == b"BEAM":
+        return "beam"
     return None
 
 
@@ -441,6 +477,44 @@ class AssignedArchive:
             return blob
         return self.files.read_index(blob, index)
 
+    def container_kind(self, data: bytes) -> str | None:
+        """What the final bytes are, each kind validated as days 19-25 did (malformed -> ParseError)."""
+        if data.startswith(b"\0asm"):
+            self.wasm(data)
+            return "wasm"
+        if data.startswith(b"PK"):
+            try:
+                self.jar(data).main
+                return "jar"
+            except ParseError:
+                names = set(self.jar(data).archive.namelist())
+                if "AndroidManifest.xml" in names and any(n.startswith("classes") and n.endswith(".dex") for n in names):
+                    return "apk"
+                if any(n.endswith(".class") for n in names):
+                    raise  # Classfiles without a unique Main-Class: what day 19 skipped.
+                return "zip"
+        if data.startswith(b"NEKO"):
+            Neko(data)                      # validate the header; malformed -> ParseError -> skipped
+            return "neko"
+        if kind := _bytecode_kind(data):
+            return kind
+        try:
+            image = self.image(data)
+        except ParseError:
+            if data[:4] == b"\xca\xfe\xba\xbe" and 45 <= int.from_bytes(data[6:8], "big") < 100:
+                return "java_class"       # Shares its magic with a fat Mach-O; the major version tells.
+            if len(parse_images(data)) > 1:
+                return "macho_fat"
+            raise
+        if isinstance(image, ELF):
+            return "elf"
+        if isinstance(image, PE):
+            if image.directory(14)[0]:
+                clr_version(image)
+                return "pe_cli"
+            return "pe"
+        return "macho" if isinstance(image, MachO) else None
+
     def image(self, data: bytes):
         if id(data) not in self.images:
             self.images[id(data)] = None
@@ -598,24 +672,13 @@ class AssignedArchive:
         if "Compute SHA-256 over the exact bytes of member" in q:
             return True, self.digest(data)
         if "Classify final bytes by magic and parsed container:" in q:
-            if data.startswith(b"\0asm"):
-                self.wasm(data)
-                return True, "wasm"
-            if data.startswith(b"PK"):
-                self.jar(data).main
-                return True, "jar"
-            if data.startswith(b"NEKO"):
-                Neko(data)                      # validate the header; malformed -> ParseError -> skipped
-                return True, "neko_bytecode"
-            image = self.image(data)
-            if isinstance(image, ELF):
-                return True, "elf"
-            if isinstance(image, PE):
-                if image.directory(14)[0]:
-                    clr_version(image)
-                    return True, "pe_cli"
-                return True, "pe"
-            return True, None
+            kind, offered = self.container_kind(data), _offered(question)
+            tokens = CONTAINER_TOKENS.get(kind, ())
+            if offered is None:
+                if kind in _DAY25_KINDS:
+                    return True, tokens[0]
+                offered = set(re.findall(r"\b([a-z][a-z0-9_-]*) for\b", q))  # "macho for Mach-O, ..."
+            return True, next((token for token in tokens if token in offered), None)
         if "Report x86-64 for an ELF/PE machine field identifying AMD64" in q:
             if data.startswith(b"\0asm"):
                 self.wasm(data)
