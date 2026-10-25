@@ -261,7 +261,7 @@ GATE_PAUSE_SECONDS = 30.0
 # listed but no answer_ids and no deadline yet (AGENTS guidance). Polling status until the
 # target is ready is read-only (no variant) and happens before the clock, like the gate.
 TARGET_READY_BUDGET_S = 120.0
-TARGET_POLL_INTERVAL_S = 3.0
+TARGET_POLL_INTERVAL_S = 1.0
 
 
 def _target_not_ready(attempt: Any) -> bool:

@@ -174,30 +174,61 @@ class CurriculumWebSolver:
     def solve(self, context: Any) -> list[AnswerCandidate]:
         if handlers is None or not context.answer_ids:
             return []
-        url = context.url
-        if not url or not context.http.allows(url):
-            return []
         day = context.curriculum_day
         try:
             day_int: int | None = int(day)
         except (TypeError, ValueError):
             day_int = None
+
+        targets_map: dict[str, str] = {}
+        target_list: list[str] = []
+        for t in context.targets or ():
+            if isinstance(t, dict):
+                tid = t.get("id")
+                turl = t.get("url") or t.get("target") or t.get("endpoint") or ""
+                if tid and turl:
+                    targets_map[tid] = turl
+                if turl:
+                    target_list.append(turl)
+            elif isinstance(t, str) and t:
+                target_list.append(t)
+
+        questions = context.attempt.get("questions", []) if isinstance(context.attempt, dict) else []
+        candidates: list[AnswerCandidate] = []
+
         try:
             with _scope(context.http):
-                proof = handlers.detect_and_solve(url, day_int)
+                for i, answer_id in enumerate(context.answer_ids):
+                    turl = None
+                    for q in questions:
+                        if isinstance(q, dict) and q.get("id") == answer_id:
+                            art = q.get("artifact")
+                            if art in targets_map:
+                                turl = targets_map[art]
+                            break
+                    if not turl:
+                        if i < len(target_list):
+                            turl = target_list[i]
+                        elif target_list:
+                            turl = target_list[0]
+                    if not turl or not context.http.allows(turl):
+                        continue
+
+                    try:
+                        proof = handlers.detect_and_solve(turl, day_int)
+                    except Exception:
+                        continue
+                    if not isinstance(proof, str) or not handlers.PROOF_PATTERN.fullmatch(proof):
+                        continue
+                    evidence = f"proof read from assigned target {turl}"
+                    chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                    candidates.append(
+                        AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
+                                        evidence=evidence, chain=chain)
+                    )
         except Exception:
-            # WebHandlerError, HostNotAllowed, transport errors: a web route with no proof
-            # is left UNRESOLVED, never guessed. Ported handlers must not break the race.
             return []
-        if not isinstance(proof, str) or not handlers.PROOF_PATTERN.fullmatch(proof):
-            return []  # Only a real proof string is real evidence (solver rules).
-        evidence = f"proof read from assigned target {url}"
-        chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
-        return [
-            AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
-                            evidence=evidence, chain=chain)
-            for answer_id in context.answer_ids
-        ]
+        return candidates
 
 
 WEB_SOLVERS = (CurriculumWebSolver(),)

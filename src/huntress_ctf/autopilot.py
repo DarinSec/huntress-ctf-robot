@@ -59,7 +59,10 @@ def lookup_challenge(client: Any, challenge_id: str) -> tuple[dict[str, Any], An
     an ID without a day needs the full list.
     """
     day, lane = list_filters(challenge_id)
-    tries = [{"day": day, "lane": lane}, {"day": day}] if day is not None else [{}]
+    if lane == "web-exploitation":
+        tries = [{"lane": "web-exploitation"}]
+    else:
+        tries = [{"day": day, "lane": lane}, {"day": day}] if day is not None else [{}]
     for filters in tries[:-1]:
         try:
             listing = client.list_challenges(**filters)
