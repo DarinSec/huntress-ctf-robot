@@ -208,6 +208,32 @@ class PropertyTests(unittest.TestCase):
         self.assertEqual(m.sqlite_page_size_bytes(bytes(header)), "65536")
         self.assertIsNone(m.sqlite_page_size_bytes(b"OggS mislabeled as .sqlite"))
 
+    def test_registry_hive_root_name(self):
+        # Synthetic regf hive (Day 25): header -> root nk cell, name latin-1 (flags & 0x20).
+        def hive(root_name: bytes) -> bytes:
+            base = bytearray(0x1000)
+            base[:4] = b"regf"
+            struct.pack_into("<IIQIIIIIII", base, 4, 7, 7, 0, 1, 5, 0, 1, 0x20, 0x1000, 1)
+            checksum = 0
+            for (word,) in struct.iter_unpack("<I", bytes(base[:508])):
+                checksum ^= word
+            struct.pack_into("<I", base, 0x1FC, checksum)
+            hbin = bytearray(0x1000)
+            hbin[:4] = b"hbin"
+            cell = 0x20
+            struct.pack_into("<i", hbin, cell, -(0x50 + len(root_name)))
+            nk = cell + 4
+            hbin[nk:nk + 2] = b"nk"
+            struct.pack_into("<HQ", hbin, nk + 2, 0x24, 0)
+            struct.pack_into("<I", hbin, nk + 0x14, 3)
+            struct.pack_into("<I", hbin, nk + 0x24, 2)
+            struct.pack_into("<H", hbin, nk + 0x48, len(root_name))
+            hbin[nk + 0x4C:nk + 0x4C + len(root_name)] = root_name
+            return bytes(base) + bytes(hbin)
+
+        self.assertEqual(m.registry_hive_root_name(hive(b"HuntressAssemblyLine")), "HuntressAssemblyLine")
+        self.assertIsNone(m.registry_hive_root_name(b"not a registry hive at all ...."))
+
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET
 
