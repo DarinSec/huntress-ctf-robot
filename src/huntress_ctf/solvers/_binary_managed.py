@@ -94,6 +94,7 @@ class Jar:
         if len(self.infos) > 65536:
             raise ParseError("Too many JAR entries")
         self._main = None
+        self._main_name = None
 
     def read(self, name: str) -> bytes:
         infos = [i for i in self.infos if i.filename == name and not i.is_dir()]
@@ -116,5 +117,23 @@ class Jar:
             names = [line.split(":", 1)[1].strip() for line in unfolded if line.casefold().startswith("main-class:")]
             if len(names) != 1 or not names[0] or "/" in names[0] or "\\" in names[0]:
                 raise ParseError("No unique manifest Main-Class")
-            self._main = JavaClass(self.read(names[0].replace(".", "/") + ".class"))
+            self._main_name = names[0].replace(".", "/") + ".class"
+            self._main = JavaClass(self.read(self._main_name))
         return self._main
+
+    def classes(self):
+        """The main class, then every other classfile in central-directory order.
+
+        "Parse every JAR classfile constant pool": day 24's Scala builds keep the HCFG
+        constant in the companion object (Day24Corrected000$.class), not the main class.
+        """
+        yield self.main
+        for info in self.infos:
+            if info.is_dir() or not info.filename.endswith(".class") or info.filename == self._main_name:
+                continue
+            if info.file_size > 16 * 1024 * 1024:
+                raise ParseError("Oversized JAR classfile")
+            try:
+                yield JavaClass(self.archive.read(info))
+            except ParseError:
+                continue
