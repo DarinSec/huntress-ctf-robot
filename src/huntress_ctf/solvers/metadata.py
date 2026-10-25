@@ -31,7 +31,7 @@ from xml.etree import ElementTree
 import zipfile
 import zlib
 
-from .. import formats
+from .. import formats, formats_dfir
 from ..macho import field as macho_field, slices as macho_slices
 from ..state import deliveries
 from .base import AnswerCandidate, Question, SolveContext, fits_format, question_items
@@ -637,6 +637,15 @@ def sqlite_page_size_bytes(data: bytes) -> str | None:
     return str(fields["page_size"]) if fields and "page_size" in fields else None
 
 
+def registry_hive_root_name(data: bytes) -> str | None:
+    """Windows Registry hive (regf): the root key's name (Day 25). The `regf` parser's
+    `root_key_name` -- the property is named hive_root_name, so autoprop cannot map it."""
+    for label, fields in formats_dfir.formats(data):
+        if label == "regf" and fields and fields.get("root_key_name"):
+            return str(fields["root_key_name"])
+    return None
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -659,6 +668,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "apk.package_name": apk_package_name,
     "jar.main_class": jar_main_class,
     "sqlite.page_size_bytes": sqlite_page_size_bytes,
+    "registry.hive_root_name": registry_hive_root_name,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
