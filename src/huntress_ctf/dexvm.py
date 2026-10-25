@@ -558,7 +558,56 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
         return this.package
     if cls == "Landroid/content/Context;" and name == "getPackageName" and vm.context.package:
         return vm.context.package
+    reflected = _reflection(cls, name, args, vm)
+    if reflected is not _NOT_REFLECTION:
+        return reflected
     raise Unsupported(f"{cls}->{name}{sig}")
+
+
+_PRIMITIVE_TYPES = {"Ljava/lang/Long;": "J", "Ljava/lang/Integer;": "I", "Ljava/lang/Short;": "S",
+                    "Ljava/lang/Byte;": "B", "Ljava/lang/Character;": "C", "Ljava/lang/Boolean;": "Z",
+                    "Ljava/lang/Double;": "D", "Ljava/lang/Float;": "F", "Ljava/lang/Void;": "V"}
+_NOT_REFLECTION = object()
+
+
+class JMethod:
+    def __init__(self, method: "Method") -> None:
+        self.method = method
+
+
+def _reflection(cls: str, name: str, args: list[Any], vm: "Machine") -> Any:
+    """Day 19's reflection maze (reused by Day 25 Mastery): Class.forName / getDeclaredMethod /
+    Method.invoke, but only into the app's own classes; reflection into the platform stays Unsupported."""
+    this = args[0] if args else None
+    if cls == "Ljava/lang/Class;" and name == "forName" and isinstance(this, str):
+        target = "L" + this.replace(".", "/") + ";"
+        if target not in vm.classes:
+            raise Unsupported(f"reflection into {target}")
+        return JClass(target)
+    if cls == "Ljava/lang/Class;" and name in ("getDeclaredMethod", "getMethod") and isinstance(this, JClass):
+        if this.name not in vm.classes or not isinstance(args[1], str):
+            raise Unsupported(f"reflection into {this.name}")
+        kinds = args[2] if len(args) > 2 and args[2] is not None else []
+        if not all(isinstance(kind, JClass) for kind in kinds):
+            raise Unsupported("reflective parameter types")
+        prefix = "(" + "".join(kind.name for kind in kinds) + ")"
+        owner = this.name
+        while owner in vm.classes:
+            hits = [m for (n, sig), m in vm.classes[owner].methods.items() if n == args[1] and sig.startswith(prefix)]
+            if len(hits) == 1:
+                return JMethod(hits[0])
+            owner = vm.classes[owner].superclass or ""
+        raise Unsupported(f"no method {this.name}->{args[1]}{prefix}")
+    if cls in ("Ljava/lang/reflect/Method;", "Ljava/lang/reflect/AccessibleObject;") and isinstance(this, JMethod):
+        if name == "setAccessible":
+            return None
+        if name == "invoke":
+            method = this.method
+            values = list(args[2]) if len(args) > 2 and args[2] is not None else []
+            static = bool(method.flags & ACC_STATIC)
+            sig = "(" + "".join(method.params) + ")" + method.ret
+            return vm.invoke(method.cls, method.name, sig, values if static else [args[1]] + values, not static)
+    return _NOT_REFLECTION
 
 
 # --- x86-64 subset for JNI `long f(long)` -------------------------------------------------------
@@ -589,20 +638,51 @@ def elf_symbol(lib: bytes, symbol: str) -> bytes | None:
     return None
 
 
+def _flags(kind: str, a: int, b: int, bits: int) -> tuple[int, int, int, int]:
+    """(result, CF, OF, bits) after `kind` on a, b: what a later jcc/cmovcc/setcc reads."""
+    mask, top = (1 << bits) - 1, 1 << (bits - 1)
+    a, b = a & mask, b & mask
+    if kind == "sub":
+        result = (a - b) & mask
+        return result, int(a < b), int(bool((a ^ b) & (a ^ result) & top)), bits
+    if kind == "add":
+        result = (a + b) & mask
+        return result, int(a + b > mask), int(bool(~(a ^ b) & (a ^ result) & top)), bits
+    return _alu(kind, a, b) & mask, 0, 0, bits
+
+
+def _condition(cc: int, flags: tuple[int, int, int, int] | None) -> bool:
+    if flags is None:
+        raise Unsupported("x86-64 branch without flags")
+    result, cf, of, bits = flags
+    zf, sf = result == 0, (result >> (bits - 1)) & 1
+    if cc in (0xA, 0xB):
+        raise Unsupported("x86-64 parity branch")
+    taken = {0: of, 2: cf, 4: zf, 6: cf or zf, 8: sf, 0xC: sf != of, 0xE: zf or sf != of}[cc & 0xE]
+    return bool(taken) != bool(cc & 1)
+
+
 def run_x64(code: bytes, arguments: list[int], wide: bool = True) -> int:
     regs = [0] * 16
     for index, value in zip(_X64_ARGS, arguments):
         regs[index] = value & M64
     stack: list[int] = []
+    flags: tuple[int, int, int, int] | None = None
     at = 0
 
     def width_fix(value: int, is64: bool) -> int:
         return value & (M64 if is64 else M32)
 
+    def byte_reg(index: int, rex: int) -> int:
+        # Without REX, byte registers 4-7 are ah, ch, dh, bh.
+        return regs[index] & 0xFF if rex or index < 4 else (regs[index - 4] >> 8) & 0xFF
+
     for _ in range(10_000):
         if code[at:at + 4] == b"\xf3\x0f\x1e\xfa":  # endbr64
             at += 4
             continue
+        word = code[at] == 0x66  # operand-size prefix: only compares/tests read 16-bit operands
+        at += 1 if word else 0
         rex = code[at] if 0x40 <= code[at] <= 0x4F else 0
         at += 1 if rex else 0
         w, r, b = bool(rex & 8), (rex >> 2) & 1, rex & 1
@@ -612,6 +692,34 @@ def run_x64(code: bytes, arguments: list[int], wide: bool = True) -> int:
             return regs[0] if wide else s32(regs[0])
         if op == 0x90:
             continue
+        # Branches (Day 25's JNI boundary checks a narrowed length before it mixes).
+        if 0x70 <= op <= 0x7F or op == 0xEB:
+            rel = int.from_bytes(code[at:at + 1], "little", signed=True)
+            at += 1
+            if op == 0xEB or _condition(op - 0x70, flags):
+                at += rel
+            continue
+        if op == 0xE9:
+            rel = int.from_bytes(code[at:at + 4], "little", signed=True)
+            at += 4 + rel
+            continue
+        if op == 0x0F and 0x80 <= code[at] <= 0x8F:
+            cc = code[at] - 0x80
+            rel = int.from_bytes(code[at + 1:at + 5], "little", signed=True)
+            at += 5
+            if _condition(cc, flags):
+                at += rel
+            continue
+        if op in (0x3D, 0xA9):  # cmp/test eax|rax, imm32
+            bits = 64 if w else 16 if word else 32
+            size = 2 if word else 4
+            imm = int.from_bytes(code[at:at + size], "little", signed=True)
+            at += size
+            flags = _flags("sub" if op == 0x3D else "and", regs[0], imm, bits)
+            continue
+        if word:
+            if op not in (0x39, 0x3B, 0x81, 0x83, 0x85, 0xF7):
+                raise Unsupported("x86-64 16-bit operand")
         if 0x50 <= op <= 0x57:
             stack.append(regs[(op - 0x50) | (b << 3)])
             continue
@@ -642,22 +750,52 @@ def run_x64(code: bytes, arguments: list[int], wide: bool = True) -> int:
         if modrm >> 6 != 3:
             raise Unsupported("x86-64 memory operand")
         reg, rm = ((modrm >> 3) & 7) | (r << 3), (modrm & 7) | (b << 3)
-        bits = 64 if w else 32
-        mask = M64 if w else M32
+        bits = 64 if w else 16 if word else 32
+        mask = (1 << bits) - 1
         alu = {0x01: "add", 0x03: "add", 0x29: "sub", 0x2B: "sub", 0x31: "xor", 0x33: "xor",
                0x21: "and", 0x23: "and", 0x09: "or", 0x0B: "or", 0x89: "mov", 0x8B: "mov"}
         if op in alu:
             dest, source = (rm, reg) if op & 2 == 0 else (reg, rm)
+            if alu[op] != "mov":
+                flags = _flags(alu[op], regs[dest], regs[source], bits)
             regs[dest] = width_fix(_alu(alu[op], regs[dest], regs[source]), w)
             continue
+        if op in (0x39, 0x3B, 0x85):  # cmp r/m,r | cmp r,r/m | test r/m,r
+            first, second = (rm, reg) if op != 0x3B else (reg, rm)
+            flags = _flags("and" if op == 0x85 else "sub", regs[first], regs[second], bits)
+            continue
         if op in (0x81, 0x83, 0xC7):
-            size = 1 if op == 0x83 else 4
+            size = 1 if op == 0x83 else 2 if word else 4
             imm = int.from_bytes(code[at:at + size], "little", signed=True)
             at += size
-            kind = "mov" if op == 0xC7 else {0: "add", 1: "or", 4: "and", 5: "sub", 6: "xor"}.get((modrm >> 3) & 7)
+            kind = "mov" if op == 0xC7 else {0: "add", 1: "or", 4: "and", 5: "sub", 6: "xor", 7: "cmp"}.get((modrm >> 3) & 7)
             if kind is None:
-                raise Unsupported("x86-64 compare")
+                raise Unsupported("x86-64 add/sub with carry")
+            if kind == "cmp":
+                flags = _flags("sub", regs[rm], imm & mask, bits)
+                continue
+            if kind != "mov":
+                flags = _flags(kind, regs[rm], imm & mask, bits)
             regs[rm] = width_fix(_alu(kind, regs[rm], imm & mask), w)
+            continue
+        if op in (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, 0x63):  # movzx / movsx / movsxd
+            if op in (0x0FB6, 0x0FBE):
+                value, size = byte_reg(rm, rex), 8
+            elif op == 0x63:
+                value, size = regs[rm] & M32, 32
+            else:
+                value, size = regs[rm] & 0xFFFF, 16
+            if op != 0x0FB6 and op != 0x0FB7 and value >> (size - 1):
+                value -= 1 << size
+            regs[reg] = width_fix(value, w)
+            continue
+        if 0x0F40 <= op <= 0x0F4F:  # cmovcc (32-bit form zero-extends even when not taken)
+            regs[reg] = width_fix(regs[rm] if _condition(op - 0x0F40, flags) else regs[reg], w)
+            continue
+        if 0x0F90 <= op <= 0x0F9F:  # setcc r/m8
+            if not rex and rm >= 4:
+                raise Unsupported("x86-64 setcc into ah..bh")
+            regs[rm] = (regs[rm] & ~0xFF) | int(_condition(op - 0x0F90, flags))
             continue
         if op == 0x0FAF:
             regs[reg] = width_fix(regs[reg] * regs[rm], w)
@@ -690,6 +828,12 @@ def run_x64(code: bytes, arguments: list[int], wide: bool = True) -> int:
             else:
                 raise Unsupported("x86-64 rotate through carry")
             regs[rm] = value
+            continue
+        if op == 0xF7 and (modrm >> 3) & 7 == 0:  # test r/m, imm32
+            size = 2 if word else 4
+            imm = int.from_bytes(code[at:at + size], "little", signed=True)
+            at += size
+            flags = _flags("and", regs[rm], imm & mask, bits)
             continue
         if op == 0xF7 and (modrm >> 3) & 7 in (2, 3):
             regs[rm] = width_fix(~regs[rm] if (modrm >> 3) & 7 == 2 else -regs[rm], w)
@@ -976,6 +1120,10 @@ class Machine:
                 pc += 2
             elif 0x60 <= op <= 0x6D:
                 cls, _, name = dex.fields[code[pc + 1]]
+                if cls in _PRIMITIVE_TYPES and name == "TYPE" and op <= 0x66:
+                    regs[a] = JClass(_PRIMITIVE_TYPES[cls])  # Long.TYPE -> "J": a reflective lookup's parameter
+                    pc += 2
+                    continue
                 if cls not in self.classes:
                     raise Unsupported(f"static field {cls}->{name}")
                 self._init_class(cls)
