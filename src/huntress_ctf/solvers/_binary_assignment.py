@@ -388,18 +388,50 @@ class AssignedArchive:
                 suffix = suffix[:-1] if suffix.endswith(".") else suffix
                 chosen = [(i, x) for i, x in chosen if PurePosixPath(x.filename).name.endswith(suffix)]
             else:
-                explicit = [word for word in ("plugin.cmxs", "loader.elf", "stripped.elf", "symbolized.elf", "compact.wasm", "direct.wasm") if word in q]
-                if len(explicit) == 1:
-                    chosen = [(i, x) for i, x in chosen if x.filename.endswith(explicit[0])]
+                # The role a question names, from a "Use the d21-- plugin.cmxs member" phrase or
+                # its answer ID (d15_analysis_stripped_machine), picks the one member named
+                # <prefix>...-<role>.<ext>: stripped/symbolized, compact/direct, loader/plugin and
+                # vulnerable/corrected so far, so a new day's pair needs no new code.
+                named = re.search(r"Use the (?:unique )?[A-Za-z0-9_.-]+-- ([A-Za-z0-9_.-]+) member", q)
+                role = re.match(r"(?:set\d+\.)?d\d+_analysis_([a-z0-9]+)_", question.answer_id)
+                if named:
+                    picked = [(i, x) for i, x in chosen if PurePosixPath(x.filename).name.endswith(named[1])]
+                elif role:
+                    picked = [(i, x) for i, x in chosen if PurePosixPath(x.filename).stem.endswith("-" + role[1])]
+                else:
+                    picked = []
+                if len(picked) == 1:
+                    chosen = picked
             if len(chosen) > 1 and "primary managed assembly" in family_text:
                 # The primary assembly has its own .runtimeconfig.json, a dependency DLL has
                 # none (day 22: d22--sample.dll beside d22--FSharp.Core.dll).
                 configs = {PurePosixPath(x.filename).name for x in infos if x.filename.endswith(".runtimeconfig.json")}
                 chosen = [(i, x) for i, x in chosen
                           if PurePosixPath(x.filename).name.rsplit(".", 1)[0] + ".runtimeconfig.json" in configs]
+        if len(chosen) == 2 and "require their config objects to be byte-for-byte equal" in q:
+            # Day 24: "Decode both d24-- role members" (vulnerable and corrected build) and
+            # answer only the config they share; a mismatch has no common value.
+            members = [self.member(reference, blob, index, info) for index, info in chosen]
+            shared = {(c.crc, json.dumps(c.values, sort_keys=True)) for c in (self.config(question, m) for m in members)}
+            return members[0] if len(shared) == 1 else None
+        if len(chosen) > 1 and not self.timed and "HCFG" in q and _config_field(question, None) is not None:
+            # Untimed only: a selector no rule knows left several members. Answer the config
+            # that every member carrying a CRC32/JSON-valid one agrees on, else nothing; a
+            # wrong one costs a single answer there (learn splits a rejected kind).
+            found = []
+            for index, info in chosen:
+                data = self.member(reference, blob, index, info)
+                try:
+                    found.append((data, self.config(question, data)))
+                except (ParseError, ValueError, zipfile.BadZipFile):
+                    continue
+            shared = {(c.crc, json.dumps(c.values, sort_keys=True)) for _, c in found}
+            return found[0][0] if len(shared) == 1 else None
         if len(chosen) != 1:
             return None
-        index, info = chosen[0]
+        return self.member(reference, blob, *chosen[0])
+
+    def member(self, reference: str, blob: bytes, index: int, info: zipfile.ZipInfo) -> bytes:
         key = (id(blob), index)
         if key in self.content:
             return self.content[key]
@@ -474,37 +506,54 @@ class AssignedArchive:
         key = (id(data), scope_key)
         if key not in self.configs:
             self.configs[key] = None  # Cache failed validation as well as success.
-            if scope_key in ("packed_overlay", "resource_overlay"):
-                node = self.record(self.overlay(question, data).payload, 0)
-            elif scope_key == "wasm_data_segment":
-                found = []
-                for start, payload in self.wasm(data).data_segments:
-                    at, count = 0, 0
-                    while (at := payload.find(b"HCFG", at)) >= 0:
-                        count += 1
-                        if count > 4096:
-                            raise ParseError("WebAssembly HCFG scan exceeded bound")
-                        candidate = self.record(payload, at)
-                        if candidate:
-                            found.append(Config(start + at, candidate.version, candidate.key,
-                                                candidate.crc, candidate.values, "wasm_data_segment"))
-                        at += 4
-                if len(found) != 1:
-                    raise ParseError("No unique valid HCFG in WebAssembly data segments")
-                node = found[0]
-            elif scope_key == "discover":
+            node = self._carrier(question, data, scope_key)
+            if node is None and not self.timed and scope_key != "discover":
+                # A named rule that finds nothing is searched like an unknown one (untimed only):
+                # day 24's "every JAR classfile" rule was known, but read only the Main-Class.
+                # A rule that raises found something inconsistent (bounds, a second record) and
+                # stays refused: the payload tests pin that.
                 node = self.discover(data)
-            elif scope_key == "section":
-                sections = [s for s in self.image(data).sections if s.name == ".hcfg"]
-                if len(sections) != 1:
-                    raise ParseError("No unique .hcfg section")
-                section = sections[0]
-                node = self.record(data[section.offset:section.offset + section.size], 0)
-                if node:
-                    node = Config(section.offset, node.version, node.key, node.crc, node.values, "raw_hcfg_section")
-            elif scope_key == "jar":
-                node = None
-                for offset, text in self.jar(data).main.utf8:
+            if node is None:
+                raise ParseError("No bounds/CRC/JSON-valid HCFG record")
+            self.configs[key] = node
+        if self.configs[key] is None:
+            raise ParseError("Cached unsupported HCFG carrier")
+        return self.configs[key]
+
+    def _carrier(self, question: Question, data: bytes, scope_key: str) -> Config | None:
+        """The record the named storage rule finds: None or ParseError when it finds none."""
+        if scope_key in ("packed_overlay", "resource_overlay"):
+            node = self.record(self.overlay(question, data).payload, 0)
+        elif scope_key == "wasm_data_segment":
+            found = []
+            for start, payload in self.wasm(data).data_segments:
+                at, count = 0, 0
+                while (at := payload.find(b"HCFG", at)) >= 0:
+                    count += 1
+                    if count > 4096:
+                        raise ParseError("WebAssembly HCFG scan exceeded bound")
+                    candidate = self.record(payload, at)
+                    if candidate:
+                        found.append(Config(start + at, candidate.version, candidate.key,
+                                            candidate.crc, candidate.values, "wasm_data_segment"))
+                    at += 4
+            if len(found) != 1:
+                raise ParseError("No unique valid HCFG in WebAssembly data segments")
+            node = found[0]
+        elif scope_key == "discover":
+            node = self.discover(data)
+        elif scope_key == "section":
+            sections = [s for s in self.image(data).sections if s.name == ".hcfg"]
+            if len(sections) != 1:
+                raise ParseError("No unique .hcfg section")
+            section = sections[0]
+            node = self.record(data[section.offset:section.offset + section.size], 0)
+            if node:
+                node = Config(section.offset, node.version, node.key, node.crc, node.values, "raw_hcfg_section")
+        elif scope_key == "jar":
+            node = None
+            for javaclass in self.jar(data).classes():
+                for offset, text in javaclass.utf8:
                     if len(text) < 80 or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", text):
                         continue
                     try:
@@ -515,36 +564,33 @@ class AssignedArchive:
                     if candidate:
                         node = Config(offset, candidate.version, candidate.key, candidate.crc, candidate.values, "base64")
                         break
-            elif scope_key.startswith(("hex_", "base64url_")):
-                codec = scope_key.split("_")[0]
-                node = self.encoded_config(data, codec, scope_key.endswith("_first"))
-            else:
-                node, start, found = None, 0, []
-                if scope_key != "base64":
-                    for _ in range(4096):
-                        offset = data.find(b"HCFG", start)
-                        if offset < 0:
+                if node:
+                    break
+        elif scope_key.startswith(("hex_", "base64url_")):
+            codec = scope_key.split("_")[0]
+            node = self.encoded_config(data, codec, scope_key.endswith("_first"))
+        else:
+            node, start, found = None, 0, []
+            if scope_key != "base64":
+                for _ in range(4096):
+                    offset = data.find(b"HCFG", start)
+                    if offset < 0:
+                        break
+                    candidate = self.record(data, offset)
+                    if candidate:
+                        found.append(candidate)
+                        if scope_key != "unique_literal":
                             break
-                        candidate = self.record(data, offset)
-                        if candidate:
-                            found.append(candidate)
-                            if scope_key != "unique_literal":
-                                break
-                        start = offset + 4
-                    else:
-                        raise ParseError("HCFG scan exceeded candidate bound")
-                    if len(found) > 1:
-                        raise ParseError("Multiple valid literal HCFG records")
-                    node = found[0] if found else None
-                if node is None and (scope_key == "base64" or scope_key.startswith("literal_then_")):
-                    codec = scope_key.removeprefix("literal_then_")
-                    node = self.encoded_config(data, codec, True)
-            if node is None:
-                raise ParseError("No bounds/CRC/JSON-valid HCFG record")
-            self.configs[key] = node
-        if self.configs[key] is None:
-            raise ParseError("Cached unsupported HCFG carrier")
-        return self.configs[key]
+                    start = offset + 4
+                else:
+                    raise ParseError("HCFG scan exceeded candidate bound")
+                if len(found) > 1:
+                    raise ParseError("Multiple valid literal HCFG records")
+                node = found[0] if found else None
+            if node is None and (scope_key == "base64" or scope_key.startswith("literal_then_")):
+                codec = scope_key.removeprefix("literal_then_")
+                node = self.encoded_config(data, codec, True)
+        return node
 
     def answer(self, question: Question, data: bytes) -> tuple[bool, str | None]:
         """handled/answer: recognized but unsupported templates must not fall through."""

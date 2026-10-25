@@ -29,9 +29,10 @@ def archive_context(files, prompts):
     return replace(ctx, attempt={"questions": qs}, answer_ids=tuple(q["id"] for q in qs))
 
 
-def java_fixture():
-    strings = ["Fixture", "java/lang/Object", "<init>", "()V", "main", "([Ljava/lang/String;)V",
-               base64.b64encode(config_record()).decode()]
+def java_fixture(name="Fixture", record=b"default"):
+    strings = [name, "java/lang/Object", "<init>", "()V", "main", "([Ljava/lang/String;)V"]
+    if record:
+        strings.append(base64.b64encode(config_record() if record == b"default" else record).decode())
     constants = []
     indices = {}
     for text in strings:
@@ -39,7 +40,7 @@ def java_fixture():
         raw = text.encode()
         constants.append(b"\x01" + struct.pack(">H", len(raw)) + raw)
     this = len(constants) + 1
-    constants.append(b"\x07" + struct.pack(">H", indices['Fixture']))
+    constants.append(b"\x07" + struct.pack(">H", indices[name]))
     parent = len(constants) + 1
     constants.append(b"\x07" + struct.pack(">H", indices['java/lang/Object']))
     header = struct.pack(">IHHH", 0xcafebabe, 0, 52, len(constants) + 1)
@@ -99,6 +100,65 @@ class AssignedBinaryTests(unittest.TestCase):
         got={c.answer_id:c.answer for c in BinarySolver().solve(archive_context({'unit--java.jar':jar},prompts))}
         self.assertEqual(got,{'unit_analysis_format':'JAR','unit_analysis_methods':'["<init>","main"]','unit_analysis_flags':'33','unit_analysis_codecs':'[0,8]','unit_analysis_campaign':'synthetic-campaign'})
         with self.assertRaises(ValueError): JavaClass(java_fixture()[:-1])
+
+    def test_jar_config_in_companion_class_and_role_pair(self):
+        # Day 24: Scala builds keep the HCFG constant in Main$ (not the Main-Class), and the
+        # shared config questions name both role members and require equal configs.
+        def jar(record):
+            blob = BytesIO()
+            with zipfile.ZipFile(blob, 'w') as archive:
+                archive.writestr('META-INF/MANIFEST.MF', b'Manifest-Version: 1.0\r\nMain-Class: Main\r\n\r\n')
+                archive.writestr('Main$.class', java_fixture('Main$', record))
+                archive.writestr('Main.class', java_fixture('Main', None))
+            return blob.getvalue()
+        rule = ('Parse every JAR classfile constant pool; for Base64-alphabet UTF-8 constants of at least 80 characters, '
+                'Base64-decode and accept the first CRC32-valid HCFG JSON record. Submit the exact string value of the '
+                'decoded HCFG JSON object\'s top-level campaign property, without JSON quotes.')
+        prompts = [('u_analysis_config_campaign', 'In evidence.zip, Decode both unit-- role members and require their config objects to be byte-for-byte equal before using the common value. ' + rule),
+                   ('u_analysis_corrected_config_campaign', 'In evidence.zip, Use the unique unit-- member whose basename ends corrected.jar. ' + rule)]
+        padded = config_record({'campaign': 'synthetic-campaign', 'padding': 'fixture' * 12})
+        same = {'unit--sample-vulnerable.jar': jar(padded), 'unit--sample-corrected.jar': jar(padded)}
+        got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context(same, prompts))}
+        self.assertEqual(got, {'u_analysis_config_campaign': 'synthetic-campaign', 'u_analysis_corrected_config_campaign': 'synthetic-campaign'})
+        other = config_record({'campaign': 'other-campaign', 'padding': 'fixture' * 12})
+        differ = {'unit--sample-vulnerable.jar': jar(other), 'unit--sample-corrected.jar': jar(padded)}
+        got = {c.answer_id: c.answer for c in BinarySolver().solve(archive_context(differ, prompts))}
+        self.assertEqual(got, {'u_analysis_corrected_config_campaign': 'synthetic-campaign'})
+
+    def test_untimed_fallbacks_answer_wording_no_rule_knows(self):
+        # A new day's wording, anticipated (the fallbacks are untimed only, CRC32/JSON-checked):
+        # a named carrier that finds nothing is searched like an unknown one; a selector no rule
+        # knows answers the config every member agrees on; a role pair is picked by the answer
+        # ID's role word (<prefix>...-<role>.<ext>), as days 15, 16, 21 and 24 name them.
+        def native(campaign):
+            return pe_fixture() + b'\0' + config_record({'campaign': campaign, 'padding': 'fixture' * 12})
+        field = " Submit the exact string value of the decoded HCFG JSON object's top-level campaign property."
+        literal = 'Scan the specified member for literal HCFG magic and accept the first record whose bounds, CRC32, and decoded JSON are valid.'
+        def solve(files, prompts, timed=False):
+            ctx = archive_context(files, prompts)
+            if timed:
+                ctx = replace(ctx, attempt=dict(ctx.attempt, deadline='2026-10-24T13:00:00Z'))
+            return {c.answer_id: c.answer for c in BinarySolver().solve(ctx)}
+
+        # The named Base64 rule finds nothing (the record is literal): untimed, the search finds it.
+        named = [('d97_analysis_config_campaign', 'In evidence.zip, Use all d97-- members in ZIP central-directory order. '
+                  'Test every non-overlapping Latin-1 run matching [A-Za-z0-9+/]{100,}={0,2} by Base64-decoding it.' + field)]
+        files = {'d97--sample.exe': native('carrier-fallback')}
+        self.assertEqual(solve(files, named), {'d97_analysis_config_campaign': 'carrier-fallback'})
+        self.assertEqual(solve(files, named, timed=True), {})
+
+        shared = [('d98_analysis_config_campaign', 'In evidence.zip, Compare the d98-- builds and use the config they have in common. ' + literal + field)]
+        same = {'d98--sample-alpha.exe': native('shared'), 'd98--sample-beta.exe': native('shared')}
+        self.assertEqual(solve(same, shared), {'d98_analysis_config_campaign': 'shared'})
+        self.assertEqual(solve(same, shared, timed=True), {})
+        self.assertEqual(solve({'d98--sample-alpha.exe': native('one'), 'd98--sample-beta.exe': native('two')}, shared), {})
+
+        role = [('d99_analysis_patched_config_campaign', 'In evidence.zip, Read the d99-- patched build. ' + literal + field),
+                ('d99_analysis_unpatched_config_campaign', 'In evidence.zip, Read the d99-- unpatched build. ' + literal + field)]
+        pair = {'d99--sample-unpatched.exe': native('before'), 'd99--sample-patched.exe': native('after')}
+        expected = {'d99_analysis_patched_config_campaign': 'after', 'd99_analysis_unpatched_config_campaign': 'before'}
+        self.assertEqual(solve(pair, role), expected)
+        self.assertEqual(solve(pair, role, timed=True), expected)  # The role rule is exact, not a guess.
 
     def test_base64_config_records_keep_carrier_offset(self):
         original=pe_fixture()

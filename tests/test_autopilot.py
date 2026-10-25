@@ -110,8 +110,28 @@ class UntimedSolveTests(unittest.TestCase):
         client.list_challenges = list_challenges
         found, _ = lookup_challenge(client, "web-day-02-x")
         self.assertEqual(found, record)
-        # The ID's lane missed, so the day was listed; the 80-second full list never was.
-        self.assertEqual(lists, [(2, "web"), (2, None)])
+        # day+lane missed, lane-only missed, so the day was listed; the 80 s full list never was.
+        self.assertEqual(lists, [(2, "web"), (None, "web"), (2, None)])
+
+    def test_web_id_hidden_from_its_day_resolves_lane_wide(self):
+        # A web challenge is not under its day-01 filter, nor in the day's full list, but it
+        # is in the lane-wide listing. Lookup must fall back to lane-only instead of failing.
+        record = {"id": "web-exploitation-day-01-backup-exposure", "lane": "web-exploitation",
+                  "curriculum_day": 1}
+        lists = []
+
+        def list_challenges(day=None, lane=None):
+            lists.append((day, lane))
+            # Only the lane-only query (day is None, lane set) returns the web challenge.
+            if day is None and lane == "web-exploitation":
+                return {"challenges": [record]}
+            return {"challenges": []}
+        client = FakeClient()
+        client.list_challenges = list_challenges
+        found, _ = lookup_challenge(client, "web-exploitation-day-01-backup-exposure")
+        self.assertEqual(found, record)
+        # Stopped at the lane-wide listing: the whole-day and 80 s full list were never run.
+        self.assertEqual(lists, [(1, "web-exploitation"), (None, "web-exploitation")])
 
     def test_legacy_route_start_reports_the_running_clock(self):
         client = FakeClient()

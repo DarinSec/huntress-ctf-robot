@@ -31,6 +31,7 @@ from urllib.parse import urljoin, urlsplit
 
 from ..base import AnswerCandidate
 from . import HostNotAllowed, ScopedHttp
+from . import sessions
 
 try:  # handlers.py is third-party within the repo; a broken import must not kill discovery.
     from . import handlers
@@ -63,6 +64,9 @@ class _ScopedTransport:
     def __init__(self, http: ScopedHttp) -> None:
         self._http = http
         self._conns: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
+        # Cookie values the target set during the run, so the adapter can read a proof the
+        # server stashed in a (signed, not encrypted) session cookie -- no extra request.
+        self.seen_cookies: list[str] = []
 
     # -- connection pool ---------------------------------------------------------------
     def _connection(self, scheme: str, host: str, port: int,
@@ -146,6 +150,11 @@ class _ScopedTransport:
             oversize = len(raw) > self._http.max_bytes
             body = raw[: self._http.max_bytes].decode("utf-8", "replace")
             resp_headers = {name.lower(): value for name, value in response.getheaders()}
+            for hname, hvalue in response.getheaders():
+                if hname.lower() == "set-cookie":
+                    pair = hvalue.split(";", 1)[0]
+                    if "=" in pair:
+                        self.seen_cookies.append(pair.split("=", 1)[1])
             if oversize or response.version < 11 or resp_headers.get("connection", "").lower() == "close":
                 self._drop(key)  # not safely reusable: a fresh socket next time
             return response.status, body, resp_headers
@@ -153,14 +162,17 @@ class _ScopedTransport:
 
 
 @contextlib.contextmanager
-def _scope(http: ScopedHttp) -> Iterator[None]:
-    """Confine `handlers`' network to `http`'s allowlist, over one pooled connection."""
+def _scope(http: ScopedHttp) -> Iterator["_ScopedTransport"]:
+    """Confine `handlers`' network to `http`'s allowlist, over one pooled connection.
+
+    Yields the transport so the caller can read the cookies the target set during the run.
+    """
     with _PATCH_LOCK:
         transport = _ScopedTransport(http)
         original = handlers._request
         handlers._request = transport.request
         try:
-            yield
+            yield transport
         finally:
             handlers._request = original
             transport.close()
@@ -174,30 +186,88 @@ class CurriculumWebSolver:
     def solve(self, context: Any) -> list[AnswerCandidate]:
         if handlers is None or not context.answer_ids:
             return []
-        url = context.url
-        if not url or not context.http.allows(url):
-            return []
         day = context.curriculum_day
         try:
             day_int: int | None = int(day)
         except (TypeError, ValueError):
             day_int = None
+        # Each answer gets its own assigned target: a day 11-15 mastery route lists several
+        # in `targets[]` and names them per question (artifact -> target id); days 1-10 list
+        # one. Build an id->url map plus an ordered list, and fall back to context.url (the
+        # first target) so a single-target route with no per-question mapping still solves.
+        targets_map: dict[str, str] = {}
+        target_list: list[str] = []
+        for t in context.targets or ():
+            if isinstance(t, dict):
+                tid = t.get("id")
+                turl = t.get("url") or t.get("target") or t.get("endpoint") or ""
+                if tid and turl:
+                    targets_map[tid] = turl
+                if turl:
+                    target_list.append(turl)
+            elif isinstance(t, str) and t:
+                target_list.append(t)
+        if not target_list and context.url:
+            target_list.append(context.url)
+
+        questions = context.attempt.get("questions", []) if isinstance(context.attempt, dict) else []
+        # answer_id -> artifact (the target id it names), resolved once: the loop below is
+        # O(answers + questions), not O(answers x questions) as a per-answer scan would be.
+        artifact_of = {q["id"]: q.get("artifact") for q in questions
+                       if isinstance(q, dict) and "id" in q}
+        candidates: list[AnswerCandidate] = []
+        # proof by target url: a route may map several answers to one target (every day 1-10
+        # answer shares the single target), and the multi-step network walk is the dominant
+        # on-clock cost, so each distinct target is solved once and its proof reused.
+        solved: dict[str, tuple[str, tuple[str, ...]]] = {}
+
         try:
-            with _scope(context.http):
-                proof = handlers.detect_and_solve(url, day_int)
+            with _scope(context.http) as transport:
+                for i, answer_id in enumerate(context.answer_ids):
+                    turl = targets_map.get(artifact_of.get(answer_id))
+                    if not turl:
+                        turl = target_list[i] if i < len(target_list) else (
+                            target_list[0] if target_list else None)
+                    if not turl or not context.http.allows(turl):
+                        continue
+
+                    if turl in solved:
+                        proof, chain = solved[turl]
+                    else:
+                        seen_before = len(transport.seen_cookies)
+                        proof = None
+                        chain = ()
+                        try:
+                            result = handlers.detect_and_solve(turl, day_int)
+                        except Exception:
+                            # WebHandlerError, HostNotAllowed, transport errors: never guessed.
+                            result = None
+                        if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
+                            proof = result
+                            chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                        else:
+                            # No handler proof: the server may have stashed it in a signed
+                            # (readable) session cookie set during this target's run. Scan
+                            # only the cookies this target added, so the proof is credited
+                            # to it.
+                            for found in sessions.proofs_in_cookies(
+                                transport.seen_cookies[seen_before:], handlers.PROOF_PATTERN
+                            ):
+                                if handlers.PROOF_PATTERN.fullmatch(found):
+                                    proof, chain = found, ("web-cookie",)
+                                    break
+                        if proof is not None:
+                            solved[turl] = (proof, chain)
+                    if proof is None:
+                        continue  # Only a real proof string is real evidence (solver rules).
+                    evidence = f"proof read from assigned target {turl}"
+                    candidates.append(
+                        AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
+                                        evidence=evidence, chain=chain)
+                    )
         except Exception:
-            # WebHandlerError, HostNotAllowed, transport errors: a web route with no proof
-            # is left UNRESOLVED, never guessed. Ported handlers must not break the race.
             return []
-        if not isinstance(proof, str) or not handlers.PROOF_PATTERN.fullmatch(proof):
-            return []  # Only a real proof string is real evidence (solver rules).
-        evidence = f"proof read from assigned target {url}"
-        chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
-        return [
-            AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
-                            evidence=evidence, chain=chain)
-            for answer_id in context.answer_ids
-        ]
+        return candidates
 
 
 WEB_SOLVERS = (CurriculumWebSolver(),)
