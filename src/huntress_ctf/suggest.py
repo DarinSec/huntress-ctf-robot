@@ -46,7 +46,16 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "xz": "xz", "bzip2": "bzip2", "bz2": "bzip2", "zstd": "zstd", "zst": "zstd", "lz4": "lz4",
                "ar": "ar", "deb": "ar", "debian": "ar", "pyc": "pyc", "python": "pyc", "rtf": "rtf",
                "crx": "crx", "ese": "ese", "edb": "ese", "srum": "ese", "ole": "ole", "ole2": "ole",
-               "cfb": "ole", "doc": "ole", "xls": "ole", "ppt": "ole", "msg": "ole", "msi": "ole"}
+               "cfb": "ole", "doc": "ole", "xls": "ole", "ppt": "ole", "msg": "ole", "msi": "ole",
+               "jumplist": "ole", "jump_list": "ole", "destlist": "ole", "automaticdestinations": "ole",
+               "customdestinations": "custom_destinations", "custom_destinations": "custom_destinations",
+               "mft": "mft", "ntfs": "ntfs", "usn": "usn", "usnjrnl": "usn", "usn_journal": "usn",
+               "recycle": "recycle_bin_i", "recyclebin": "recycle_bin_i", "recycle_bin": "recycle_bin_i",
+               "minidump": "minidump", "mdmp": "minidump", "dmp": "minidump", "crashdump": "minidump",
+               "task": "scheduled_task", "scheduled_task": "scheduled_task", "schtask": "scheduled_task",
+               "ewf": "ewf", "e01": "ewf", "encase": "ewf", "mbr": "mbr", "gpt": "gpt", "dmg": "dmg",
+               "udif": "dmg", "ds_store": "ds_store", "dsstore": "ds_store", "x509": "x509",
+               "certificate": "x509", "cert": "x509", "pem": "x509", "der": "x509"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 
 
