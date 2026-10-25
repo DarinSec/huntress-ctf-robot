@@ -19,6 +19,7 @@ import struct
 import zipfile
 import zlib
 
+from ..containers import ZIP_ERRORS
 from ..state import GameMasterError, current_fields, deliveries
 from ._binary_formats import ELF, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
@@ -283,7 +284,7 @@ class AssignedArchive:
                         for info in archive.infolist()[:4096]:
                             if not info.is_dir() and info.file_size <= 16 * 1024 * 1024 and not info.flag_bits & 1:
                                 blobs.append(archive.read(info))
-                except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, zlib.error, NotImplementedError):
+                except ZIP_ERRORS:
                     pass
             for blob in blobs:
                 try:

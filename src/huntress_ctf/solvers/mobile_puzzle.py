@@ -24,6 +24,7 @@ import re
 import zipfile
 
 from .. import dexvm, formats
+from ..containers import ZIP_ERRORS
 from ..decoders import LAYERS
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
 
@@ -230,7 +231,7 @@ def answer_code(apk_bytes: bytes) -> str | None:
                 codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
                          if ANSWER.fullmatch(value)}
             literal = _in_app(apk) if not codes else set()  # Read while the zip is open.
-    except (zipfile.BadZipFile, ValueError, KeyError, UnicodeDecodeError):
+    except (*ZIP_ERRORS, KeyError, UnicodeDecodeError):
         return None
     if not codes:
         manifest = formats.apk(apk_bytes) or {}
@@ -249,7 +250,7 @@ def _apks(context: SolveContext) -> dict[str, bytes]:
             with zipfile.ZipFile(BytesIO(context.artifact)) as archive:
                 if "AndroidManifest.xml" in archive.namelist():
                     found["artifact"] = context.artifact
-        except zipfile.BadZipFile:
+        except ZIP_ERRORS:
             pass
     for member in context.members:
         if member.name.endswith(".apk"):

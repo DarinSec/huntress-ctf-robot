@@ -293,6 +293,11 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   previous replay of an entry (`ALLOW_SLOWER=1` accepts that), or breaks a solver that ran
   fine there (`SKIP_REPLAY=1` overrides all three). Each replay ends with the slowest
   solvers, and the daily summary with the day's (`slowest_solvers`; `homebase.sh report`).
+- `scripts/fuzz.py` feeds every solver broken copies of the corpus (a member truncated, bits
+  flipped, a length field forged; one ZIP member deep) and names each input that hangs or
+  raises, as `<seed>#<index>` that `--repro` replays with the traceback. A damaged file must
+  answer nothing: catch `containers.ZIP_ERRORS` (everything a damaged ZIP member raises) at
+  every zipfile read. `tests/test_fuzz.py` runs synthetic seeds of every non-web lane each test run.
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds

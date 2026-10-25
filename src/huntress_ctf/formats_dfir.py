@@ -21,7 +21,7 @@ def _guarded(parse: Callable[[bytes, dict], None], data: bytes) -> dict:
     fields: dict = {}
     try:
         parse(data, fields)
-    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError) as exc:
+    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError, OverflowError) as exc:
         fields["damaged"] = f"{type(exc).__name__} while reading"
     return fields
 
@@ -33,7 +33,10 @@ def _utf16(blob: bytes) -> str:
 def _filetime(value: int) -> str | None:
     if not value or value >= 0x7FFFFFFFFFFFFFFF:
         return None
-    moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value // 10)
+    try:
+        moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value // 10)
+    except OverflowError:  # Past the year 9999: a damaged field, not a time.
+        return None
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -408,7 +411,10 @@ def _property_set(stream: bytes) -> dict:
         if kind == 0x1E:
             length = struct.unpack_from("<I", stream, body)[0]
             raw = stream[body + 4:body + 4 + length].split(b"\0", 1)[0]
-            out[name] = raw.decode("utf-8" if codepage == 65001 else f"cp{codepage}", "replace")
+            try:
+                out[name] = raw.decode("utf-8" if codepage == 65001 else f"cp{codepage}", "replace")
+            except LookupError:  # A code page Python has no codec for (cp1200, a damaged field): no value.
+                continue
         elif kind == 0x03:
             out[name] = struct.unpack_from("<i", stream, body)[0]
         elif kind == 0x40:

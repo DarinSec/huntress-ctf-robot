@@ -8,8 +8,8 @@ import json
 import re
 import struct
 from urllib.parse import urlsplit
-import zipfile
 
+from ..containers import ZIP_ERRORS
 from ..decoders import decode_fragment, extract_answer, peel
 from ..state import deliveries
 from ._binary_formats import ELF, MachO, PE, ParseError, parse_images
@@ -557,8 +557,8 @@ class BinarySolver:
                 if answer is not None and valid_answer(answer, question.answer_format):
                     result.append(AnswerCandidate(question.answer_id, answer, self.name, evidence, chain,
                                                   _spellings(question, analysis, answer)))
-            except (ParseError, struct.error, ValueError, IndexError, UnicodeError, zipfile.BadZipFile, RuntimeError):
-                continue  # Preserve unsupported/malformed/ambiguous questions.
+            except (ParseError, struct.error, IndexError, UnicodeError, OverflowError, *ZIP_ERRORS):
+                continue  # Preserve unsupported/malformed/ambiguous/damaged questions.
         return result
 
 

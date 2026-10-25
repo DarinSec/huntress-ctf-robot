@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
+import lzma
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,12 @@ import zlib
 MAX_MEMBERS = 5000
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_DEPTH = 3
+# What reading a damaged ZIP member raises: a bad header or CRC (BadZipFile), a cut or corrupt
+# stream (zlib.error, EOFError, lzma/bz2's LZMAError/OSError), a flipped method field
+# (NotImplementedError) or encryption flag (RuntimeError). Every reader catches all of them:
+# a damaged member is no data, never a crash (found by fuzz.py; ROBUSTNESS.md workstream 3).
+ZIP_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError, ValueError, NotImplementedError, RuntimeError,
+              OSError, lzma.LZMAError)
 # Packaged formats are files in their own right, not folders of evidence: one nested JAR's
 # 3,134 classes used up the member limit before Day 23 Binary's d08-d23 samples were reached.
 # Their solvers read them whole (binary, metadata apk/jar/ooxml, evidence docProps, mobile).
@@ -324,7 +331,7 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
         if blob.startswith(_ZIP_MAGIC):
             try:
                 archive = zipfile.ZipFile(BytesIO(blob))
-            except (zipfile.BadZipFile, ValueError):
+            except ZIP_ERRORS:
                 notes.append(f"{name or 'artifact'}: damaged ZIP")
                 return
             with archive:
@@ -358,8 +365,7 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
                             with archive.open(info, pwd=password.encode() if password else None) as stream:
                                 content = stream.read(budget[0] + 1)
                             break
-                        except (RuntimeError, zipfile.BadZipFile, zlib.error, EOFError,
-                                ValueError, NotImplementedError):
+                        except ZIP_ERRORS:
                             continue
                     if content is None:
                         notes.append(f"{inner}: could not be decrypted with the known passwords")
