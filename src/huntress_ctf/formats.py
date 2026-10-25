@@ -23,7 +23,7 @@ import zipfile
 from typing import Any, Callable
 
 from . import macho
-from .containers import ZIP_ERRORS
+from .containers import ZIP_ERRORS, read_member
 
 ELF_TYPES = {0: "ET_NONE", 1: "ET_REL", 2: "ET_EXEC", 3: "ET_DYN", 4: "ET_CORE"}
 ELF_MACHINES = {
@@ -820,7 +820,7 @@ def axml(data: bytes) -> list[tuple[str, dict[str, str]]]:
 def _apk(data: bytes, f: dict) -> None:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         names = archive.namelist()
-        manifest = archive.read("AndroidManifest.xml")
+        manifest = read_member(archive, "AndroidManifest.xml")
     elements = axml(manifest)
     root = next((attributes for tag, attributes in elements if tag == "manifest"), {})
     sdk = next((attributes for tag, attributes in elements if tag == "uses-sdk"), {})

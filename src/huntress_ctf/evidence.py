@@ -245,7 +245,8 @@ def _office_and_zip(data: bytes, out: dict[str, list[str]]) -> None:
             try:
                 if archive.getinfo(name).flag_bits & 0x1:
                     continue
-                xml = archive.read(name)[:MAX_STREAM_BYTES].decode("utf-8", "replace")
+                with archive.open(name) as stream:  # Only the part that is used is inflated.
+                    xml = stream.read(MAX_STREAM_BYTES).decode("utf-8", "replace")
             except (KeyError, *ZIP_ERRORS):
                 continue
             pattern = _OFFICE_CUSTOM if prefix == "Office:custom" else _OFFICE_ELEMENT

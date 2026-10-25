@@ -298,6 +298,13 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   raises, as `<seed>#<index>` that `--repro` replays with the traceback. A damaged file must
   answer nothing: catch `containers.ZIP_ERRORS` (everything a damaged ZIP member raises) at
   every zipfile read. `tests/test_fuzz.py` runs synthetic seeds of every non-web lane each test run.
+- Memory: a forked solver may grow `HUNTRESS_SOLVER_MEMORY_MB` (4096) past its size at the fork
+  and is the OOM killer's first pick; past it, it gets MemoryError and only that solver is lost.
+  Read ZIP members with `containers.read_member` and inflate with `containers.decompress`, never
+  `archive.read` or a bare `zlib/gzip/lzma/bz2.decompress`: zipfile inflates a whole member before
+  it cuts it to the stated size, so a header that understates a bomb costs all of it, and a
+  script layer once parsed 64 MiB of a bomb's zeros into a "record". `scripts/fuzz.py --bomb 1024`
+  and `tests/test_resources.py` send bombs past every cap (256 MiB unpacker, 16 MiB layers).
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds

@@ -13,7 +13,6 @@ import base64
 import binascii
 import codecs
 import functools
-import gzip
 import hashlib
 import json
 import os
@@ -23,6 +22,9 @@ import zlib
 
 
 from . import answers, scripts  # noqa: E402
+from ..containers import decompress
+
+MAX_LAYER_BYTES = 16 * 1024 * 1024  # A zlib/gzip layer inflates to at most this (ROBUSTNESS.md workstream 4).
 
 # Each script gets ~12 questions: decode it once per text, not once per question.
 recover = functools.lru_cache(maxsize=None)(scripts.recover)
@@ -305,9 +307,9 @@ def _undo(layer, data):
     if layer == "a85":
         return base64.a85decode(data, adobe=data.startswith(b"<~"))
     if layer == "zlib":
-        return zlib.decompress(data)
+        return decompress(data, "zlib", MAX_LAYER_BYTES)
     if layer in ("gz", "gzip"):
-        return gzip.decompress(data)
+        return decompress(data, "gzip", MAX_LAYER_BYTES)
     if layer == "url":
         return urllib.parse.unquote_to_bytes(data)
     if layer == "bin":

@@ -20,6 +20,11 @@ reported, and the other solvers' answers still go out.
   "multi-threaded, use of fork()" DeprecationWarning is filtered for that reason.
 - HUNTRESS_WATCHDOG=off: the old in-process loop, still crash-isolated, for debugging.
   HUNTRESS_SOLVER_BUDGET=<seconds> overrides the per-solver budget.
+- Memory (ROBUSTNESS.md workstream 4): a forked solver may grow SOLVER_MEMORY_MB past its size
+  at the fork (HUNTRESS_SOLVER_MEMORY_MB; 0 = no ceiling). One that reaches it gets MemoryError,
+  reported as crashed, and the robot goes on. Each child also offers itself to the OOM killer
+  first (oom_score_adj 1000), so when the machine as a whole runs out, a solver dies, not the
+  robot. Thread and off modes have no per-solver ceiling (a limit there is process-wide).
 
 On the clock, `race_deadline()` turns the attempt's deadline into one overall cap: no solver
 runs past it minus SUBMIT_MARGIN_S, so the race always reaches submit-or-fail in time.
@@ -50,6 +55,10 @@ SUBMIT_MARGIN_S = 3.0
 MIN_BUDGET_S = 0.5
 # A deadline further away than this is not a race deadline (a skewed or odd field).
 MAX_DEADLINE_AHEAD_S = 24 * 3600
+# A forked solver's memory ceiling above its size at the fork. A real solve adds far less (Day 25
+# Binary Mastery: ~900 MB for all 12 solvers together, in one process), so this only stops a
+# runaway: a forged size or a bomb some path still reads whole.
+SOLVER_MEMORY_MB = 4096
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,39 @@ def default_budget() -> float:
         return SOLVER_BUDGET_S
 
 
+def memory_headroom() -> int:
+    """Bytes a forked solver may grow past its size at the fork; 0 means no ceiling."""
+    try:
+        return max(0, int(os.environ.get("HUNTRESS_SOLVER_MEMORY_MB", SOLVER_MEMORY_MB))) << 20
+    except ValueError:
+        return SOLVER_MEMORY_MB << 20
+
+
+def cap_memory(headroom: int) -> None:
+    """In a forked child: be the OOM killer's first choice, and grow at most `headroom` bytes.
+
+    RLIMIT_AS counts address space, which the child inherits from the parent at the fork, so
+    the limit is the current size plus the headroom. Best effort: no /proc or resource module
+    (Windows, macOS) leaves the budget's timeout as the only bound.
+    """
+    try:
+        with open("/proc/self/oom_score_adj", "w", encoding="ascii") as score:
+            score.write("1000")
+    except OSError:
+        pass
+    if headroom <= 0:
+        return
+    try:
+        import resource
+        with open("/proc/self/status", encoding="ascii") as status:
+            size = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = size + headroom if hard == resource.RLIM_INFINITY else min(size + headroom, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except (ImportError, OSError, ValueError, StopIteration):
+        pass
+
+
 def race_deadline(deadline: str | None, now: Callable[[], float] = time.time) -> float | None:
     """The attempt's ISO deadline as a time.monotonic() cap, SUBMIT_MARGIN_S early; None when
     there is no usable deadline. A deadline already past (clock skew) is no reason to stay
@@ -100,21 +142,22 @@ def race_deadline(deadline: str | None, now: Callable[[], float] = time.time) ->
 
 def run_solvers(
     solvers: Sequence[Any], context: Any, *, budget: float | None = None, deadline: float | None = None,
-    mode: str | None = None, parallel: int | None = None,
+    mode: str | None = None, parallel: int | None = None, memory: int | None = None,
 ) -> tuple[list[Any], list[Outcome]]:
     """Every solver's candidates (in solver order) and one Outcome per solver.
 
     `budget` caps each solver (default SOLVER_BUDGET_S); `deadline` (time.monotonic()) caps
     them all. `mode` is "fork", "thread" or "off" (default: HUNTRESS_WATCHDOG, else fork where
-    the platform has it).
+    the platform has it). `memory` is a forked solver's ceiling in bytes (memory_headroom()).
     """
     budget = default_budget() if budget is None else budget
+    memory = memory_headroom() if memory is None else memory
     mode = mode or os.environ.get("HUNTRESS_WATCHDOG") or (
         "fork" if "fork" in multiprocessing.get_all_start_methods() else "thread")
     if mode == "off":
         return _in_process(solvers, context)
     if mode == "fork":
-        return _forked(solvers, context, budget, deadline, parallel or os.cpu_count() or 1)
+        return _forked(solvers, context, budget, deadline, parallel or os.cpu_count() or 1, memory)
     return _threaded(solvers, context, budget, deadline)
 
 
@@ -140,11 +183,14 @@ def _in_process(solvers: Sequence[Any], context: Any) -> tuple[list[Any], list[O
     return candidates, outcomes
 
 
-def _child(solver: Any, context: Any, conn: Any) -> None:
+def _child(solver: Any, context: Any, conn: Any, memory: int = 0) -> None:
     # Never touch the inherited streams: another thread may have held their lock at the fork.
     sys.stdout = sys.stderr = open(os.devnull, "w")
+    cap_memory(memory)
     try:
         result: tuple[str, Any] = ("ok", list(solver.solve(context)))
+    except MemoryError:
+        result = ("crashed", f"MemoryError: past the {memory >> 20} MB memory ceiling")
     except BaseException as exc:  # noqa: BLE001 - everything goes back to the parent as a report
         result = ("crashed", f"{type(exc).__name__}: {exc}")
     try:
@@ -155,7 +201,7 @@ def _child(solver: Any, context: Any, conn: Any) -> None:
 
 
 def _forked(
-    solvers: Sequence[Any], context: Any, budget: float, deadline: float | None, parallel: int,
+    solvers: Sequence[Any], context: Any, budget: float, deadline: float | None, parallel: int, memory: int = 0,
 ) -> tuple[list[Any], list[Outcome]]:
     fork = multiprocessing.get_context("fork")
     results: list[list[Any]] = [[] for _ in solvers]
@@ -186,7 +232,7 @@ def _forked(
                     break
                 index = waiting.pop(0)
                 parent, child = fork.Pipe(duplex=False)
-                process = fork.Process(target=_child, args=(solvers[index], context, child), daemon=True)
+                process = fork.Process(target=_child, args=(solvers[index], context, child, memory), daemon=True)
                 process.start()
                 child.close()
                 running[parent] = (index, process, now)

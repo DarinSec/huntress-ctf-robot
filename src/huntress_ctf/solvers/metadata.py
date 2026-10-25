@@ -32,7 +32,7 @@ import zipfile
 import zlib
 
 from .. import formats
-from ..containers import ZIP_ERRORS
+from ..containers import MAX_TOTAL_BYTES, ZIP_ERRORS, read_member
 from ..macho import field as macho_field, slices as macho_slices
 from ..state import deliveries
 from .base import AnswerCandidate, Question, SolveContext, fits_format, question_items
@@ -60,7 +60,7 @@ def _read_member(blob: bytes, name: str) -> bytes | None:
             exact = [info for info in infos if info.filename == name]
             loose = [info for info in infos if PurePosixPath(info.filename).name == name]
             chosen = exact or loose
-            return archive.read(chosen[0]) if len(chosen) == 1 else None
+            return read_member(archive, chosen[0]) if len(chosen) == 1 else None
     except (*ZIP_ERRORS, KeyError):
         return None
 
@@ -72,7 +72,8 @@ def _fast_member(blob: bytes, info: zipfile.ZipInfo) -> bytes | None:
     third of the solve on a 3 MB Mastery bundle (19 Oct 2026). Encrypted, unusual or damaged
     entries return None and go through zipfile as before.
     """
-    if info.flag_bits & 0x1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+    if (info.flag_bits & 0x1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+            or info.file_size > MAX_TOTAL_BYTES):  # _read_member then refuses it (read_member's limit).
         return None
     start = info.header_offset
     if blob[start:start + 4] != b"PK\x03\x04":
@@ -497,7 +498,7 @@ def ooxml_external_relationship_targets(data: bytes) -> str | None:
             for name in archive.namelist():
                 if not name.endswith(".rels"):
                     continue
-                root = ElementTree.fromstring(archive.read(name))
+                root = ElementTree.fromstring(read_member(archive, name))
                 targets += [
                     item.get("Target") for item in root.iter(_RELS)
                     if item.get("TargetMode") == "External" and item.get("Target") is not None
@@ -625,7 +626,7 @@ def jar_main_class(data: bytes) -> str | None:
             names = [name for name in archive.namelist() if name.upper() == "META-INF/MANIFEST.MF"]
             if not names:
                 return "none"
-            manifest = archive.read(names[0])
+            manifest = read_member(archive, names[0])
     except ZIP_ERRORS:
         return None
     text = manifest.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")

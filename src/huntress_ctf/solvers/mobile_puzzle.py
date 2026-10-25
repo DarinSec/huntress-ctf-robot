@@ -24,7 +24,7 @@ import re
 import zipfile
 
 from .. import dexvm, formats
-from ..containers import ZIP_ERRORS
+from ..containers import ZIP_ERRORS, read_member
 from ..decoders import LAYERS
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
 
@@ -91,7 +91,7 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
                 placed[position] = char
             found |= {"".join(placed), "".join(data[index] for index in order)}
     elif codec == "dynamic" and data in apk.namelist():
-        found.update(match.decode() for match in _IN_TEXT.findall(apk.read(data)))
+        found.update(match.decode() for match in _IN_TEXT.findall(read_member(apk, data)))
     elif codec == "rot47":
         found.add(_rot47(data))
     elif codec == "atbash":
@@ -209,7 +209,7 @@ def _in_app(apk: zipfile.ZipFile) -> set[str]:
     for item in apk.infolist():
         if item.is_dir() or item.file_size > MAX_MEMBER_BYTES:
             continue
-        data = apk.read(item)
+        data = read_member(apk, item)
         found.update(match.decode() for match in _IN_TEXT.findall(data))
         if b"\0" in data:
             found.update(match.decode() for match in _IN_TEXT.findall(data.replace(b"\0", b"")))
@@ -223,7 +223,7 @@ def answer_code(apk_bytes: bytes) -> str | None:
             names = [name for name in apk.namelist() if name.endswith("huntress_puzzle.json")]
             if len(names) != 1:
                 return None
-            puzzle = json.loads(apk.read(names[0]))
+            puzzle = json.loads(read_member(apk, names[0]))
             if not isinstance(puzzle, dict):
                 return None
             codes: set[str] = set()

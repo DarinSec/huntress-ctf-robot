@@ -8,18 +8,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import binascii
-import bz2
 from io import BytesIO
 import hashlib
 import json
-import lzma
 from pathlib import PurePosixPath
 import re
 import struct
 import zipfile
 import zlib
 
-from ..containers import ZIP_ERRORS
+from ..containers import ZIP_ERRORS, decompress, read_member
 from ..state import GameMasterError, current_fields, deliveries
 from ._binary_formats import ELF, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
@@ -271,19 +269,19 @@ class AssignedArchive:
                     if len(out) >= 12:
                         blobs.append(out)
                     start = at + 2
-            for magic, unpack in ((b"\xfd7zXZ\x00", lzma.decompress), (b"BZh", bz2.decompress)):
+            for magic, kind in ((b"\xfd7zXZ\x00", "xz"), (b"BZh", "bz2")):
                 at = data.find(magic)
                 if at >= 0:
                     try:
-                        blobs.append(unpack(data[at:])[:16 * 1024 * 1024])
-                    except (lzma.LZMAError, OSError, ValueError, EOFError):
+                        blobs.append(decompress(data[at:], kind, 16 * 1024 * 1024, head=True))
+                    except ZIP_ERRORS:
                         pass
             if data.startswith(b"PK"):
                 try:
                     with zipfile.ZipFile(BytesIO(data)) as archive:
                         for info in archive.infolist()[:4096]:
                             if not info.is_dir() and info.file_size <= 16 * 1024 * 1024 and not info.flag_bits & 1:
-                                blobs.append(archive.read(info))
+                                blobs.append(read_member(archive, info))
                 except ZIP_ERRORS:
                     pass
             for blob in blobs:

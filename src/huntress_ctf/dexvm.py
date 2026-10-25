@@ -27,7 +27,7 @@ from typing import Any
 import zipfile
 import zlib
 
-from .containers import ZIP_ERRORS
+from .containers import ZIP_ERRORS, read_member
 
 ANSWER = re.compile(r"ANS-[0-9A-F]{16}")
 # An answer-code method is short: day 24's apps run ~55k steps (63 ms) at ~0.9M steps/s.
@@ -1147,8 +1147,8 @@ def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
     try:
         with zipfile.ZipFile(BytesIO(apk_bytes)) as apk:
             names = apk.namelist()
-            dexes = [Dex(apk.read(name)) for name in sorted(names) if re.fullmatch(r"classes\d*\.dex", name)]
-            libraries = [apk.read(name) for name in names if name.startswith("lib/x86_64/") and name.endswith(".so")]
+            dexes = [Dex(read_member(apk, name)) for name in sorted(names) if re.fullmatch(r"classes\d*\.dex", name)]
+            libraries = [read_member(apk, name) for name in names if name.startswith("lib/x86_64/") and name.endswith(".so")]
     except (*ZIP_ERRORS, KeyError, struct.error, IndexError, UnicodeDecodeError, Unsupported):
         return None
     if not dexes:

@@ -17,30 +17,48 @@ and reports each input that hangs, raises, or kills the solver's process.
   on with the next one. The child has a memory ceiling, so a forged 4 GB length field ends as
   a MemoryError finding, not a frozen machine.
 
+- Bombs (ROBUSTNESS.md workstream 4): with `bomb=<bytes>` each mutant replaces one member
+  (one ZIP level deep, as above) by a stream that inflates to that size: a ZIP entry whose own
+  deflate data is the bomb (honest size and CRC, or a header claiming 1 MiB with that MiB's
+  CRC: zipfile's read() inflates it all before it cuts), or a gzip, xz, bz2 or zlib blob. Run with a
+  memory ceiling below the bomb, any path that reads it whole meets MemoryError there. A bomb
+  is one small compressed piece repeated (a fully flushed deflate block; concatenated gzip,
+  xz and bz2 streams), so it costs milliseconds, not the seconds of compressing it.
+
 `scripts/fuzz.py` fuzzes the local replay corpus (real-shaped, never committed);
-tests/test_fuzz.py fuzzes synthetic seeds of every non-web lane on each test run.
+tests/test_fuzz.py fuzzes synthetic seeds of every non-web lane on each test run, and
+tests/test_resources.py sends them bombs.
 """
 
 from __future__ import annotations
 
+import bz2
 from dataclasses import dataclass, field
+from functools import lru_cache
+import gzip
 from io import BytesIO
+import lzma
 import multiprocessing
 from multiprocessing.connection import wait
 import os
 from pathlib import Path
 import random
 import re
+import struct
 import sys
 import time
 import traceback
 from typing import Any, Iterator, Sequence
 import zipfile
+import zlib
 
 from .containers import Member
 
 BUDGET_S = 5.0  # Per input. Every solver answers a small mutant in milliseconds.
 MEMORY_HEADROOM = 2 << 30  # The child may grow this much past its size at the fork.
+BOMB_FLAVOURS = ("zip-deflate", "zip-understated", "gzip", "xz", "bz2", "zlib")
+_STATED = 1 << 20  # What an understated bomb's header claims.
+_PIECE = 8 << 20  # Bytes of zeros per concatenated gzip/xz/bz2 stream.
 MAX_GROWTH = 1 << 20  # A mutant is at most this much larger than its seed.
 PASSWORDS = (b"infected",)  # Reads an encrypted seed member; mutants are zipped without one.
 INTERESTING = (0, 1, 2, 0x7F, 0x80, 0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
@@ -188,16 +206,89 @@ def mutate(data: bytes, rng: random.Random, depth: int = 0) -> tuple[bytes, str]
     return changed, how
 
 
-def mutant(seed: Seed, index: int, salt: str = "0") -> tuple[Seed, str]:
-    """Mutant `index` of `seed`: one of its files mutated, always the same for the same salt."""
+@lru_cache(maxsize=None)
+def _deflate_bomb(size: int) -> tuple[bytes, int]:
+    """Raw deflate inflating to `size` zero bytes, and their CRC-32: after a full flush the
+    compressor starts afresh, so one MiB's block repeated is a valid stream."""
+    chunk = bytes(1 << 20)
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    block = compressor.compress(chunk) + compressor.flush(zlib.Z_FULL_FLUSH)
+    crc = 0
+    for _ in range(size >> 20):
+        crc = zlib.crc32(chunk, crc)
+    return block * (size >> 20) + compressor.flush(), crc
+
+
+@lru_cache(maxsize=None)
+def bomb_blob(flavour: str, size: int) -> bytes:
+    """A gzip, xz, bz2 or zlib stream inflating to `size` zero bytes (`size` a multiple of 8 MiB)."""
+    if flavour == "zlib":
+        deflate, _ = _deflate_bomb(size)
+        adler, chunk = 1, bytes(1 << 20)
+        for _ in range(size >> 20):
+            adler = zlib.adler32(chunk, adler)
+        return b"\x78\xda" + deflate + struct.pack(">I", adler)
+    compress = {"gzip": lambda d: gzip.compress(d, 9), "xz": lzma.compress, "bz2": bz2.compress}[flavour]
+    return compress(bytes(_PIECE)) * (size // _PIECE)  # Each decoder reads concatenated streams.
+
+
+def _zip_bomb(entries: list[tuple[zipfile.ZipInfo, bytes]], at: int, size: int, understated: bool = False) -> bytes:
+    """The ZIP of `entries` with entry `at` a deflate bomb of `size` bytes, written by hand
+    (zipfile would have to compress the whole size); `understated`, its header says 1 MiB."""
+    out, central = bytearray(), bytearray()
+    for index, (info, data) in enumerate(entries):
+        name = info.filename.encode()
+        if index == at:
+            packed, crc = _deflate_bomb(size)
+            usize = size
+            if understated:
+                usize, crc = _STATED, zlib.crc32(bytes(_STATED))
+        else:
+            compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+            packed, crc, usize = compressor.compress(data) + compressor.flush(), zlib.crc32(data), len(data)
+        central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 8, 0, 0x21, crc, len(packed), usize,
+                               len(name), 0, 0, 0, 0, 0, len(out)) + name
+        out += struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 8, 0, 0x21, crc, len(packed), usize, len(name), 0)
+        out += name + packed
+    return bytes(out + central + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries),
+                                             len(central), len(out), 0))
+
+
+def bombed(data: bytes, rng: random.Random, size: int, depth: int = 0) -> tuple[bytes, str]:
+    """`data` with one member (one ZIP level deep, sometimes two) replaced by a bomb."""
+    if is_zip(data) and depth < 3:
+        entries = _read_zip(data)
+        files = [i for i, (info, _) in enumerate(entries or ()) if not info.is_dir()]
+        if entries and files:
+            pick = rng.choice(files)
+            info, inner = entries[pick]
+            if is_zip(inner) and rng.random() < 0.5:
+                changed, how = bombed(inner, rng, size, depth + 1)
+                entries[pick] = (info, changed)
+                return _zip(entries), f"{info.filename}: {how}"
+            flavour = rng.choice(BOMB_FLAVOURS)
+            if flavour.startswith("zip-"):
+                understated = flavour == "zip-understated"
+                return (_zip_bomb(entries, pick, size, understated),
+                        f"{info.filename}: a {size >> 20} MiB deflate bomb" + (" stated as 1 MiB" if understated else ""))
+            entries[pick] = (info, bomb_blob(flavour, size))
+            return _zip(entries), f"{info.filename}: a {size >> 20} MiB {flavour} bomb"
+    flavour = rng.choice(BOMB_FLAVOURS[2:])
+    return bomb_blob(flavour, size), f"a {size >> 20} MiB {flavour} bomb"
+
+
+def mutant(seed: Seed, index: int, salt: str = "0", bomb: int = 0) -> tuple[Seed, str]:
+    """Mutant `index` of `seed`: one of its files mutated (or, with `bomb`, one member replaced
+    by a bomb of that many bytes), always the same for the same salt."""
     rng = random.Random(f"{salt}:{seed.name}:{index}")
+    change = (lambda data: bombed(data, rng, bomb)) if bomb else (lambda data: mutate(data, rng))
     if seed.deliveries:
         pick = rng.randrange(len(seed.deliveries))
         member = seed.deliveries[pick]
-        changed, how = mutate(member.data, rng)
+        changed, how = change(member.data)
         deliveries = tuple(Member(m.name, changed) if i == pick else m for i, m in enumerate(seed.deliveries))
         return Seed(seed.name, seed.challenge, seed.attempt, deliveries[0].data, deliveries), f"{member.name}: {how}"
-    changed, how = mutate(seed.artifact, rng)
+    changed, how = change(seed.artifact)
     return Seed(seed.name, seed.challenge, seed.attempt, changed), how
 
 
@@ -224,22 +315,14 @@ def _where(exc: BaseException) -> str:
     return f"{frame.filename.rsplit('huntress_ctf' + os.sep, 1)[-1]}:{frame.lineno} in {frame.name}"
 
 
-def _cap_memory() -> None:
-    try:
-        import resource
-        with open("/proc/self/status", encoding="ascii") as status:
-            size = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
-        limit = size + MEMORY_HEADROOM
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except Exception:  # No resource module or /proc (Windows, macOS): no ceiling, still a timeout.
-        pass
+def _work(solver: Any, seeds: Sequence[Seed], jobs: list[tuple[int, int]], salt: str, conn: Any,
+          memory: int, bomb: int) -> None:
+    from .watchdog import cap_memory
 
-
-def _work(solver: Any, seeds: Sequence[Seed], jobs: list[tuple[int, int]], salt: str, conn: Any) -> None:
     sys.stdout = sys.stderr = open(os.devnull, "w")
-    _cap_memory()
+    cap_memory(memory)
     for seed_at, index in jobs:
-        changed, how = mutant(seeds[seed_at], index, salt)
+        changed, how = mutant(seeds[seed_at], index, salt, bomb)
         conn.send(("begin", seed_at, index, how))
         try:
             list(solver.solve(context(changed)))
@@ -251,11 +334,19 @@ def _work(solver: Any, seeds: Sequence[Seed], jobs: list[tuple[int, int]], salt:
 
 def run(
     solvers: Sequence[Any], seeds: Sequence[Seed], count: int, *, budget: float = BUDGET_S, salt: str = "0",
-    parallel: int | None = None, progress: Any = None,
+    parallel: int | None = None, progress: Any = None, memory: int = MEMORY_HEADROOM, bomb: int = 0,
 ) -> list[Finding]:
-    """`count` mutants of every seed through every solver; each hang, raise or death found."""
+    """`count` mutants of every seed through every solver; each hang, raise or death found.
+
+    `memory` is each child's ceiling above its size at the fork; `bomb` (bytes) sends bombs
+    instead of mutants: keep `memory` below it, so a whole read shows as a MemoryError.
+    """
     from .watchdog import solver_name
 
+    for flavour in BOMB_FLAVOURS[2:] if bomb else ():  # Built once here; every child inherits them.
+        bomb_blob(flavour, bomb)
+    if bomb:
+        _deflate_bomb(bomb)
     fork = multiprocessing.get_context("fork")
     jobs = [(seed_at, index) for index in range(count) for seed_at in range(len(seeds))]
     children = [_Child(solver, jobs) for solver in solvers]
@@ -264,8 +355,8 @@ def run(
 
     def launch(child: _Child) -> None:
         parent, end = fork.Pipe(duplex=False)
-        child.process = fork.Process(target=_work, args=(child.solver, seeds, child.jobs[child.position:], salt, end),
-                                     daemon=True)
+        child.process = fork.Process(target=_work, args=(child.solver, seeds, child.jobs[child.position:], salt, end,
+                                                         memory, bomb), daemon=True)
         child.process.start()
         end.close()
         child.conn, child.started, child.current = parent, 0.0, None

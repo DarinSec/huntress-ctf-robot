@@ -5,10 +5,14 @@
   PYTHONPATH=src python3 scripts/fuzz.py --only day-23 --solver metadata-facts --count 200
   PYTHONPATH=src python3 scripts/fuzz.py --salt 7 --count 50     # another 50 (the salt picks the mutants)
   PYTHONPATH=src python3 scripts/fuzz.py --repro 'binary-...-day-19-jack-in-the-box/f4053d98#17' --solver binary-static-facts
+  PYTHONPATH=src python3 scripts/fuzz.py --bomb 1024 --count 10 --parallel 3   # 1 GiB bombs, 768 MiB ceiling
 
 Findings are grouped by where they happen (one bug usually shows on many inputs); each names
 an input as <seed>#<index>, which --repro (same --salt) replays here with the full traceback.
 Exit status 1 when anything hung, raised or died. Seeds are real artifacts: they stay local.
+With --bomb each input has one member replaced by a stream inflating to that many MiB, and
+each child runs under --memory MiB (three quarters of the bomb by default): a path that reads
+it whole raises MemoryError there. Each child may use up to that much, so keep --parallel low.
 """
 
 from __future__ import annotations
@@ -34,7 +38,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--budget", type=float, default=fuzz.BUDGET_S, help="seconds per input")
     parser.add_argument("--parallel", type=int, default=None)
     parser.add_argument("--repro", default=None, help="<seed>#<index>: replay one input in this process")
+    parser.add_argument("--bomb", type=int, default=0, help="MiB: send bombs of this size instead of mutants")
+    parser.add_argument("--memory", type=int, default=None, help="MiB each child may grow (ceiling)")
     args = parser.parse_args(argv)
+    bomb = -(-args.bomb // 8) * 8 << 20  # A multiple of 8 MiB (fuzz.bomb_blob).
+    memory = (args.memory << 20 if args.memory is not None else
+              bomb * 3 // 4 if bomb else fuzz.MEMORY_HEADROOM)
     solvers = [s for s in SOLVERS if not args.solver or solver_name(s) in args.solver]
     seeds = list(fuzz.corpus_seeds(args.corpus, args.only))
     if not seeds or not solvers:
@@ -43,15 +52,17 @@ def main(argv: list[str]) -> int:
     if args.repro:
         name, _, index = args.repro.rpartition("#")
         seed = next(s for s in seeds if s.name == name)
-        changed, how = fuzz.mutant(seed, int(index), args.salt)
+        changed, how = fuzz.mutant(seed, int(index), args.salt, bomb)
         print(f"{args.repro}: {how}")
         for solver in solvers:
             found = list(solver.solve(fuzz.context(changed)))  # Raises here, with the traceback.
             print(f"{solver_name(solver)}: {len(found)} candidate(s)")
         return 0
     began = time.monotonic()
-    print(f"{len(seeds)} seed(s) x {args.count} mutants x {len(solvers)} solver(s), salt {args.salt}")
-    findings = fuzz.run(solvers, seeds, args.count, budget=args.budget, salt=args.salt, parallel=args.parallel)
+    kind = f"{bomb >> 20} MiB bombs under a {memory >> 20} MiB ceiling" if bomb else "mutants"
+    print(f"{len(seeds)} seed(s) x {args.count} {kind} x {len(solvers)} solver(s), salt {args.salt}")
+    findings = fuzz.run(solvers, seeds, args.count, budget=args.budget, salt=args.salt, parallel=args.parallel,
+                        memory=memory, bomb=bomb)
     groups: dict[tuple[str, str, str, str], list[fuzz.Finding]] = defaultdict(list)
     for finding in findings:
         groups[(finding.solver, finding.status, finding.where, finding.detail.split(":")[0])].append(finding)
