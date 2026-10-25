@@ -7,7 +7,9 @@
 #   scripts/homebase.sh run '<cmd>'  run one command there (PYTHONPATH and the proxy URL set)
 #   scripts/homebase.sh deploy       test src/ and replay the corpus on the VM, then swap it into ~/src (keeps
 #                                    ~/src.previous) and install day.sh and hof.sh; the
-#                                    minute cron sweeps the day with the new code
+#                                    minute cron sweeps the day with the new code. A lost
+#                                    answer, a solver over 2x slower (ALLOW_SLOWER=1 deploys
+#                                    anyway) or one that broke stops it (SKIP_REPLAY=1 skips)
 #   scripts/homebase.sh sweep        run ~/day.sh now instead of waiting for cron
 #   scripts/homebase.sh log          the latest day and Hall of Fame summaries
 #   scripts/homebase.sh pull <id>    copy work/<id>/ to artifacts/work/ (git-ignored), show triage.md
@@ -64,9 +66,11 @@ case "${1:-}" in
         fi
         tail -3 test.log
         # Every assignment the robot scored, re-solved with the new code (scripts/replay.py):
-        # an answer that matched the accepted one and no longer does stops the deploy.
-        if [ '${SKIP_REPLAY:-0}' != 1 ] && ! HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=src python3 scripts/replay.py --dry > replay.log 2>&1; then
-          grep -B1 -A3 REGRESSION replay.log | head -40; echo 'Replay found regressions; ~/src is unchanged (SKIP_REPLAY=1 to deploy anyway).'; exit 1
+        # an answer that matched the accepted one and no longer does stops the deploy, and so
+        # does a solver over twice as slow as with the deployed code, or one that broke.
+        if [ '${SKIP_REPLAY:-0}' != 1 ] && ! HUNTRESS_ALLOW_SLOWER='${ALLOW_SLOWER:-0}' HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=src python3 scripts/replay.py --dry > replay.log 2>&1; then
+          grep -B1 -A3 -E 'REGRESSION|SLOWER|BROKE' replay.log | head -40; grep '^slowest solvers' replay.log || true
+          echo 'Replay found regressions, slower or broken solvers; ~/src is unchanged (ALLOW_SLOWER=1 accepts slower solvers, SKIP_REPLAY=1 deploys anyway).'; exit 1
         fi
         rm -rf ~/src.previous ~/src.new; cp -a ~/src ~/src.previous; cp -a src ~/src.new
         rm -rf ~/src; mv ~/src.new ~/src

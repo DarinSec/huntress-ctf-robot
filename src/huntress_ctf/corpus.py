@@ -11,9 +11,17 @@ Layout (git-ignored, in the state directory next to hints.json):
                                   deliveries/<N>-<filename>
                                   accepted.json     {answer_id: accepted answer}
                                   last_replay.json  the previous replay's answers
+                                  last_timing.json  the previous replay's seconds per solver
 An answer that differs from the accepted one is not by itself wrong (several spellings are
 often accepted). A regression is an answer that equalled the accepted one in the previous
 replay and no longer does, or that is no longer answered.
+
+Time is compared the same way (ROBUSTNESS.md workstream 5): a solver is over its budget when
+it takes more than SLOW_FACTOR times its previous replay of that entry, and more than
+SLOW_FLOOR_S; it broke when it ran fine there before and now crashes or hangs. Deploy replays
+the new code --dry against the deployed code's last timings, so a slowdown stops the PR's
+deploy instead of showing up on the clock. A fixed limit would not do: solvers range from
+milliseconds to ~25 s (Day 22 Binary Mastery), so no one number catches a 3x slowdown in both.
 """
 
 from __future__ import annotations
@@ -29,6 +37,13 @@ from .hints import default_path
 
 MAX_ENTRIES_PER_ROUTE = 2   # Two variants per route are enough to catch a regression.
 MAX_ENTRY_BYTES = 512 * 1024 * 1024  # Binary Mastery: 7 x 35 MB deliveries.
+SLOW_FACTOR = 2.0    # Over budget: slower than this many times the previous replay ...
+SLOW_FLOOR_S = 0.25  # ... and than this (3 ms -> 8 ms is noise, not a regression).
+
+
+def budget(previous: float) -> float:
+    """A solver's time budget on an entry, from its time there in the previous replay."""
+    return max(SLOW_FLOOR_S, SLOW_FACTOR * previous)
 
 
 def corpus_root() -> Path:
@@ -84,11 +99,18 @@ def entries(root: Path | None = None, only: str = "") -> list[Path]:
     return [path for path in found if only in str(path.relative_to(base))]
 
 
-def solve_entry(entry: Path) -> tuple[dict[str, str], tuple[str, ...]]:
-    """The current solvers' selected answers for a saved assignment, fully offline."""
+def solve_entry(
+    entry: Path, previous: dict[str, float] | None = None,
+) -> tuple[dict[str, str], tuple[str, ...], dict[str, float], list[Any]]:
+    """The current solvers' selected answers for a saved assignment, fully offline, with the
+    seconds of each solver that ran fine and the watchdog Outcomes of those that did not.
+
+    A solver over its budget against `previous` is timed once more on its own and the faster
+    time counts: a busy machine (a sweep running beside a deploy) must not stop a deploy.
+    """
     from .autopilot import build_context, select_candidates
     from .solvers import SOLVERS
-    from .watchdog import run_solvers
+    from .watchdog import run_solvers, solver_name
     from .state import AttemptState
 
     saved = _read(entry / "assignment.json")
@@ -101,16 +123,33 @@ def solve_entry(entry: Path) -> tuple[dict[str, str], tuple[str, ...]]:
     context, _ = build_context(str(challenge.get("id") or entry.parent.name), challenge, attempt,
                                members[0].data, files[0], answer_ids, None, extra)
     candidates, outcomes = run_solvers(SOLVERS, context)
-    for outcome in outcomes:  # One lane's crash or hang is a finding, not the end of the replay.
-        if outcome.status != "ok":
-            print(f"  {outcome.note()}")
+    failed = [outcome for outcome in outcomes if outcome.status != "ok"]
+    for outcome in failed:  # One lane's crash or hang is a finding, not the end of the replay.
+        print(f"  {outcome.note()}")
+    seconds = {outcome.solver: outcome.seconds for outcome in outcomes if outcome.status == "ok"}
+    for solver in SOLVERS:
+        name = solver_name(solver)
+        if name in seconds and name in (previous or {}) and seconds[name] > budget(previous[name]):
+            _, again = run_solvers([solver], context)
+            if again and again[0].status == "ok":
+                seconds[name] = min(seconds[name], again[0].seconds)
     selected, _ = select_candidates(candidates, answer_ids, [])
-    return {candidate.answer_id: candidate.answer for candidate in selected}, answer_ids
+    return {candidate.answer_id: candidate.answer for candidate in selected}, answer_ids, seconds, failed
+
+
+def _timing(entry: Path) -> dict[str, float]:
+    return {name: float(value) for name, value in _read(entry / "last_timing.json").items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)}
 
 
 def replay(entry: Path, keep: bool = True) -> dict[str, Any]:
-    """Re-solve one entry; compare with the accepted answers and with the previous replay."""
-    answers, answer_ids = solve_entry(entry)
+    """Re-solve one entry; compare with the accepted answers and with the previous replay.
+
+    `slower` names each solver over its budget, `broke` the watchdog notes of solvers that
+    ran fine in the previous replay and now crash or hang.
+    """
+    timing = _timing(entry)
+    answers, answer_ids, seconds, failed = solve_entry(entry, timing)
     accepted = _read(entry / "accepted.json")
     previous = _read(entry / "last_replay.json")
     equal = [key for key, value in accepted.items() if answers.get(key) == value]
@@ -119,11 +158,16 @@ def replay(entry: Path, keep: bool = True) -> dict[str, Any]:
         key for key in previous
         if (previous[key] == accepted.get(key) and answers.get(key) != previous[key]) or key not in answers
     )
+    slower = {name: {"seconds": round(value, 3), "previous": timing[name], "budget": round(budget(timing[name]), 3)}
+              for name, value in seconds.items() if name in timing and value > budget(timing[name])}
+    broke = [outcome.note() for outcome in failed if outcome.solver in timing]
     if keep:
         (entry / "last_replay.json").write_text(json.dumps(answers, indent=1, sort_keys=True), encoding="utf-8")
+        (entry / "last_timing.json").write_text(json.dumps(
+            {name: round(value, 4) for name, value in seconds.items()}, indent=1, sort_keys=True), encoding="utf-8")
     return {"entry": entry, "questions": len(answer_ids), "answered": len(answers), "accepted": len(accepted),
             "equal": len(equal), "differs": differs, "regressions": regressions,
-            "missing": sorted(set(answer_ids) - set(answers))}
+            "missing": sorted(set(answer_ids) - set(answers)), "seconds": seconds, "slower": slower, "broke": broke}
 
 
 def import_entry(

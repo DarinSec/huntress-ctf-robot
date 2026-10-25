@@ -74,6 +74,7 @@ class Run:
     notes: list[str] = field(default_factory=list)
     # Solvers the watchdog left out, killed or skipped (Outcome.report), for daily's summary.
     problems: list[dict[str, Any]] = field(default_factory=list)
+    solver_ms: dict[str, float] = field(default_factory=dict)  # Each solver that ran, in the race.
     attempt: Any = None
     started: AttemptState | None = None
     artifact: bytes | None = None
@@ -473,6 +474,7 @@ def _race(
         run.selected, run.conflict = select_candidates(candidates, answer_ids, run.notes)
     run.notes.extend(outcome.note() for outcome in outcomes if outcome.status != "ok")
     run.problems += [outcome.report("race") for outcome in outcomes if outcome.status != "ok"]
+    run.solver_ms = {o.solver: round(o.seconds * 1000, 1) for o in outcomes if o.status != "skipped"}
     run.submitted = {
         candidate.answer_id: candidate.answer for candidate in run.selected
         if candidate.answer_id in needed
@@ -532,6 +534,8 @@ def _timings(run: Run) -> dict[str, Any]:
         for name, begin, end in spans if begin in marks and end in marks
     }
     timings["pipelined"] = run.pipelined and run.pipeline_failure is None
+    if run.solver_ms:
+        timings["solver_ms"] = dict(run.solver_ms)  # Printed per route; daily ranks the slowest.
     server_clock = _server_clock(run)
     if server_clock:
         timings["server_clock_ms"] = server_clock

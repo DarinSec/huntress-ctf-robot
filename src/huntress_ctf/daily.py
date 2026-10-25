@@ -32,6 +32,7 @@ from .state import AttemptState, mode_name
 # mobile-android decodes each app's puzzle asset).
 COURSE_LANES = {"warmups", "metadata-forensics", "mobile-android"}
 WORKERS = 6
+SLOWEST_SHOWN = 5  # The summary's "slowest_solvers": a creeping solver shows before it freezes.
 # One lane is enough to see a release: ~1 s per list instead of ~4 s for a whole day.
 RELEASE_PROBE_LANE = "warmups"
 RELEASE_POLL_SECONDS = 0.25  # Plus ~0.6 s per list: a release is seen within ~1 s.
@@ -249,6 +250,7 @@ def run_daily(
         records = [record for record in records if lane_of(record, str(_id(record))) in lanes]
     hints = load_hints(hints_path)
     problems: dict[Any, list[dict[str, Any]]] = {}  # Per route: solvers the watchdog left out.
+    timings: dict[Any, dict[str, float]] = {}  # Per route: each solver's slowest ms (--repeat).
 
     def run_one(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
         challenge_id = _id(record)
@@ -298,6 +300,10 @@ def run_daily(
         found = [problem for report in reports for problem in report.get("solver_problems", ())]
         if found:  # Each race of a --repeat names the same left-out solver: once is enough.
             problems[challenge_id] = list({json.dumps(p, sort_keys=True): p for p in found}.values())
+        for report in reports:
+            for solver, ms in (report.get("solver_ms") or {}).items():
+                route = timings.setdefault(challenge_id, {})
+                route[solver] = max(ms, route.get(solver, ms))
         if on_clock:
             entry["on_clock_ms"] = on_clock
             entry["best_on_clock_ms"] = min(on_clock)
@@ -318,6 +324,9 @@ def run_daily(
     safe = safe_mode(summary, problems)
     if safe:
         result["safe_mode"] = safe
+    slowest = slowest_solvers(summary, timings)
+    if slowest:
+        result["slowest_solvers"] = slowest
     print("\n===== Summary =====")
     print_result(result)
     ran = [entry for entry in summary if entry["outcome"] != "skipped"]
@@ -345,6 +354,16 @@ def safe_mode(summary: list[dict[str, Any]], problems: dict[Any, list[dict[str, 
     if held:
         block["held_back"] = held
     return block
+
+
+def slowest_solvers(summary: list[dict[str, Any]], timings: dict[Any, dict[str, float]]) -> list[dict[str, Any]]:
+    """The SLOWEST_SHOWN slowest solvers of the sweep, each once, at its slowest route."""
+    worst: dict[str, dict[str, Any]] = {}
+    for entry in summary:
+        for solver, ms in timings.get(entry["challenge"], {}).items():
+            if ms > worst.get(solver, {"ms": -1.0})["ms"]:
+                worst[solver] = {"solver": solver, "ms": ms, "challenge": entry["challenge"]}
+    return sorted(worst.values(), key=lambda item: -item["ms"])[:SLOWEST_SHOWN]
 
 
 def _run_group(

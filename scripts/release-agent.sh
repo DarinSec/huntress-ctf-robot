@@ -62,7 +62,7 @@ run_agent() {  # <challenge-id> [--push] [--from <work folder>]
   # Checked here, not taken from the agent's word.
   echo "== $id: after"; (cd "$dir" && PYTHONPATH=src python3 scripts/solve_offline.py "$work" | sed -n '/answered/,$p' | head -30)
   (cd "$dir" && PYTHONPATH=src python3 -m unittest discover -s tests > tests.log 2>&1 && echo "tests: OK" || { echo "tests: FAILED"; tail -15 tests.log; })
-  (cd "$dir" && PYTHONPATH=src HUNTRESS_STATE_DIR="$state" python3 scripts/replay.py --dry > replay.log 2>&1 && echo "replay: no regressions" || { echo "replay: REGRESSIONS"; grep -A3 REGRESSION replay.log | head -20; })
+  (cd "$dir" && PYTHONPATH=src HUNTRESS_STATE_DIR="$state" python3 scripts/replay.py --dry > replay.log 2>&1 && echo "replay: no regressions" || { echo "replay: REGRESSIONS, SLOWER or BROKE"; grep -A3 -E 'REGRESSION|SLOWER|BROKE' replay.log | head -20; })
   git -C "$dir" log --oneline "HEAD@{1}..HEAD" 2>/dev/null || git -C "$dir" log --oneline -3
   if [ "$push" = "--push" ]; then git -C "$dir" push -q -u origin "$branch" && echo "pushed $branch"; fi
   echo "Review: git -C $repo diff HEAD...$branch   Deploy after review; remove with: git -C $repo worktree remove $dir"

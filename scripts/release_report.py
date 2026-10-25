@@ -97,6 +97,15 @@ def safe_mode_lines(summary: dict) -> list[str]:
     return lines
 
 
+def slowest_line(summary: dict) -> str | None:
+    """The sweep's slowest solvers on one line: a creeping solver shows before it freezes."""
+    slowest = summary.get("slowest_solvers") or []
+    if not slowest:
+        return None
+    return "slowest solvers: " + ", ".join(
+        f"{item['solver']} {item['ms']:.0f} ms ({item['challenge']})" for item in slowest)
+
+
 def main() -> None:
     day = int(sys.argv[1]) if len(sys.argv) > 1 else datetime.now(ZoneInfo("America/New_York")).day
     for kind in ("untimed", "timed"):
@@ -118,6 +127,9 @@ def main() -> None:
             print(f"   {entry['outcome']:10} {entry['challenge']}  {entry.get('wall_seconds', '')} {extra}")
             for line in blocked.get(str(entry["challenge"]), ()):
                 print(f"              {line}")
+        slowest = slowest_line(summary)
+        if slowest:
+            print(f"   {slowest}")
         safe = safe_mode_lines(summary)
         if safe:
             print("   safe mode:")

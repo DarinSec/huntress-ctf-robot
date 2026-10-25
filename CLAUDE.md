@@ -289,7 +289,10 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   replay and coverage itself. A human reviews, merges and deploys.
 - `scripts/replay.py` re-solves every scored assignment in `~/.huntress/corpus` (the robot
   records them after each CORRECT/accepted submit); `homebase.sh deploy` refuses a
-  deploy that regresses an accepted answer (`SKIP_REPLAY=1` overrides).
+  deploy that regresses an accepted answer, makes a solver over twice as slow as in the
+  previous replay of an entry (`ALLOW_SLOWER=1` accepts that), or breaks a solver that ran
+  fine there (`SKIP_REPLAY=1` overrides all three). Each replay ends with the slowest
+  solvers, and the daily summary with the day's (`slowest_solvers`; `homebase.sh report`).
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds
