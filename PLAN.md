@@ -257,6 +257,11 @@ till exakt ett svar. Läget före och efter:
 | Nya läsare: VMDK, QCOW2, PST/OST, kernel-dump, systemd-journal, utmp/wtmp (30 namn) | 0 | 30 |
 | Warmups-kodningar som avkodas till exakt ett svar | 5 av 21 | 21 av 21 |
 
+Kursen frågar ofta om samma formatfamilj två dagar i rad (PE dag 9–11, media 17–18, APK/JAR
+21–22), så testet har också 20 rader för en andra egenskap på dag 23–25:s format (SQLite, EVTX,
+registret). Där lade prognosen till SQLite-schemats namn (`table_names`, `index_names`, …) och
+alias för EVTX:s äldsta/nyaste post; alla 117 rader är rätt på första otidsatta svaret.
+
 Ändringarna är generella: `suggest.py` delar CamelCase (plist-nycklar), har en aliaslista för
 DFIR-ord (`common_name` → `cn`, `thumbprint` → `fingerprint`, `ads` → `alternate_data_streams`,
 …) där ett alias bara kan lägga till en träff, och straffar ett listfält när egenskapen är
