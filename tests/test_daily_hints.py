@@ -10,7 +10,7 @@ from unittest.mock import patch
 from huntress_ctf import solvers
 from huntress_ctf.autopilot import COMPLETE, INCORRECT, UNRESOLVED
 from huntress_ctf.client import GameMasterError
-from huntress_ctf.daily import eligibility, families, run_daily, wait_for_release
+from huntress_ctf.daily import eligibility, families, needs_proof, run_daily, wait_for_release
 from huntress_ctf.hints import get_hint, load_hints, record_hint, record_outcome
 from huntress_ctf.solvers import AnswerCandidate
 
@@ -89,6 +89,57 @@ class DailyTests(unittest.TestCase):
         self.assertIsNotNone(eligibility(new_day, True, {}))
         other_lane = {"id": "binary-day-20-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery"}
         self.assertIsNotNone(eligibility(other_lane, True, {"binary-day-20-x": {}}))
+
+    def test_prove_runs_solved_unproven_timed_routes_once_untimed(self):
+        # Day 26: Binary's Single Solve was finished by hand, so its Time Trial and Mastery
+        # had no proven solver and `daily --timed` never raced them.
+        lane = "binary-reverse-engineering"
+        family = [
+            {"id": "binary-day-26-x", "lane": lane, "mode": "single_solve", "solved": True},
+            {"id": "binary-day-26-x/time_trial", "lane": lane, "mode": "time_trial", "solved": True,
+             "run_for_time_supported": True},
+            {"id": "binary-day-26-x/mastery", "lane": lane, "mode": "mastery", "solved": True,
+             "run_for_time_supported": True},
+        ]
+
+        class FamilyClient(ListOnlyClient):
+            def list_challenges(self, day=None, lane=None):
+                return {"challenges": family}
+
+        def daily(**kwargs):
+            with redirect_stdout(StringIO()) as output:
+                run_daily(FamilyClient(), artifact_dir=self.root, work_dir=self.root / "work",
+                          hints_path=self.root / "hints.json", **kwargs)
+            return output.getvalue()
+
+        with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
+            self.assertIn("already solved", daily())
+        fast.assert_not_called()  # Opt-in only: a proof spends a regular variant.
+        # A failed proof of the Time Trial does not hold the Mastery (both are open already).
+        with patch("huntress_ctf.daily.run_fast", side_effect=[UNRESOLVED, COMPLETE]) as fast:
+            output = daily(prove=True)
+        self.assertEqual([call.args[1] for call in fast.call_args_list],
+                         ["binary-day-26-x/time_trial", "binary-day-26-x/mastery"])
+        self.assertTrue(all(call.kwargs.get("prove") and not call.kwargs["timed"] for call in fast.call_args_list))
+        self.assertIn('"proof": true', output)
+        with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
+            daily(prove=True, timed=True)
+        self.assertNotIn("prove", fast.call_args_list[0].kwargs if fast.call_args_list else {})
+
+    def test_which_routes_need_a_proof(self):
+        route = {"id": "b-day-26-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery",
+                 "solved": True, "run_for_time_supported": True}
+        self.assertTrue(needs_proof(route, {}))
+        self.assertTrue(needs_proof(route, {route["id"]: {"turned_down": "unresolved", "turned_down_at": "x"}}))
+        self.assertFalse(needs_proof(route, {route["id"]: {"solvers": ["s"]}}))  # Proven.
+        self.assertFalse(needs_proof(route, {route["id"]: {"raced_at": "x"}}))
+        self.assertFalse(needs_proof({**route, "solved": False}, {}))  # The ordinary sweep solves it.
+        self.assertFalse(needs_proof({**route, "run_for_time_supported": False}, {}))
+        self.assertFalse(needs_proof({**route, "id": "b-day-26-x", "mode": "single_solve"}, {}))
+        self.assertFalse(needs_proof({**route, "lane": "web-exploitation"}, {}))
+        course = {**route, "lane": "metadata-forensics"}
+        self.assertTrue(needs_proof(course, {}))
+        self.assertFalse(needs_proof(course, {"b-day-26-x": {"solvers": ["s"]}}))  # Races on the Single Solve.
 
     def test_a_route_the_service_turned_down_untimed_is_not_raced(self):
         # Day 23: the Metadata Time Trial was rejected untimed and raced twice anyway,

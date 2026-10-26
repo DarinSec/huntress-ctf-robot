@@ -120,6 +120,25 @@ def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tupl
     return "start", None
 
 
+def plan_proof(before: Any) -> tuple[str, str | None]:
+    """An untimed proof run on a route someone already solved: 'retry', 'start', 'pending' or 'stop'.
+
+    The scored attempt has ended, so a plain `retry` (no run_for_time) opens a fresh regular
+    variant; a ranked variant is never spent. An untimed attempt still open (an earlier proof
+    the robot could not finish) is reconnected with `start`, so each sweep after a deploy
+    retries it without spending another variant. A running timed attempt is left alone.
+    """
+    state = AttemptState.parse(before)
+    if state.pending:
+        return "pending", "CourseStack scoring is still pending; keep this attempt until it is confirmed."
+    if state.complete or state.expired:
+        return "retry", None
+    active = not state.inactive and (state.attempt_id is not None or bool(state.answer_ids))
+    if active and state.deadline:
+        return "stop", "A timed attempt is running on this route; a proof waits until it ends."
+    return "start", None
+
+
 def warm_up(solvers: tuple[Solver, ...], left_out: list[Outcome] | None = None) -> tuple[Solver, ...]:
     """Run every code path once before the clock: imports, regex caches, allocations.
 
@@ -606,7 +625,9 @@ def _report(
     if before is not None:
         print("Status before start:")
         print_result(_without_repeats(before, printed), secrets)
-    if not run.timed:
+    if not run.timed and run.route == "retry":
+        print("Route: retry (untimed proof: a fresh regular variant after the scored attempt; no ranked variant)")
+    elif not run.timed:
         print("Route: start (untimed request; reconnects to the current attempt)")
     else:
         print(f"Route: {run.route}" + (" (new timed variant after the previous attempt ended)" if run.route == "retry" else ""))
@@ -753,11 +774,13 @@ def run_fast(
     ntp: Callable[[], float | None] = network.clock_offset,
     gate_ms: float | None = None, gate_wait: float = 600.0,
     sleep: Callable[[float], None] = time.sleep, report: dict[str, Any] | None = None,
-    reserve: int = 0,
+    reserve: int = 0, prove: bool = False,
 ) -> int:
     """Solve one challenge. `challenge` is its record from a list the caller already has.
 
-    Untimed: an ordinary start (which only reconnects; never an automatic retry).
+    Untimed: an ordinary start (which only reconnects; never an automatic retry). With
+    `prove`, on a route that is already solved: status first, then a plain untimed retry
+    (`plan_proof`), so the robot's own CORRECT records the hint `daily --timed` races on.
     Timed: status first, then start or retry with run_for_time, as `plan_route` decides.
     `pipeline=False` keeps one request at a time even where the probe passed.
     `gate_ms` (timed) waits up to `gate_wait` s for the server to answer status that fast
@@ -777,6 +800,15 @@ def run_fast(
         and network.pipelining_ok(base_url, network_path),
     )
     before = None
+    if prove and not timed:
+        try:
+            responses["before"] = before = client.status(challenge_id)
+            run.route, reason = plan_proof(before)
+        except GameMasterError as exc:
+            run.route, reason = "stop", f"status failed ({exc})"
+        if run.route in ("pending", "stop"):
+            print(f"No proof run was started: {reason}")
+            return PENDING if run.route == "pending" else UNRESOLVED
     if timed:
         # Before the clock. This request also leaves the connection warm for start.
         try:

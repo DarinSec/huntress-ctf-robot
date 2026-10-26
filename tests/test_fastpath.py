@@ -12,6 +12,7 @@ from unittest.mock import patch
 from huntress_ctf.autopilot import COMPLETE, CONFLICT, EXPIRED, INCORRECT, PENDING, UNRESOLVED
 from huntress_ctf.client import GameMasterError
 from huntress_ctf.fastpath import run_fast
+from huntress_ctf.hints import get_hint
 from huntress_ctf.solvers import AnswerCandidate
 
 
@@ -77,9 +78,9 @@ class FastPathTests(unittest.TestCase):
         root = Path(self.directory.name)
         with redirect_stdout(output or self.output):
             return run_fast(
-                client, "c", timed=True, artifact_dir=root, work_dir=root / "work",
+                client, "c", artifact_dir=root, work_dir=root / "work",
                 hints_path=root / "hints.json",
-                **{"ntp": lambda: None, "clock": lambda: next(ticks) / 1000, **kwargs},
+                **{"timed": True, "ntp": lambda: None, "clock": lambda: next(ticks) / 1000, **kwargs},
             )
 
     def pipelining_client(self, early=None):
@@ -360,6 +361,30 @@ class FastPathTests(unittest.TestCase):
         self.assertIn(("retry", True), client.calls)
         self.assertNotIn(("start", True), client.calls)
         self.assertIn("Route: retry", self.output.getvalue())
+
+    def test_a_proof_run_retries_untimed_and_records_the_hint(self):
+        client = FakeClient(self.output)
+        del client.assignment["deadline"]
+        client.status_response = {"answer_ids": ["a"], "result": "CORRECT", "ranked_attempts_remaining": 2}
+        self.assertEqual(self.run_fast(client, timed=False, prove=True), COMPLETE)
+        attempts = [call for call in client.calls if isinstance(call, tuple) and call[0] in ("start", "retry")]
+        self.assertEqual(attempts, [("retry", False)])  # A regular variant; run_for_time never sent.
+        self.assertIn("untimed proof", self.output.getvalue())
+        self.assertIsNotNone(get_hint("c", Path(self.directory.name) / "hints.json"))
+
+    def test_a_proof_run_reconnects_or_waits(self):
+        for status, expected, attempts in (
+            ({"answer_ids": ["a"], "attempt_id": "one", "state": "active"}, COMPLETE, [("start", False)]),
+            ({"answer_ids": ["a"], "attempt_id": "one", "state": "active",
+              "deadline": "2026-10-27T13:10:00Z"}, UNRESOLVED, []),  # Someone is racing it.
+            ({"result": "CORRECT", "status": "pending"}, PENDING, []),
+        ):
+            with self.subTest(status=status):
+                client = FakeClient(self.output)
+                client.status_response = status
+                self.assertEqual(self.run_fast(client, timed=False, prove=True), expected)
+                self.assertEqual([call for call in client.calls
+                                  if isinstance(call, tuple) and call[0] in ("start", "retry")], attempts)
 
     def test_reserve_keeps_the_last_variants(self):
         for remaining, raced in ((9, True), (8, False), (None, False)):

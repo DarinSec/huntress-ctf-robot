@@ -127,6 +127,28 @@ def eligibility(
     return "an ordinary start may begin a timer on this route"
 
 
+def needs_proof(record: dict[str, Any], hints: dict[str, Any]) -> bool:
+    """A solved Time Trial or Mastery that `daily --timed` will not race: no solver scored it.
+
+    Day 26: three Single Solves were finished by hand, so six timed routes had no proven
+    solver and were never raced. `daily --prove` gives such a route one untimed run
+    (`fastpath.plan_proof`): a fresh regular variant, never a ranked one.
+    """
+    challenge_id = _id(record)
+    if record.get("solved") is not True or record.get("run_for_time_supported") is not True:
+        return False
+    if lane_of(record, str(challenge_id)) in TARGET_LANES:
+        return False
+    if mode_name(record, AttemptState()) not in ("Time Trial", "Mastery Mode"):
+        return False
+    hint = hints.get(challenge_id) or {}
+    if hint.get("raced_at") or not hint.keys() <= set(TURNED_DOWN_KEYS):
+        return False  # Raced, or a solver scored here: proven already.
+    single = challenge_id.split("/", 1)[0]
+    # A course lane races on its Single Solve's proof.
+    return not (single in hints and record.get("lane") in COURSE_LANES)
+
+
 def families(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Records grouped by their Single Solve ID, each group Single, Time Trial, Mastery."""
     groups: dict[Any, list[dict[str, Any]]] = {}
@@ -214,7 +236,7 @@ def run_daily(
     repeat: int = 1, gate_ms: float | None = None, gate_wait: float = 600.0,
     rerace: bool = False, wait_release: float = 0.0, workers: int = WORKERS,
     sleep: Callable[[float], None] = time.sleep, days: list[int] | None = None,
-    reserve: int = 0, lanes: tuple[str, ...] = (),
+    reserve: int = 0, lanes: tuple[str, ...] = (), prove: bool = False,
 ) -> int:
     """`repeat` (timed) races each challenge that many times: Hall of Fame keeps the best.
 
@@ -225,6 +247,8 @@ def run_daily(
     `reserve` (timed) keeps that many fresh variants per route unspent.
     `lanes` keeps the run to those lanes: teammates share attempts, and an untimed start
     of their Time Trial would block their timed race until it ends.
+    `prove` (untimed) gives each solved but unproven Time Trial and Mastery one untimed run
+    (`needs_proof`), so the timed pass after it can race a route a human solved first.
     """
     began_all = clock()
     if days:
@@ -255,6 +279,9 @@ def run_daily(
     def run_one(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
         challenge_id = _id(record)
         reason = eligibility(record, timed, hints, lane=lane, requested_lanes=lanes, rerace=rerace)
+        proving = prove and not timed and reason == "already solved" and needs_proof(record, hints)
+        if proving:
+            reason = None
         if reason is not None:
             entry = {"challenge": challenge_id, "outcome": "skipped", "reason": reason}
             if reason.startswith(TURNED_DOWN_REASON):
@@ -265,7 +292,8 @@ def run_daily(
         reports: list[dict[str, Any]] = []
         try:
             for number in range(1, (max(repeat, 1) if timed else 1) + 1):
-                print(f"\n===== {challenge_id} ({'timed race ' + str(number) if timed else 'untimed'}) =====")
+                kind = "timed race " + str(number) if timed else "untimed proof" if proving else "untimed"
+                print(f"\n===== {challenge_id} ({kind}) =====")
                 report: dict[str, Any] = {}
                 reports.append(report)
                 # The record from this list is passed on, so no run fetches the list again.
@@ -274,6 +302,7 @@ def run_daily(
                     artifact_dir=artifact_dir, work_dir=work_dir, hints_path=hints_path,
                     capture_dir=capture_dir, clock=clock, pipeline=pipeline,
                     gate_ms=gate_ms, gate_wait=gate_wait, report=report, reserve=reserve,
+                    **({"prove": True} if proving else {}),
                 )
                 measured = (report.get("server_clock_ms") or {}).get("from")
                 if measured is not None:
@@ -291,6 +320,8 @@ def run_daily(
                 print(f"\n===== {challenge_id} (incorrect: resending kind by kind) =====")
                 code = run_learn(target, challenge_id, hints_path=hints_path, challenge=record, open_only=True)
             entry = {"challenge": challenge_id, "outcome": OUTCOMES.get(code, str(code))}
+            if proving:
+                entry["proof"] = True
             # So tonight's and tomorrow's races skip what the service turned down.
             note = record_outcome(challenge_id, entry["outcome"], timed, hints_path)
             if note:
@@ -389,6 +420,8 @@ def _run_group(
             traceback.print_exc(file=sys.stdout)
             entry = {"challenge": _id(record), "outcome": "error", "reason": repr(exc)}
         entries[id(record)] = entry
+        if entry.get("proof"):
+            continue  # The route is solved, so the next mode is open whatever the proof did.
         if entry["outcome"] not in ("complete", "skipped") or entry.get("blocks_family"):
             blocked = _id(record)
 

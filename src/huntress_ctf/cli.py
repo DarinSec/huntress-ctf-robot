@@ -158,6 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
                        default=(), help="Only these lanes, comma-separated (leave teammates' lanes alone)")
     daily.add_argument("--timed", action="store_true", help="Race only challenges whose solver already scored CORRECT")
     daily.add_argument("--rerace", action="store_true", help="With --timed: also race routes that were raced before (spends variants)")
+    daily.add_argument("--prove", action="store_true",
+                       help="Untimed: one untimed retry of each solved Time Trial/Mastery no solver scored (a regular variant), so --timed races it")
     daily.add_argument("--wait-release", type=_seconds, default=0, metavar="SECONDS",
                        help="With --day: poll for that day's release for up to this long, then start at once")
     daily.add_argument("--workers", type=_count, default=6, help="Untimed: challenge families solved in parallel (1-100)")
@@ -336,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
                 capture_dir=CAPTURE_DIR if args.capture else None, pipeline=not args.no_pipeline,
                 repeat=args.repeat, gate_ms=args.gate_ms, gate_wait=args.gate_wait,
                 rerace=args.rerace, wait_release=args.wait_release, workers=args.workers,
-                days=args.days, reserve=args.reserve, lanes=args.lanes,
+                days=args.days, reserve=args.reserve, lanes=args.lanes, prove=args.prove,
             )
         elif args.command == "bench":
             print_result(_bench(client, args, token), secrets)
