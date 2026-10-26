@@ -311,6 +311,98 @@ def destlist(paths):
     return out
 
 
+RECYCLED_PATH = "C:\\Users\\analyst\\Desktop\\secret.xlsx"
+
+
+def recycle_bin_i():
+    return (struct.pack("<QQQI", 2, 48213, filetime(2026, 10, 20), len(RECYCLED_PATH) + 1)
+            + (RECYCLED_PATH + "\0").encode("utf-16-le"))
+
+
+def minidump():
+    name = "C:\\Windows\\System32\\lsass.exe".encode("utf-16-le")
+    system = struct.pack("<HHHBBIIIII", 9, 6, 0, 4, 1, 10, 0, 19045, 2, 0)
+    modules = struct.pack("<I", 1) + struct.pack("<QIIII", 0x7FF600000000, 0x1000, 0, 0, 200).ljust(108, b"\0")
+    misc = struct.pack("<IIII", 24, 1, 712, 0)
+    directory = struct.pack("<III", 7, len(system), 100) + struct.pack("<III", 4, len(modules), 140) \
+        + struct.pack("<III", 15, len(misc), 280)
+    data = bytearray(400)
+    data[:32] = b"MDMP" + struct.pack("<IIIIIQ", 0xA793, 3, 32, 0, 1793491200, 0x2)
+    data[32:32 + len(directory)] = directory
+    data[100:100 + len(system)] = system
+    data[140:140 + len(modules)] = modules
+    data[200:204 + len(name)] = struct.pack("<I", len(name)) + name
+    data[280:296] = misc
+    return bytes(data)
+
+
+def scheduled_task():
+    xml = ('<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" '
+           'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Author>CORP\\svc</Author>'
+           '<URI>\\Updater</URI></RegistrationInfo><Triggers><LogonTrigger/><TimeTrigger/></Triggers>'
+           '<Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>'
+           '<Settings><Hidden>true</Hidden></Settings><Actions><Exec><Command>powershell.exe</Command>'
+           '<Arguments>-w hidden -enc AAAA</Arguments></Exec></Actions></Task>')
+    return b"\xff\xfe" + xml.encode("utf-16-le")
+
+
+def ewf():
+    import zlib
+    text = "1\nmain\nc\tn\ta\te\tt\tav\tov\tm\tu\nCASE-26\tEV-1\tLaptop\tJ. Analyst\tnone\t20201230\tWindows\t2026 10 01\t2026 10 01\n\n"
+    def section(kind, body, nxt):
+        return kind.ljust(16, b"\0") + struct.pack("<QQ", nxt, 76 + len(body)) + bytes(44) + body
+    header = zlib.compress(text.encode())
+    volume = struct.pack("<B3xIIIQ", 1, 2, 64, 512, 128).ljust(1052, b"\0")
+    digest = bytes.fromhex("00112233445566778899aabbccddeeff") + bytes(20)
+    a = 13
+    b = a + 76 + len(header)
+    c = b + 76 + len(volume)
+    d = c + 76 + len(digest)
+    return (b"EVF\x09\x0d\x0a\xff\x00" + b"\x01" + struct.pack("<HH", 1, 0) + section(b"header", header, b)
+            + section(b"volume", volume, c) + section(b"digest", digest, d) + section(b"done", b"", d))
+
+
+def gpt_disk():
+    """A protective MBR and a GPT with one basic data partition named "Data"."""
+    disk = bytearray(512 * 34)
+    struct.pack_into("<I", disk, 440, 0xDEADBEEF)
+    struct.pack_into("<B3xB3xII", disk, 446, 0x00, 0xEE, 1, 0xFFFFFFFF)
+    disk[510:512] = b"\x55\xaa"
+    disk[512:520] = b"EFI PART"
+    struct.pack_into("<IIIIQQQQ", disk, 520, 0x10000, 92, 0, 0, 1, 99, 34, 90)
+    disk[568:584] = bytes(range(16))
+    struct.pack_into("<QII", disk, 584, 2, 128, 128)
+    entry = 1024
+    disk[entry:entry + 16] = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")  # basic data
+    struct.pack_into("<QQ", disk, entry + 32, 34, 90)
+    disk[entry + 56:entry + 56 + 8] = "Data".encode("utf-16-le")
+    return bytes(disk)
+
+
+def ntfs_boot():
+    boot = bytearray(512)
+    boot[3:11] = b"NTFS    "
+    struct.pack_into("<HB", boot, 11, 512, 8)
+    struct.pack_into("<QQQb", boot, 40, 2048000, 786432, 2, -10)
+    struct.pack_into("<Q", boot, 72, 0x1234ABCD5678EF90)
+    boot[510:512] = b"\x55\xaa"
+    return bytes(boot)
+
+
+def dmg():
+    koly = bytearray(512)
+    koly[:4] = b"koly"
+    struct.pack_into(">IIIQQQQQII", koly, 4, 4, 512, 1, 0, 0, 8192, 0, 0, 1, 1)
+    struct.pack_into(">QQ", koly, 0xD8, 8192, 300)
+    struct.pack_into(">IQ", koly, 0x1E8, 1, 64)
+    return bytes(8492) + bytes(koly)
+
+
+def ds_store():
+    record = lambda name: struct.pack(">I", len(name)) + name.encode("utf-16-be") + b"Ilocblob" + bytes(8)
+    return b"\0\0\0\x01Bud1" + bytes(20) + record("payload.app") + record("readme.txt") + record("payload.app")
+
+
 class Day26CandidateTests(unittest.TestCase):
     def test_mft_record(self):
         f = fields(mft_record(), "mft")
@@ -334,12 +426,10 @@ class Day26CandidateTests(unittest.TestCase):
         self.assertEqual(f["reasons"], ["DATA_EXTEND", "FILE_CREATE", "FILE_DELETE", "CLOSE"])
 
     def test_recycle_bin_i(self):
-        path = "C:\\Users\\analyst\\Desktop\\secret.xlsx"
-        data = struct.pack("<QQQI", 2, 48213, filetime(2026, 10, 20), len(path) + 1) + (path + "\0").encode("utf-16-le")
-        f = fields(data, "recycle_bin_i")
+        f = fields(recycle_bin_i(), "recycle_bin_i")
         self.assertEqual((f["original_path"], f["original_name"], f["original_size"], f["deleted_utc"]),
-                         (path, "secret.xlsx", 48213, "2026-10-20T00:00:00Z"))
-        legacy = struct.pack("<QQQ", 1, 7, filetime()) + path.encode("utf-16-le").ljust(520, b"\0")
+                         (RECYCLED_PATH, "secret.xlsx", 48213, "2026-10-20T00:00:00Z"))
+        legacy = struct.pack("<QQQ", 1, 7, filetime()) + RECYCLED_PATH.encode("utf-16-le").ljust(520, b"\0")
         self.assertEqual(fields(legacy, "recycle_bin_i")["original_name"], "secret.xlsx")
 
     def test_jump_lists(self):
@@ -353,96 +443,39 @@ class Day26CandidateTests(unittest.TestCase):
         self.assertEqual(fields(custom, "custom_destinations")["target_paths"], paths)
 
     def test_minidump(self):
-        name = "C:\\Windows\\System32\\lsass.exe".encode("utf-16-le")
-        system = struct.pack("<HHHBBIIIII", 9, 6, 0, 4, 1, 10, 0, 19045, 2, 0)
-        modules = struct.pack("<I", 1) + struct.pack("<QIIII", 0x7FF600000000, 0x1000, 0, 0, 200).ljust(108, b"\0")
-        misc = struct.pack("<IIII", 24, 1, 712, 0)
-        directory = struct.pack("<III", 7, len(system), 100) + struct.pack("<III", 4, len(modules), 140) \
-            + struct.pack("<III", 15, len(misc), 280)
-        data = bytearray(400)
-        data[:32] = b"MDMP" + struct.pack("<IIIIIQ", 0xA793, 3, 32, 0, 1793491200, 0x2)
-        data[32:32 + len(directory)] = directory
-        data[100:100 + len(system)] = system
-        data[140:140 + len(modules)] = modules
-        data[200:204 + len(name)] = struct.pack("<I", len(name)) + name
-        data[280:296] = misc
-        f = fields(bytes(data), "minidump")
+        f = fields(minidump(), "minidump")
         self.assertEqual((f["processor_architecture"], f["os_version"], f["module_count"], f["main_module_name"],
                           f["process_id"], f["stream_types"]),
                          ("amd64", "10.0.19045", 1, "lsass.exe", 712, ["SystemInfoStream", "ModuleListStream", "MiscInfoStream"]))
 
     def test_scheduled_task(self):
-        xml = ('<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" '
-               'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Author>CORP\\svc</Author>'
-               '<URI>\\Updater</URI></RegistrationInfo><Triggers><LogonTrigger/><TimeTrigger/></Triggers>'
-               '<Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>'
-               '<Settings><Hidden>true</Hidden></Settings><Actions><Exec><Command>powershell.exe</Command>'
-               '<Arguments>-w hidden -enc AAAA</Arguments></Exec></Actions></Task>')
-        f = fields(b"\xff\xfe" + xml.encode("utf-16-le"), "scheduled_task")
+        f = fields(scheduled_task(), "scheduled_task")
         self.assertEqual((f["author"], f["uri"], f["user_id"], f["run_level"], f["hidden"]),
                          ("CORP\\svc", "\\Updater", "S-1-5-18", "HighestAvailable", "true"))
         self.assertEqual((f["trigger_types"], f["command"], f["command_arguments"]),
                          (["LogonTrigger", "TimeTrigger"], "powershell.exe", "-w hidden -enc AAAA"))
 
     def test_ewf_image(self):
-        import zlib
-        text = "1\nmain\nc\tn\ta\te\tt\tav\tov\tm\tu\nCASE-26\tEV-1\tLaptop\tJ. Analyst\tnone\t20201230\tWindows\t2026 10 01\t2026 10 01\n\n"
-        def section(kind, body, nxt):
-            return kind.ljust(16, b"\0") + struct.pack("<QQ", nxt, 76 + len(body)) + bytes(44) + body
-        header = zlib.compress(text.encode())
-        volume = struct.pack("<B3xIIIQ", 1, 2, 64, 512, 128).ljust(1052, b"\0")
-        digest = bytes.fromhex("00112233445566778899aabbccddeeff") + bytes(20)
-        a = 13
-        b = a + 76 + len(header)
-        c = b + 76 + len(volume)
-        d = c + 76 + len(digest)
-        data = (b"EVF\x09\x0d\x0a\xff\x00" + b"\x01" + struct.pack("<HH", 1, 0) + section(b"header", header, b)
-                + section(b"volume", volume, c) + section(b"digest", digest, d) + section(b"done", b"", d))
-        f = fields(data, "ewf")
+        f = fields(ewf(), "ewf")
         self.assertEqual((f["case_number"], f["examiner_name"], f["acquisition_software_version"], f["sector_count"],
                           f["media_size_bytes"], f["md5"]),
                          ("CASE-26", "J. Analyst", "20201230", 128, 65536, "00112233445566778899aabbccddeeff"))
         self.assertEqual(f["section_types"], ["header", "volume", "digest", "done"])
 
     def test_disk_layouts(self):
-        disk = bytearray(512 * 34)
-        struct.pack_into("<I", disk, 440, 0xDEADBEEF)
-        struct.pack_into("<B3xB3xII", disk, 446, 0x00, 0xEE, 1, 0xFFFFFFFF)
-        disk[510:512] = b"\x55\xaa"
-        disk[512:520] = b"EFI PART"
-        struct.pack_into("<IIIIQQQQ", disk, 520, 0x10000, 92, 0, 0, 1, 99, 34, 90)
-        disk[568:584] = bytes(range(16))
-        struct.pack_into("<QII", disk, 584, 2, 128, 128)
-        entry = 1024
-        disk[entry:entry + 16] = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")  # basic data
-        struct.pack_into("<QQ", disk, entry + 32, 34, 90)
-        disk[entry + 56:entry + 56 + 8] = "Data".encode("utf-16-le")
-        mbr, gpt = fields(bytes(disk), "mbr"), fields(bytes(disk), "gpt")
+        mbr, gpt = fields(gpt_disk(), "mbr"), fields(gpt_disk(), "gpt")
         self.assertEqual((mbr["disk_signature"], mbr["partition_types"]), ("0xdeadbeef", ["0xee"]))
         self.assertEqual((gpt["partition_count"], gpt["partition_names"], gpt["partition_type_guids"]),
                          (1, ["Data"], ["ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"]))
-        boot = bytearray(512)
-        boot[3:11] = b"NTFS    "
-        struct.pack_into("<HB", boot, 11, 512, 8)
-        struct.pack_into("<QQQb", boot, 40, 2048000, 786432, 2, -10)
-        struct.pack_into("<Q", boot, 72, 0x1234ABCD5678EF90)
-        boot[510:512] = b"\x55\xaa"
-        f = fields(bytes(boot), "ntfs")
-        self.assertNotIn("mbr", dict(formats(bytes(boot))))
+        f = fields(ntfs_boot(), "ntfs")
+        self.assertNotIn("mbr", dict(formats(ntfs_boot())))
         self.assertEqual((f["cluster_size"], f["mft_offset"], f["mft_record_size"], f["volume_serial_number"]),
                          (4096, 786432 * 4096, 1024, "1234ABCD5678EF90"))
 
     def test_dmg_and_ds_store(self):
-        koly = bytearray(512)
-        koly[:4] = b"koly"
-        struct.pack_into(">IIIQQQQQII", koly, 4, 4, 512, 1, 0, 0, 8192, 0, 0, 1, 1)
-        struct.pack_into(">QQ", koly, 0xD8, 8192, 300)
-        struct.pack_into(">IQ", koly, 0x1E8, 1, 64)
-        f = fields(bytes(8492) + bytes(koly), "dmg")
+        f = fields(dmg(), "dmg")
         self.assertEqual((f["data_fork_length"], f["xml_offset"], f["xml_length"], f["sector_count"]), (8192, 8192, 300, 64))
-        record = lambda name: struct.pack(">I", len(name)) + name.encode("utf-16-be") + b"Ilocblob" + bytes(8)
-        store = b"\0\0\0\x01Bud1" + bytes(20) + record("payload.app") + record("readme.txt") + record("payload.app")
-        self.assertEqual(fields(store, "ds_store")["file_names"], ["payload.app", "readme.txt"])
+        self.assertEqual(fields(ds_store(), "ds_store")["file_names"], ["payload.app", "readme.txt"])
 
     def test_x509_certificate(self):
         import base64

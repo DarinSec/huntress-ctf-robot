@@ -2,7 +2,7 @@
 # Solve and race one release day on the Homebase that plays for the team. Started by cron
 # every minute and at boot (see `crontab -l`). Run by hand: ~/day.sh [day]
 #
-# Before the release (09:00 New York = 15:00 in Sweden) it sleeps until just before it;
+# Before the release (09:00 New York: 15:00 in Sweden, 14:00 from 25 Oct to 1 Nov) it sleeps until just before it;
 # `daily --wait-release` then starts the moment the day is listed:
 #   1. solves every challenge the robot can, untimed, families in parallel (records
 #      proven solvers in ~/.huntress/hints.json);
@@ -51,7 +51,7 @@ swept="$state/day$day.swept"
 release=$(TZ=America/New_York date -d "08:59:30" +%s)
 now=$(date +%s)
 if [ "$now" -lt "$release" ]; then
-  echo "$(date): day $day waits $(( (release - now) / 60 )) min for the release (09:00 New York = 15:00 Sweden)."
+  echo "$(date): day $day waits $(( (release - now) / 60 )) min for the release (09:00 New York)."
   # Close fd 9 for the sleep child: this bash keeps day.lock while it waits, but if the
   # bash is killed or swapped out mid-wait (a deploy, a stray `pkill day.sh`, an OOM), the
   # orphaned sleep must not keep holding the lock -- that would block every later cron run

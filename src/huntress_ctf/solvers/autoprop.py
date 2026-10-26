@@ -30,7 +30,7 @@ from ..formats import describe
 from ..state import GameMasterError, current_fields
 from ..suggest import confident, formatted, ranked
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
-from .metadata import PROPERTIES, Files
+from .metadata import PROPERTIES, Files, _orderings
 
 _PROPERTY = re.compile(r"Determine ([a-z0-9_.]+) for ")
 _MAPPING = re.compile(r"([a-z0-9_.]+)=([a-z_]+):([A-Za-z0-9_]+)")
@@ -106,9 +106,10 @@ class AutoPropertySolver:
             else:
                 continue
             if fits_format(answer, question.answer_format):
+                # A list's order is the grader's choice, as for the parsers: sorted and basenames, untimed.
                 candidates.append(AnswerCandidate(
                     question.answer_id, answer, self.name, evidence,
-                    ("autoprop", f"{prop}={label}:{key}"),
+                    ("autoprop", f"{prop}={label}:{key}"), _orderings(answer, question),
                 ))
         return candidates
 
