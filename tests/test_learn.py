@@ -130,8 +130,10 @@ class LearnTests(unittest.TestCase):
                 return {"answer_ids": ids, "attempt_id": "a"}
 
         client = OpenClient(wrong_kind="never", ids=ids)
-        with redirect_stdout(StringIO()), patch("huntress_ctf.learn.SOLVERS", (ScriptSolver(),)):
-            run_learn(client, "script-analysis-day-22-x", open_only=True, challenge={"id": "script-analysis-day-22-x"})
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), \
+                patch("huntress_ctf.learn.SOLVERS", (ScriptSolver(),)):  # Never the real hints.json.
+            run_learn(client, "script-analysis-day-22-x", open_only=True, challenge={"id": "script-analysis-day-22-x"},
+                      hints_path=Path(directory) / "hints.json")
         self.assertEqual(client.calls, [("start", False)])  # Reconnects only.
         self.assertEqual(sorted(len(batch) for batch in client.submits), [45, 45])  # attack, role.
 
@@ -198,9 +200,10 @@ class LearnTests(unittest.TestCase):
                 return {"result": "incorrect"}
 
         client = OpenClient(ids=ids)
-        with redirect_stdout(StringIO()) as output, patch("huntress_ctf.learn.SOLVERS", (OneSolver(),)):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()) as output, \
+                patch("huntress_ctf.learn.SOLVERS", (OneSolver(),)):
             code = run_learn(client, "metadata-day-23-x/time_trial", open_only=True,
-                             challenge={"id": "metadata-day-23-x/time_trial"})
+                             challenge={"id": "metadata-day-23-x/time_trial"}, hints_path=Path(directory) / "hints.json")
         report = json.loads(output.getvalue())
         self.assertEqual(code, COMPLETE)
         self.assertEqual(report["alternatives"][ids[0]]["accepted"], sorted_names)
