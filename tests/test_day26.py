@@ -10,9 +10,15 @@ import json
 import struct
 import unittest
 import zipfile
+from pathlib import Path
 
+from huntress_ctf import dexvm
+from huntress_ctf.containers import Member
+from huntress_ctf.solvers.base import SolveContext
 from huntress_ctf.solvers.binary import BinarySolver
+from huntress_ctf.solvers.mobile_puzzle import MobilePuzzleSolver
 from tests.test_binary_assignment import archive_context
+from tests.test_dexvm import manifest
 
 
 def classfile(name, methods):
@@ -65,6 +71,92 @@ class CrashTraceTests(unittest.TestCase):
     def test_missing_or_malformed_trace_is_no_answer(self):
         for trace in ("{not json", json.dumps({"frames": []}), json.dumps({"frames": ["a", 3]}), json.dumps([1])):
             self.assertEqual(crash_answers(crash_jar([], trace=trace)), {}, trace)
+
+
+PACKAGE = "com.huntress.mobile.d26.vsynthetic"
+CODE = "ANS-0123456789ABCDEF"
+
+
+def split_apk(files, package=PACKAGE):
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("AndroidManifest.xml", manifest(package, 26, "1.0"))
+        for name, data in files.items():
+            archive.writestr(name, data)
+    return out.getvalue()
+
+
+def apks(**apks_by_name):
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        for name, data in apks_by_name.items():
+            archive.writestr(name, data)
+    return out.getvalue()
+
+
+def mobile_context(artifact, members, reference):
+    question = {"id": "answer", "artifact": reference,
+                "question": f"For case MOB-26-X in package {PACKAGE}: Reassemble evidence distributed across base "
+                            "and configuration splits. Submit only the exact backend answer code returned for this case.",
+                "answer_format": {"kind": "pattern", "syntax": "ANS- followed by exactly 16 uppercase hexadecimal characters"}}
+    return SolveContext("mobile-android-day-26-synthetic", {"lane": "mobile-android"}, {"questions": [question]},
+                        artifact, Path("synthetic.apks"), ("answer",), tuple(members))
+
+
+class SplitApkTests(unittest.TestCase):
+    def bundle(self, part="89ABCDEF", index=0):
+        base = split_apk({"assets/huntress_puzzle.json": json.dumps(
+            {"schema": "huntress.mobile.puzzle.v1", "day": 26, "codec": "split", "data": "",
+             "parts": ["", "ANS-", "01234567"], "order": [2, 0, 1]})})
+        feature = split_apk({"assets/huntress_feature.json": json.dumps(
+            {"codec": "split", "day": 26, "part": part, "part_index": index})})
+        return base, feature
+
+    def answer(self, context):
+        return {c.answer_id: c.answer for c in MobilePuzzleSolver().solve(context)}
+
+    def test_single_solve_apks_fills_parts_from_the_feature_split(self):
+        base, feature = self.bundle()
+        bundle = apks(**{"base.apk": base, "feature.apk": feature})
+        unpacked = [Member("base.apk", base), Member("feature.apk", feature)]
+        self.assertEqual(self.answer(mobile_context(bundle, unpacked, "split_decision.apks")), {"answer": CODE})
+
+    def test_mastery_delivery_keeps_the_apks_whole(self):
+        base, feature = self.bundle()
+        member = Member("delivery 10: split_decision_mastery_10.apks", apks(**{"base.apk": base, "feature.apk": feature}))
+        self.assertEqual(self.answer(mobile_context(b"", [member], "delivery 10: split_decision_mastery_10.apks")),
+                         {"answer": CODE})
+
+    def test_no_feature_split_or_other_package_is_no_answer(self):
+        base, feature = self.bundle()
+        self.assertEqual(self.answer(mobile_context(apks(**{"base.apk": base}), [Member("base.apk", base)],
+                                                    "split_decision.apks")), {})
+        stranger = split_apk({"assets/huntress_feature.json": json.dumps({"part": "89ABCDEF", "part_index": 0})},
+                             package="com.example.other")
+        self.assertEqual(self.answer(mobile_context(apks(**{"base.apk": base, "feature.apk": stranger}),
+                                                    [Member("base.apk", base), Member("feature.apk", stranger)],
+                                                    "split_decision.apks")), {})
+
+    def test_split_source_dirs_open_the_feature_split(self):
+        # The "analysis" variant: getApplicationInfo().splitSourceDirs -> new ZipFile(path) -> getEntry(asset).
+        secret = bytes(range(16))
+        feature = split_apk({"assets/huntress_feature.bin": secret})
+        base = split_apk({"assets/huntress_puzzle.json": "{}"})
+        vm = dexvm.Machine([], package=PACKAGE, apk=base, splits=[feature])
+        call = lambda cls, name, sig, *args: dexvm._platform(cls, name, sig, list(args), vm)
+        info = call("Landroid/content/Context;", "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", vm.context)
+        (path,) = info.fields["splitSourceDirs"]
+        archive = dexvm.ApkZip()
+        call("Ljava/util/zip/ZipFile;", "<init>", "(Ljava/lang/String;)V", archive, path)
+        entry = call("Ljava/util/zip/ZipFile;", "getEntry", "", archive, "assets/huntress_feature.bin")
+        stream = call("Ljava/util/zip/ZipFile;", "getInputStream", "", archive, entry)
+        chunk = [0] * 16
+        self.assertEqual(call("Ljava/io/InputStream;", "read", "([BII)I", stream, chunk, 0, 16), 16)
+        self.assertEqual(dexvm._bytes(chunk), secret)
+        self.assertIsNone(call("Ljava/util/zip/ZipFile;", "getEntry", "", archive, "assets/missing.bin"))
+        alone = dexvm.Machine([], package=PACKAGE, apk=base)  # A plain APK has no splits: null, as on Android.
+        info = dexvm._platform("Landroid/content/Context;", "getApplicationInfo", "", [alone.context], alone)
+        self.assertIsNone(info.fields["splitSourceDirs"])
 
 
 if __name__ == "__main__":

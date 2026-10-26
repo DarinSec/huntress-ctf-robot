@@ -216,8 +216,13 @@ def _in_app(apk: zipfile.ZipFile) -> set[str]:
     return found
 
 
-def answer_code(apk_bytes: bytes) -> str | None:
-    """The one answer code the APK's puzzle asset decodes to, or None."""
+def answer_code(apk_bytes: bytes, feature_parts: dict[int, str] | None = None,
+                splits: list[bytes] | None = None) -> str | None:
+    """The one answer code the APK's puzzle asset decodes to, or None.
+
+    feature_parts fills the empty "split" parts a base APK leaves to its feature splits, and splits
+    are those split APKs for code that opens them (splitSourceDirs; both day 26).
+    """
     try:
         with zipfile.ZipFile(BytesIO(apk_bytes)) as apk:
             names = [name for name in apk.namelist() if name.endswith("huntress_puzzle.json")]
@@ -226,6 +231,9 @@ def answer_code(apk_bytes: bytes) -> str | None:
             puzzle = json.loads(read_member(apk, names[0]))
             if not isinstance(puzzle, dict):
                 return None
+            if feature_parts and isinstance(puzzle.get("parts"), list):
+                puzzle["parts"] = [feature_parts.get(i, part) if part == "" else part
+                                   for i, part in enumerate(puzzle["parts"])]
             codes: set[str] = set()
             if isinstance(puzzle.get("data"), str):
                 codes = {value for value in _decoded(str(puzzle.get("codec", "")), puzzle["data"], apk, puzzle)
@@ -235,7 +243,7 @@ def answer_code(apk_bytes: bytes) -> str | None:
         return None
     if not codes:
         manifest = formats.apk(apk_bytes) or {}
-        computed = dexvm.answer_code(apk_bytes, manifest.get("package_name"))
+        computed = dexvm.answer_code(apk_bytes, manifest.get("package_name"), splits)
         # A code the app merely ships as text counts only where nothing computed one, so
         # a literal left in another member can never contradict the emulated answer.
         codes = {computed} if computed else literal
@@ -258,6 +266,57 @@ def _apks(context: SolveContext) -> dict[str, bytes]:
     return found
 
 
+def _package_apks(context: SolveContext, package: str) -> list[bytes]:
+    """Every APK (artifact or member, split bundles included) whose manifest names the package."""
+    blobs = [member.data for member in context.members if member.name.endswith(".apk")]
+    if context.artifact.startswith(b"PK"):
+        blobs.append(context.artifact)
+    # A Mastery delivery can itself be an .apks bundle, kept whole by the unpacker: open it here.
+    for data in [context.artifact] + [member.data for member in context.members if member.name.endswith(".apks")]:
+        blobs.extend(_bundle_apks(data))
+    unique = list({blob: None for blob in blobs})  # A bundle's APKs may also be unpacked members.
+    return [blob for blob in unique if (formats.apk(blob) or {}).get("package_name") == package]
+
+
+def _bundle_apks(data: bytes) -> list[bytes]:
+    """The split APKs inside an .apks bundle (a ZIP of APKs without its own manifest), bounded."""
+    if not data.startswith(b"PK"):
+        return []
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as bundle:
+            names = bundle.namelist()
+            if "AndroidManifest.xml" in names:
+                return []
+            return [read_member(bundle, name, MAX_MEMBER_BYTES) for name in names
+                    if name.endswith(".apk") and not name.endswith("/")][:16]
+    except (*ZIP_ERRORS, KeyError):
+        return []
+
+
+def _with_asset(blob: bytes, suffix: str) -> list[str]:
+    try:
+        with zipfile.ZipFile(BytesIO(blob)) as apk:
+            return [name for name in apk.namelist() if name.endswith(suffix)]
+    except ZIP_ERRORS:
+        return []
+
+
+def _feature_parts(blobs: list[bytes]) -> dict[int, str]:
+    """Day 26 split APKs: each feature split's assets/huntress_feature.json carries one part."""
+    parts: dict[int, str] = {}
+    for blob in blobs:
+        for name in _with_asset(blob, "huntress_feature.json"):
+            try:
+                with zipfile.ZipFile(BytesIO(blob)) as apk:
+                    feature = json.loads(read_member(apk, name))
+            except (*ZIP_ERRORS, KeyError, UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(feature, dict) and isinstance(feature.get("part_index"), int) \
+                    and isinstance(feature.get("part"), str):
+                parts[feature["part_index"]] = feature["part"]
+    return parts
+
+
 class MobilePuzzleSolver:
     name = "mobile-puzzle"
     lanes = frozenset({"mobile-android"})
@@ -272,14 +331,21 @@ class MobilePuzzleSolver:
             name = (question.artifact or "").rsplit("->", 1)[-1].strip().rsplit("/", 1)[-1]
             name = re.sub(r"^delivery \d+:\s*", "", name)
             blob = apks.get(name) or (apks.get("artifact") if len(apks) == 1 or name not in apks else None)
-            if blob is None:
-                continue
             # "For case ... in package <name>": never answer one app's question from another app
             # (a Mastery delivery that is missing must not borrow the first app's code).
             wanted = _PACKAGE.search(question.text)
-            if wanted and (formats.apk(blob) or {}).get("package_name") != wanted[1]:
+            features: dict[int, str] = {}
+            if wanted:
+                same = _package_apks(context, wanted[1])
+                if blob is None or (formats.apk(blob) or {}).get("package_name") != wanted[1]:
+                    # Day 26 .apks bundle: the base split holds the puzzle, feature splits the parts.
+                    bases = [b for b in same if _with_asset(b, "huntress_puzzle.json")]
+                    blob = bases[0] if len(bases) == 1 else None
+                features = _feature_parts(same)
+            if blob is None:
                 continue
-            code = answer_code(blob)
+            splits = [other for other in same if other is not blob] if wanted else []
+            code = answer_code(blob, features, splits)
             if code and fits_format(code, question.answer_format):
                 candidates.append(AnswerCandidate(
                     question.answer_id, code, self.name,

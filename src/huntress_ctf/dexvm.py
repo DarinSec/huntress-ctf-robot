@@ -264,9 +264,10 @@ class Context:
     """getPackageName() and getAssets(); Day 23 only stores the argument. Assets are the APK's own
     assets/ members, read from the bytes in memory (Day 20 ships its second DEX there)."""
 
-    def __init__(self, package: str | None, apk: bytes | None = None) -> None:
+    def __init__(self, package: str | None, apk: bytes | None = None, splits: list[bytes] | None = None) -> None:
         self.package = package
         self.apk = apk
+        self.splits = list(splits or [])  # Day 26: the installed config/feature split APKs (splitSourceDirs).
 
     def asset(self, name: str) -> bytes:
         if self.apk is None:
@@ -453,8 +454,19 @@ class Unresolved:
 
 
 class PathToken:
-    """The app's own APK path (getPackageCodePath, ApplicationInfo.sourceDir). Only ZipFile and File
-    accept it: the real path holds a random install directory, so its text is never an answer."""
+    """The app's own APK path (getPackageCodePath, ApplicationInfo.sourceDir), or one split APK's
+    (ApplicationInfo.splitSourceDirs, day 26). Only ZipFile and File accept it: the real path holds a
+    random install directory, so its text is never an answer."""
+
+    def __init__(self, apk: bytes | None = None) -> None:
+        self.apk = apk  # None: the base APK itself.
+
+
+def _path_bytes(vm: "Machine", token: "PathToken") -> bytes:
+    data = token.apk if token.apk is not None else vm.context.apk
+    if data is None:
+        raise Unsupported("APK path without the APK")
+    return data
 
 
 class FileModel:
@@ -1128,7 +1140,9 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
             return PackageManager(this)
         if name == "getApplicationInfo" and this.apk is not None and this.package:
             info = JObject("Landroid/content/pm/ApplicationInfo;")
-            info.fields.update(packageName=this.package, sourceDir=PathToken(), publicSourceDir=PathToken())
+            info.fields.update(packageName=this.package, sourceDir=PathToken(), publicSourceDir=PathToken(),
+                               splitSourceDirs=[PathToken(split) for split in this.splits] or None,
+                               splitPublicSourceDirs=[PathToken(split) for split in this.splits] or None)
             return info
     if isinstance(this, PackageManager):
         if name == "getPackageInfo":
@@ -1178,13 +1192,14 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
         this.path = args[1]
         return None
     if isinstance(this, FileModel) and name in ("length", "exists", "isFile"):
-        return len(vm.context.apk) if name == "length" else True
+        return len(_path_bytes(vm, this.path)) if name == "length" else True
     if isinstance(this, ApkZip):
         if name == "<init>":
             if not isinstance(args[1], PathToken) and not (isinstance(args[1], FileModel) and args[1].path is not None):
                 raise Unsupported("ZipFile outside the APK")
+            token = args[1] if isinstance(args[1], PathToken) else args[1].path
             try:
-                this.archive = zipfile.ZipFile(BytesIO(vm.context.apk))
+                this.archive = zipfile.ZipFile(BytesIO(_path_bytes(vm, token)))
             except ZIP_ERRORS as error:
                 raise Unsupported(f"ZipFile: {error}") from None
             return None
@@ -1497,12 +1512,12 @@ _ARRAY_KINDS = "ijozbcs"  # aget, -wide, -object, -boolean, -byte, -char, -short
 
 class Machine:
     def __init__(self, dexes: list[Dex], natives: dict[str, bytes] | None = None, package: str | None = None,
-                 apk: bytes | None = None) -> None:
+                 apk: bytes | None = None, splits: list[bytes] | None = None) -> None:
         self.classes: dict[str, ClassDef] = {}
         self.dexes: list[Dex] = []
         self.load(dexes)
         self.natives = natives or {}
-        self.context = Context(package, apk)
+        self.context = Context(package, apk, splits)
         self.statics: dict[tuple[str, str], Any] = {}
         self.initialized: set[str] = set()
         self.steps = 0
@@ -1929,8 +1944,10 @@ def _binary(kind: int, left: Any, right: Any, reverse: bool = False) -> Any:
 
 # --- Entry point ----------------------------------------------------------------------------------
 
-def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
-    """The app's computed answer code (Release.code and similar), or None when it cannot be derived."""
+def answer_code(apk_bytes: bytes, package: str | None = None, splits: list[bytes] | None = None) -> str | None:
+    """The app's computed answer code (Release.code and similar), or None when it cannot be derived.
+
+    splits are the bundle's other APKs of the same package (day 26 .apks), seen as splitSourceDirs."""
     try:
         with zipfile.ZipFile(BytesIO(apk_bytes)) as apk:
             names = apk.namelist()
@@ -1954,7 +1971,7 @@ def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
                         if body:
                             natives[symbol] = body
                             break
-    machine = Machine(dexes, natives, package, apk_bytes)
+    machine = Machine(dexes, natives, package, apk_bytes, splits)
     candidates = []
     for definition in machine.classes.values():
         for method in definition.methods.values():
