@@ -281,6 +281,13 @@ its header) runs `daily` untimed from the release and then races the proven rout
 sweeps again within a minute whenever `~/src` or hints.json changes.
 `scripts/homebase-hof.sh` (cron every two hours 00:30-10:30 UTC) re-races every proven Warmups and
 Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
+From a player's own machine instead, `scripts/local-day.sh` does the same from this checkout (direct
+API, token from the git-ignored `.env`, state in `.huntress/`, Web left out of its default lanes,
+`MIN_DAY`, races only with `RACE=1`; install line in its header). Only one robot may play the team's
+shared attempts. Both sweeps can pass `daily --prove`: a Time Trial or Mastery someone solved by hand
+has no proven solver, so `--timed` would never race it; `--prove` gives it one untimed retry (a regular
+variant, never a ranked one; status first, a reconnect if an untimed attempt is still open, nothing
+while a timed one runs), and the robot's own CORRECT records the hint the race needs.
 
 ## Release day: a new question type
 
