@@ -730,6 +730,20 @@ class AssignedArchive:
                 return True, "JAR"
             if "distinct ZIP compression methods" in q:
                 return True, json.dumps(sorted({i.compress_type for i in jar.infos}), separators=(",", ":"))
+            if "crash/trace.json" in q:
+                # Day 26: a synthetic crash trace shipped in the JAR ({"kind", "frames": [innermost first]}).
+                try:
+                    trace = json.loads(jar.read("crash/trace.json"))
+                except (ValueError, UnicodeDecodeError):
+                    return True, None
+                frames = trace.get("frames") if isinstance(trace, dict) else None
+                if not (isinstance(frames, list) and frames and all(isinstance(f, str) for f in frames)):
+                    return True, None
+                if "first string in its frames array" in q:
+                    return True, frames[0]
+                if "every string in crash/trace.json frames is present in the primary classfile method-name set" in q:
+                    return True, str(set(frames) <= set(jar.main.methods)).lower()
+                return True, None
             if "method names in classfile method-table order" in q:
                 return True, json.dumps(jar.main.methods, separators=(",", ":"))
             if "classfile access_flags" in q:
