@@ -8,7 +8,7 @@ may sit in the chain.
 The app is never run. This module parses classes*.dex and interprets the bytecode of the
 methods that chain reaches, with exact Java int/long semantics, in pure Python. Calls into
 the platform are allowed only for a short list of pure library methods (StringBuilder,
-String, Long/Integer, Math, Character, CRC32, MessageDigest, Base64), Context's package
+String, Long/Integer, Math, Character, CRC32, Adler32, MessageDigest, Base64, ByteBuffer), Context's package
 name and the APK's own assets/ members (read from the bytes in memory; Day 20 loads a second
 DEX from there with InMemoryDexClassLoader, and its classes are interpreted like the app's);
 anything else (files, network, platform reflection, clocks, threads) stops the run with
@@ -303,10 +303,34 @@ class Sink:
 
 
 class Buffer:
-    """java.nio.ByteBuffer.wrap(byte[]); only ever handed to a class loader."""
+    """java.nio.ByteBuffer over a byte[] it shares (wrap) or owns (allocate), big-endian until
+    order() says otherwise. A class loader reads its bytes from position to limit."""
 
-    def __init__(self, data: bytes) -> None:
-        self.data = data
+    def __init__(self, array: list[int], position: int = 0, limit: int | None = None) -> None:
+        self.array, self.position = array, position
+        self.limit = len(array) if limit is None else limit
+        self.little = False
+
+    @property
+    def data(self) -> bytes:
+        return _bytes(self.array[self.position:self.limit])
+
+
+class Adler:
+    def __init__(self) -> None:
+        self.value = 1
+
+
+class Locale:
+    """java.util.Locale constants whose case mapping and digits are the root locale's."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+
+class ByteOrder:
+    def __init__(self, little: bool) -> None:
+        self.little = little
 
 
 class Loader:
@@ -514,10 +538,14 @@ _PLATFORM_NEW = {
     **{kind: (lambda kind=kind: Spec(kind)) for kind in ("Ljavax/crypto/spec/SecretKeySpec;", "Ljavax/crypto/spec/IvParameterSpec;",
                                                           "Ljavax/crypto/spec/GCMParameterSpec;", "Ljavax/crypto/spec/PBEKeySpec;")},
     "Ljava/math/BigInteger;": BigNum, "Ljava/util/zip/ZipFile;": ApkZip, "Ljava/io/File;": FileModel,
-    "Ljava/io/ByteArrayInputStream;": lambda: Stream(b""),
+    "Ljava/io/ByteArrayInputStream;": lambda: Stream(b""), "Ljava/util/zip/Adler32;": Adler,
 }
 _PLATFORM_STATICS = {("Ljava/nio/charset/StandardCharsets;", name): Charset(name.replace("_", "-"))
                      for name in ("UTF_8", "US_ASCII", "ISO_8859_1", "UTF_16", "UTF_16BE", "UTF_16LE")}
+# Locales that case-map like the root locale (tr and az do not, so they stay Unsupported).
+_PLATFORM_STATICS.update({("Ljava/util/Locale;", name): Locale(name) for name in ("ROOT", "US", "ENGLISH", "UK", "CANADA")})
+_PLATFORM_STATICS.update({("Ljava/nio/ByteOrder;", "BIG_ENDIAN"): ByteOrder(False),
+                          ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN"): ByteOrder(True)})
 
 
 def _chars(value: Any) -> str:
@@ -640,6 +668,10 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
                 return "".join(chr(c) for c in value)
             return _chars(value)
         if name == "format":
+            if sig.startswith("(Ljava/util/Locale;"):
+                if args[0] is not None and not isinstance(args[0], Locale):
+                    raise Unsupported("String.format in a device locale")
+                args = args[1:]
             return _format(args[0], args[1] or [])
         if name == "join":
             items = args[1] if isinstance(args[1], list) else []
@@ -821,7 +853,7 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
         return this.package
     if cls == "Landroid/content/Context;" and name == "getPackageName" and vm.context.package:
         return vm.context.package
-    for handler in (_secondary_dex, _reflection, _android_apis):
+    for handler in (_secondary_dex, _reflection, _android_apis, _java_utils):
         handled = handler(cls, name, sig, args, vm)
         if handled is not _UNHANDLED:
             return handled
@@ -885,7 +917,7 @@ def _secondary_dex(cls: str, name: str, sig: str, args: list[Any], vm: "Machine"
             return len(this.data)
     if cls == "Ljava/nio/ByteBuffer;" and name == "wrap" and isinstance(this, list):
         start, count = (args[1], args[2]) if len(args) > 2 else (0, len(this))
-        return Buffer(_bytes(this[start:start + count]))
+        return Buffer(this, start, start + count)  # Java shares the array: capacity stays its length.
     if cls == "Ljava/lang/Class;" and name == "getClassLoader" and isinstance(this, JClass):
         return Loader()
     if isinstance(this, Loader):
@@ -1299,6 +1331,136 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
         return Certificate(blob)
     if isinstance(this, Certificate) and name == "getEncoded":
         return _signed_bytes(this.data)
+    return _UNHANDLED
+
+
+# Java utilities a code method is likely to reach next (Darin's Android forecast, 26 Oct): a long
+# turned into bytes with ByteBuffer before a digest, String.format(Locale.US, ...) as Android lint
+# asks for, Adler32 beside CRC32, a literal split, Arrays.fill/sort/toString. A regex split, a
+# device locale, collections and streams stay Unsupported.
+
+_BUFFER_SIZES = {"get": 1, "put": 1, "getShort": 2, "putShort": 2, "getChar": 2, "putChar": 2,
+                 "getInt": 4, "putInt": 4, "getLong": 8, "putLong": 8}
+_REGEX_META = set(".$|()[]{}^?*+\\")
+
+
+def _buffer(this: Buffer, name: str, args: list[Any]) -> Any:
+    if name in ("get", "put") and len(args) > 1 and isinstance(args[1], list):  # bulk, relative
+        array = args[1]
+        start, count = (args[2], args[3]) if len(args) > 3 else (0, len(array))
+        if count < 0 or this.position + count > this.limit or start < 0 or start + count > len(array):
+            raise Unsupported(f"ByteBuffer.{name} past the limit")
+        source, target = (this.array, array) if name == "get" else (array, this.array)
+        at, other = (this.position, start) if name == "get" else (start, this.position)
+        target[other:other + count] = source[at:at + count]
+        this.position += count
+        return this
+    if name in _BUFFER_SIZES:
+        size, writes = _BUFFER_SIZES[name], name.startswith("put")
+        absolute = len(args) == (3 if writes else 2)
+        if len(args) > (3 if writes else 2) or not all(isinstance(value, int) for value in args[1:]):
+            raise Unsupported(f"ByteBuffer.{name}")
+        at = args[1] if absolute else this.position
+        if at < 0 or at + size > this.limit:
+            raise Unsupported(f"ByteBuffer.{name} past the limit")
+        order = "little" if this.little else "big"
+        if not absolute:
+            this.position += size
+        if writes:
+            this.array[at:at + size] = _signed_bytes((args[-1] & ((1 << 8 * size) - 1)).to_bytes(size, order))
+            return this
+        return int.from_bytes(_bytes(this.array[at:at + size]), order, signed=name != "getChar")
+    if name == "order":
+        if len(args) == 1:
+            return _PLATFORM_STATICS[("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN" if this.little else "BIG_ENDIAN")]
+        if not isinstance(args[1], ByteOrder):
+            raise Unsupported("ByteBuffer.order(null)")
+        this.little = args[1].little
+        return this
+    if name in ("position", "limit") and len(args) == 2:
+        if not 0 <= args[1] <= (this.limit if name == "position" else len(this.array)):
+            raise Unsupported(f"ByteBuffer.{name}({args[1]})")
+        setattr(this, name, args[1])
+        this.position = min(this.position, this.limit)
+        return this
+    simple = {"array": lambda: this.array, "arrayOffset": lambda: 0, "position": lambda: this.position,
+              "limit": lambda: this.limit, "capacity": lambda: len(this.array),
+              "remaining": lambda: this.limit - this.position, "hasRemaining": lambda: this.position < this.limit}
+    if name in simple and len(args) == 1:
+        return simple[name]()
+    if name in ("flip", "rewind", "clear"):
+        if name == "flip":
+            this.limit = this.position
+        elif name == "clear":
+            this.limit = len(this.array)
+        this.position = 0
+        return this
+    raise Unsupported(f"ByteBuffer.{name}")
+
+
+def _literal_split(text: str, regex: str, limit: int) -> list[str]:
+    """String.split for a regex that matches only itself (Java's own fast path, and plain words)."""
+    if len(regex) == 2 and regex[0] == "\\" and not regex[1].isalnum():
+        regex = regex[1]
+    elif not regex or _REGEX_META & set(regex):
+        raise Unsupported(f"String.split by a regex {regex!r}")
+    if regex not in text:
+        return [text]
+    parts = text.split(regex, limit - 1) if limit > 0 else text.split(regex)
+    while limit == 0 and parts and not parts[-1]:
+        parts.pop()
+    return parts
+
+
+def _java_utils(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> Any:
+    this = args[0] if args else None
+    if cls == "Ljava/nio/ByteBuffer;" and name == "allocate" and isinstance(this, int):
+        if this < 0:
+            raise Unsupported("ByteBuffer.allocate of a negative size")
+        return Buffer([0] * this)
+    if isinstance(this, Buffer):
+        return _buffer(this, name, args)
+    if isinstance(this, Adler):
+        if name == "<init>":
+            return None
+        if name == "update":
+            data = bytes([args[1] & 0xFF]) if sig.startswith("(I)") else _bytes(args[1])
+            if sig.startswith("([BII)"):
+                data = _bytes(args[1][args[2]:args[2] + args[3]])
+            this.value = zlib.adler32(data, this.value)
+            return None
+        if name == "getValue":
+            return this.value
+        if name == "reset":
+            this.value = 1
+            return None
+    if cls == "Ljava/lang/String;" and isinstance(this, str):
+        if name in ("toUpperCase", "toLowerCase") and sig.startswith("(Ljava/util/Locale;)"):
+            if not isinstance(args[1], Locale):
+                raise Unsupported(f"String.{name} in a device locale")
+            return this.upper() if name == "toUpperCase" else this.lower()
+        if name == "split" and isinstance(args[1], str):
+            return _literal_split(this, args[1], args[2] if len(args) > 2 else 0)
+        if name == "repeat" and isinstance(args[1], int) and args[1] >= 0:
+            return this * args[1]
+    if cls == "Ljava/util/Arrays;" and isinstance(this, list):
+        if name == "fill":
+            start, end = (args[1], args[2]) if len(args) > 3 else (0, len(this))
+            if not 0 <= start <= end <= len(this):
+                raise Unsupported("Arrays.fill out of range")
+            this[start:end] = [args[-1]] * (end - start)
+            return None
+        if name == "sort" and sig[1:3] in ("[B", "[S", "[C", "[I", "[J") and len(args) in (1, 3):
+            start, end = (args[1], args[2]) if len(args) == 3 else (0, len(this))
+            if not 0 <= start <= end <= len(this):
+                raise Unsupported("Arrays.sort out of range")
+            this[start:end] = sorted(this[start:end])
+            return None
+        if name == "toString" and sig[1:3] in ("[B", "[S", "[C", "[I", "[J"):
+            items = (chr(value) for value in this) if sig[1:3] == "[C" else map(str, this)
+            return "[" + ", ".join(items) + "]"
+    if cls == "Ljava/util/Arrays;" and name == "toString" and this is None:
+        return "null"
     return _UNHANDLED
 
 
