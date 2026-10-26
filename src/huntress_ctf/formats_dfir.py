@@ -94,22 +94,101 @@ def _regf(data: bytes, f: dict) -> None:
                  root_key_last_written_utc=_filetime(written), root_subkey_count=subkeys, root_value_count=values)
 
 
-# --- Prefetch (SCCA; Windows 10+ MAM-compressed files report only their header) ----------------
+# --- Prefetch (SCCA; Windows 10+ files are MAM: Xpress Huffman compressed) ---------------------
 
 PREFETCH_OFFSETS = {17: (0x78, 0x90), 23: (0x80, 0x98), 26: (0x80, 0xD0), 30: (0x80, 0xD0), 31: (0x80, 0xD0)}
+MAX_XPRESS_OUTPUT = 16 * 1024 * 1024
+
+
+def xpress_huffman(data: bytes, size: int) -> bytes:
+    """[MS-XCA] 2.2.4 LZ77+Huffman decompression of `data` to `size` bytes (Windows 10 Prefetch,
+    Day 26). Every 64 KiB of output starts with a table of 512 4-bit code lengths; damaged input
+    raises ValueError (or IndexError past its end), so a parser reports `damaged`."""
+    if not 0 <= size <= MAX_XPRESS_OUTPUT:
+        raise ValueError("Xpress Huffman output size out of range")
+    data += b"\0" * 4  # The last refill may read past the stream; zeros there decode nothing.
+    out = bytearray()
+    at = 0
+    while len(out) < size:
+        if at + 264 > len(data):
+            raise ValueError("Xpress Huffman block past the end of the input")
+        lengths = [(data[at + i // 2] >> (4 * (i & 1))) & 15 for i in range(512)]
+        decode: list[int] = []
+        for bit_length in range(1, 16):
+            for symbol in range(512):
+                if lengths[symbol] == bit_length:
+                    decode.extend([symbol] * (1 << (15 - bit_length)))
+        if len(decode) != 1 << 15:
+            raise ValueError("Xpress Huffman code lengths do not form a complete code")
+        at += 256
+        bits = (data[at] | data[at + 1] << 8) << 16 | data[at + 2] | data[at + 3] << 8
+        at += 4
+        extra = 16
+        block_end = len(out) + 65536
+        while len(out) < block_end and len(out) < size:
+            symbol = decode[bits >> 17]
+            length = lengths[symbol]
+            bits = (bits << length) & 0xFFFFFFFF
+            extra -= length
+            if extra < 0:
+                bits |= (data[at] | data[at + 1] << 8) << -extra
+                extra += 16
+                at += 2
+            if symbol < 256:
+                out.append(symbol)
+                continue
+            symbol -= 256
+            match_length, offset_bits = symbol & 15, symbol >> 4
+            if match_length == 15:
+                match_length = data[at]
+                at += 1
+                if match_length == 255:
+                    match_length = data[at] | data[at + 1] << 8
+                    at += 2
+                    if match_length == 0:
+                        match_length = struct.unpack_from("<I", data, at)[0]
+                        at += 4
+                    if match_length < 15:
+                        raise ValueError("Xpress Huffman match length too short")
+                    match_length -= 15
+                match_length += 15
+            match_length += 3
+            offset = ((bits >> (32 - offset_bits)) if offset_bits else 0) + (1 << offset_bits)
+            bits = (bits << offset_bits) & 0xFFFFFFFF
+            extra -= offset_bits
+            if extra < 0:
+                bits |= (data[at] | data[at + 1] << 8) << -extra
+                extra += 16
+                at += 2
+            start = len(out) - offset
+            if start < 0:
+                raise ValueError("Xpress Huffman match before the start of the output")
+            for i in range(min(match_length, size - len(out))):
+                out.append(out[start + i])
+    return bytes(out)
 
 
 def _prefetch(data: bytes, f: dict) -> None:
     if data[:3] == b"MAM":
-        f.update(compressed=True, compression="xpress_huffman" if data[3] == 4 else f"0x{data[3]:02x}",
-                 uncompressed_size=struct.unpack_from("<I", data, 4)[0])
-        return
-    version, _, size = struct.unpack_from("<I4sI", data, 0)
-    f.update(compressed=False, version=version, file_size=size, executable_name=_utf16(data[0x10:0x4C]),
+        size = struct.unpack_from("<I", data, 4)[0]
+        f.update(compressed=True, compression="xpress_huffman" if data[3] & 0x7F == 4 else f"0x{data[3]:02x}",
+                 uncompressed_size=size)
+        if data[3] & 0x7F != 4:
+            return
+        data = xpress_huffman(data[12 if data[3] & 0x80 else 8:], size)  # 0x80: a CRC32 follows the size.
+        if data[4:8] != b"SCCA":
+            raise ValueError("decompressed prefetch is not SCCA")
+    else:
+        f["compressed"] = False
+    # Offset 8 is a constant (0x11 in version 30); the file size is at 12 (Day 26: 15412 there).
+    version, size = struct.unpack_from("<I", data, 0)[0], struct.unpack_from("<I", data, 12)[0]
+    f.update(version=version, file_size=size, executable_name=_utf16(data[0x10:0x4C]),
              prefetch_hash=struct.unpack_from("<I", data, 0x4C)[0])
     f["prefetch_hash_hex"] = f"{f['prefetch_hash']:08X}"
     if version in PREFETCH_OFFSETS:
         last_run, count = PREFETCH_OFFSETS[version]
+        if version >= 30 and struct.unpack_from("<I", data, 0x54)[0] == 0x128:
+            count = 0xC8  # The shorter version-30 file information (Day 26: 8 run times, 20 runs at 0xC8, 0 at 0xD0).
         runs = 1 if version in (17, 23) else 8
         times = [_filetime(value) for (value,) in struct.iter_unpack("<Q", data[last_run:last_run + 8 * runs])]
         f.update(run_count=struct.unpack_from("<I", data, count)[0], last_run_utc=times[0],

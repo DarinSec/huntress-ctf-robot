@@ -653,6 +653,15 @@ def registry_hive_root_name(data: bytes) -> str | None:
     return None
 
 
+def prefetch_executable_name(data: bytes) -> str | None:
+    """Windows Prefetch (SCCA): the executable name in the header (Day 26). Windows 10+ files
+    are MAM, Xpress Huffman compressed; formats_dfir decompresses them first."""
+    for label, fields in formats_dfir.formats(data):
+        if label == "prefetch" and fields and fields.get("executable_name"):
+            return str(fields["executable_name"])
+    return None
+
+
 def evtx_record_count(data: bytes) -> str | None:
     """EVTX: records over every ElfChnk (last - first record id + 1 per chunk), Day 24. A mapping
     of its own, so the Day 24 kind no longer depends on an autoprop hint kept on one Homebase."""
@@ -686,6 +695,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "sqlite.page_size_bytes": sqlite_page_size_bytes,
     "registry.hive_root_name": registry_hive_root_name,
     "evtx.record_count": evtx_record_count,
+    "prefetch.executable_name": prefetch_executable_name,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
