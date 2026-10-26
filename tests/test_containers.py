@@ -5,6 +5,7 @@ from pathlib import Path
 import struct
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -95,6 +96,29 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual([(m.name, m.data) for m in result.members], [("sample.bin", data)])
         self.assertEqual(len(calls), 2)  # the wrong password fails, the published one works
         self.assertEqual(result.notes, ())
+
+    @unittest.skipUnless(unzip_tool(), "no bsdtar, 7-Zip, or unzip on this machine")
+    def test_sibling_encrypted_zips_unpack_at_once_in_order(self):
+        # A Script Mastery nests ten encrypted evidence ZIPs: their external unzips run together
+        # on worker threads, and the members come out in the same order as one by one.
+        samples = [os.urandom(40 * 1024) for _ in range(4)]
+        outer = zipped([(f"evidence-{i:02}.zip", zipcrypto(f"sample{i}.bin", data, b"infected"))
+                        for i, data in enumerate(samples, 1)] + [("readme.txt", b"hello")])
+        threads = set()
+        real = containers._run_bounded
+
+        def spy(command, limit):
+            threads.add(threading.get_ident())
+            return real(command, limit)
+
+        with patch("huntress_ctf.containers._run_bounded", spy):
+            result = unwrap(outer, ("infected",))
+        self.assertEqual([(m.name, m.data) for m in result.members],
+                         [(f"evidence-{i:02}.zip/sample{i}.bin", data) for i, data in enumerate(samples, 1)]
+                         + [("readme.txt", b"hello")])
+        self.assertEqual(result.notes, ())
+        self.assertTrue(threads)
+        self.assertNotIn(threading.get_ident(), threads)
 
     def test_unverified_tool_output_falls_back_to_the_standard_library(self):
         archive = zipcrypto("note.txt", b"answer: flag{fallback}", b"infected")

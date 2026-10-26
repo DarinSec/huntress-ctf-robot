@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
@@ -111,6 +112,7 @@ DEFAULT_PASSWORDS = ("infected",)
 # Below this much encrypted data the pure-Python path is faster than starting a process.
 FAST_UNZIP_MIN_BYTES = 32 * 1024
 TOOL_TIMEOUT_SECONDS = 30
+PREFETCH_WORKERS = 4  # External unzips of sibling archives at once.
 _ZIP_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _PASSWORD = re.compile(
     r"\bpassword\b[^:\n]{0,40}?(?::|\bis\b)\s*[\"'`]?([^\s\"'`]{1,64})", re.I,
@@ -363,11 +365,19 @@ def _aes_member(blob: bytes, info: zipfile.ZipInfo, passwords: tuple[str, ...]) 
     return None
 
 
+def _wants_tool(infos: list[zipfile.ZipInfo]) -> bool:
+    """Encrypted entries big enough (or AES) for the external tool rather than Python's ZipCrypto."""
+    encrypted = [info for info in infos if info.flag_bits & 0x1 and not info.is_dir()]
+    return bool(encrypted) and (sum(info.compress_size for info in encrypted) >= FAST_UNZIP_MIN_BYTES
+                                or any(info.compress_type == _ZIP_AES for info in encrypted))
+
+
 def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwrapped:
     """Leaf files inside ZIP (incl. ZipCrypto), gzip, and tar containers, nested to MAX_DEPTH."""
     members: list[Member] = []
     notes: list[str] = []
     budget = [MAX_TOTAL_BYTES]
+    prefetched: dict[tuple[str, int, int], Future] = {}
 
     def keep(name: str, blob: bytes, depth: int) -> None:
         if len(members) >= MAX_MEMBERS:
@@ -387,6 +397,39 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
         budget[0] -= size
         return True
 
+    def prefetch(name: str, archive: zipfile.ZipFile, infos: list[zipfile.ZipInfo], fast: dict[int, bytes]) -> None:
+        """Start the external tool on sibling encrypted ZIPs at once (a Script Mastery nests ten,
+        74 ms each one after another); visit takes each result, in order, when it gets there."""
+        if unzip_tool() is None:
+            return
+        children = []
+        for index, info in enumerate(infos):
+            if info.is_dir() or not info.filename.lower().endswith(".zip") or info.file_size > budget[0]:
+                continue
+            if index in fast:
+                child = fast[index]
+            elif info.flag_bits & 0x1:
+                continue  # Decrypting it twice in Python is what the tool is there to avoid.
+            else:
+                try:
+                    child = read_member(archive, info, budget[0], None)
+                except ZIP_ERRORS:
+                    continue
+            try:
+                with zipfile.ZipFile(BytesIO(child)) as nested:
+                    child_infos = nested.infolist()
+            except ZIP_ERRORS:
+                continue
+            if _wants_tool(child_infos):
+                children.append((f"{name}/{info.filename}" if name else info.filename, child, child_infos))
+        if len(children) < 2:
+            return
+        workers = ThreadPoolExecutor(max_workers=min(PREFETCH_WORKERS, len(children)))
+        for inner, child, child_infos in children:
+            prefetched[(inner, len(child), zlib.crc32(child))] = workers.submit(
+                _external_unzip, child, child_infos, passwords, budget[0])
+        workers.shutdown(wait=False)
+
     def visit(name: str, blob: bytes, depth: int) -> None:
         if blob.startswith(_ZIP_MAGIC):
             try:
@@ -396,13 +439,14 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
                 return
             with archive:
                 infos = archive.infolist()
-                encrypted = [info for info in infos if info.flag_bits & 0x1 and not info.is_dir()]
                 fast: dict[int, bytes] = {}
-                if encrypted and (
-                    sum(info.compress_size for info in encrypted) >= FAST_UNZIP_MIN_BYTES
-                    or any(info.compress_type == _ZIP_AES for info in encrypted)
-                ):
-                    fast = _external_unzip(blob, infos, passwords, budget[0])
+                if _wants_tool(infos):
+                    started = prefetched.pop((name, len(blob), zlib.crc32(blob)), None)
+                    expected = sum(info.file_size for info in infos if not info.is_dir())
+                    fast = started.result() if started is not None and expected <= budget[0] \
+                        else _external_unzip(blob, infos, passwords, budget[0])
+                if depth < MAX_DEPTH:
+                    prefetch(name, archive, infos, fast)
                 for index, info in enumerate(infos):
                     if info.is_dir() or len(members) >= MAX_MEMBERS:
                         continue
