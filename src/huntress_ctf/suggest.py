@@ -98,6 +98,8 @@ _ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in 
     (r"(?<=[a-z])_filename", "_name"),
     (r"^filename", "file_name"),
     (r"(md5|sha1|sha256)_(?:hash|digest)", r"\1"),
+    (r"^(?:oldest|earliest)_record(?:_number|_id)?", "first_record_id"),
+    (r"^(?:newest|latest)_record(?:_number|_id)?", "last_record_id"),
 ))
 
 

@@ -17,8 +17,11 @@ import bz2
 import codecs
 import lzma
 import plistlib
+import os
 import random
+import sqlite3
 import struct
+import tempfile
 import unittest
 import zlib
 
@@ -26,8 +29,8 @@ from huntress_ctf.decoders import peel
 from huntress_ctf.formats import describe
 from huntress_ctf.formats_dfir import formats
 from huntress_ctf.suggest import confident, formatted, ranked
-from tests.test_formats_dfir import (CERT_B64, cfb, destlist, dmg, ds_store, ewf, fields, filetime, gpt_disk,
-                                     lnk, minidump, mft_record, ntfs_boot, prefetch, recycle_bin_i,
+from tests.test_formats_dfir import (CERT_B64, cfb, destlist, dmg, ds_store, evtx, ewf, fields, filetime, gpt_disk,
+                                     lnk, minidump, mft_record, ntfs_boot, prefetch, recycle_bin_i, regf,
                                      scheduled_task, usn_record)
 
 
@@ -179,6 +182,40 @@ class ForecastFormatTests(unittest.TestCase):
                 formats(bytes(blob[:rng.randint(1, len(blob))]))  # must not raise
 
 
+def app_database():
+    """A browser-history-shaped database: two tables, an index, a view."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "History")
+        connection = sqlite3.connect(path)
+        connection.executescript("PRAGMA user_version = 42; CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);"
+                                 "CREATE TABLE visits (id INTEGER PRIMARY KEY, url_id INTEGER);"
+                                 "CREATE INDEX visits_url ON visits (url_id); CREATE VIEW recent AS SELECT url FROM urls;")
+        connection.close()
+        with open(path, "rb") as stream:
+            return stream.read()
+
+
+class SqliteSchemaTests(unittest.TestCase):
+    def test_schema_names_in_stored_order(self):
+        f = dict(describe(app_database()))["sqlite"]
+        self.assertEqual((f["table_names"], f["table_count"], f["index_names"], f["view_names"], f["trigger_names"]),
+                         (["urls", "visits"], 2, ["visits_url"], ["recent"], []))
+
+    def test_a_malformed_database_has_no_names(self):
+        data = bytearray(app_database())
+        data[100:200] = b"\xff" * 100  # Page 1's b-tree header destroyed.
+        found = dict(describe(bytes(data)))["sqlite"]
+        self.assertNotIn("table_names", found)
+        self.assertEqual(found["user_version"], 42)  # The header still reads.
+        rng = random.Random(23)
+        seed = app_database()
+        for _ in range(100):
+            blob = bytearray(seed)
+            for _ in range(rng.randint(1, 16)):
+                blob[rng.randrange(len(blob))] = rng.randrange(256)
+            describe(bytes(blob[:rng.randint(100, len(blob))]))  # must not raise
+
+
 # --- Metadata: one new property per day, in the grader's naming style ----------------------------
 
 def fixtures():
@@ -193,7 +230,7 @@ def fixtures():
         "plist": plistlib.dumps({"CFBundleIdentifier": "com.example.app", "CFBundleShortVersionString": "1.2"},
                                 fmt=plistlib.FMT_BINARY),
         "vmdk": vmdk(), "qcow2": qcow2(), "pst": pst(), "kernel_dump": kernel_dump(), "journal": journal(),
-        "wtmp": wtmp(),
+        "wtmp": wtmp(), "evtx": evtx(), "regf": regf(), "sqlite": app_database(),
     }
 
 
@@ -251,6 +288,18 @@ PROPERTIES = (
     ("wtmp", "wtmp.record_count", "record_count"), ("wtmp", "wtmp.login_count", "login_count"),
     ("wtmp", "wtmp.user_names", "user_names"), ("wtmp", "wtmp.last_login_user", "last_login_user"),
     ("wtmp", "utmp.boot_count", "boot_count"), ("wtmp", "wtmp.remote_hosts", "hosts"),
+    # A second property on the last days' formats: the course often asks two days running
+    # (PE days 9-11, media 17-18, APK/JAR 21-22).
+    ("evtx", "evtx.first_record_id", "first_record_id"), ("evtx", "evtx.chunk_count", "chunk_count"),
+    ("evtx", "evtx.oldest_record_number", "first_record_id"), ("evtx", "evtx.newest_record_number", "last_record_id"),
+    ("evtx", "evtx.dirty_present", "dirty"), ("evtx", "evtx.header_checksum_u32_hex", "checksum"),
+    ("regf", "registry.last_written_utc", "last_written_utc"), ("regf", "registry.root_subkey_count", "root_subkey_count"),
+    ("regf", "registry.hive_file_name", "file_name"), ("regf", "registry.primary_sequence_number", "primary_sequence_number"),
+    ("regf", "registry.checksum_valid_present", "checksum_valid"), ("regf", "registry.file_type_name", "file_type_name"),
+    ("sqlite", "sqlite.table_names", "table_names"), ("sqlite", "sqlite.table_count", "table_count"),
+    ("sqlite", "sqlite.schema_table_names", "table_names"), ("sqlite", "sqlite.user_version", "user_version"),
+    ("sqlite", "sqlite.text_encoding", "text_encoding"), ("sqlite", "sqlite.journal_mode", "journal_mode"),
+    ("sqlite", "sqlite.index_names", "index_names"), ("sqlite", "sqlite.view_names", "view_names"),
 )
 
 

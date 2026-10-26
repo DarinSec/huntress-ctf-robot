@@ -431,6 +431,38 @@ def _sqlite(data: bytes, f: dict) -> None:
     f["header_size_valid"] = pages > 0 and f["file_change_counter"] == f["version_valid_for"]
     f["application"] = SQLITE_APPLICATIONS.get(f["application_id"], "none" if not f["application_id"] else "unknown")
     f["application_id_hex"] = f"0x{f['application_id']:08x}"
+    f.update(_sqlite_schema(data))
+
+
+MAX_SCHEMA_BYTES = 64 * 1024 * 1024
+
+
+def _sqlite_schema(data: bytes) -> dict:
+    """The names in sqlite_schema (tables, indexes, views, triggers) in stored order, which tell
+    one application's database from another's. Read by the stdlib sqlite3 from a copy in memory,
+    defensive and query-only; a database SQLite calls malformed has none (no partial names)."""
+    import sqlite3
+
+    if len(data) > MAX_SCHEMA_BYTES:
+        return {}
+    connection = sqlite3.connect(":memory:")
+    try:
+        if hasattr(connection, "setconfig"):  # Python 3.12+
+            connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+        connection.deserialize(data)
+        connection.execute("PRAGMA query_only = ON")
+        rows = connection.execute("SELECT type, name FROM sqlite_master").fetchall()
+    except (sqlite3.Error, AttributeError, ValueError, OverflowError, MemoryError):
+        return {}
+    finally:
+        connection.close()
+    names: dict[str, list[str]] = {}
+    for kind, name in rows:
+        if isinstance(kind, str) and isinstance(name, str) and not name.startswith("sqlite_"):
+            names.setdefault(kind, []).append(name)
+    tables = names.get("table", [])
+    return {"table_names": tables, "table_count": len(tables), "index_names": names.get("index", []),
+            "view_names": names.get("view", []), "trigger_names": names.get("trigger", [])}
 
 
 # PRAGMA application_id values registered in SQLite's magic.txt (the "parent application" a database claims).

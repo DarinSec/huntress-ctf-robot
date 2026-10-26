@@ -325,8 +325,10 @@ Untimed Time Trial and Mastery make the same clear guess (a teammate often takes
 Single Solve by hand, so nothing gets confirmed: Day 23); timed races and later days use
 only confirmed mappings. If the robot still shows the route `unresolved`, take it by hand:
 
-The robot answers every known type at 15:00 (Swedish time). A new type (Metadata gets
-one most days, Warmups now and then) is the team's slowest flag: Metadata Mastery came
+The robot answers every known type at the release, 09:00 New York: 15:00 Swedish time, but
+14:00 from 25 Oct to 1 Nov (Europe leaves summer time a week before the US; `day.sh` counts in
+New York time). A new type (Metadata gets one most days, Warmups now and then) is the team's
+slowest flag: Metadata Mastery came
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
 
 1. `scripts/homebase.sh report`: every route's outcome, under each the kind the service
