@@ -23,6 +23,7 @@ import zipfile
 from typing import Any, Callable
 
 from . import macho
+from .containers import ZIP_ERRORS, read_member
 
 ELF_TYPES = {0: "ET_NONE", 1: "ET_REL", 2: "ET_EXEC", 3: "ET_DYN", 4: "ET_CORE"}
 ELF_MACHINES = {
@@ -61,7 +62,7 @@ def _guarded(parse: Callable[[bytes, dict], None], data: bytes) -> dict:
     fields: dict = {}
     try:
         parse(data, fields)
-    except (struct.error, IndexError, ValueError, UnicodeDecodeError) as exc:
+    except (struct.error, IndexError, ValueError, UnicodeDecodeError, OverflowError, *ZIP_ERRORS) as exc:
         fields["damaged"] = f"{type(exc).__name__} while reading"
     return fields
 
@@ -819,7 +820,7 @@ def axml(data: bytes) -> list[tuple[str, dict[str, str]]]:
 def _apk(data: bytes, f: dict) -> None:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         names = archive.namelist()
-        manifest = archive.read("AndroidManifest.xml")
+        manifest = read_member(archive, "AndroidManifest.xml")
     elements = axml(manifest)
     root = next((attributes for tag, attributes in elements if tag == "manifest"), {})
     sdk = next((attributes for tag, attributes in elements if tag == "uses-sdk"), {})
@@ -844,7 +845,7 @@ def apk(data: bytes) -> dict | None:
         with zipfile.ZipFile(BytesIO(data)) as archive:
             if "AndroidManifest.xml" not in archive.namelist():
                 return None
-    except (zipfile.BadZipFile, ValueError):
+    except ZIP_ERRORS:
         return None
     return _guarded(_apk, data)
 

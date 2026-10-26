@@ -25,6 +25,7 @@ from .containers import Member
 from .display import print_result
 from .hints import record_hint
 from .solvers import SOLVERS
+from .watchdog import run_solvers
 from .state import AttemptState, deliveries
 
 
@@ -114,9 +115,11 @@ def run_learn(
     context, _ = build_context(
         challenge_id, challenge, attempt, artifact, Path("memory"), state.answer_ids, None, extra,
     )
-    selected, conflict = select_candidates(
-        [candidate for solver in SOLVERS for candidate in solver.solve(context)], state.answer_ids, [],
-    )
+    found, outcomes = run_solvers(SOLVERS, context)
+    for outcome in outcomes:
+        if outcome.status != "ok":
+            print(outcome.note())
+    selected, conflict = select_candidates(found, state.answer_ids, [])
     open_ids = set(state.answer_ids) - state.accepted_ids
     kind = kind_of
     if len({kind_of(c.answer_id) for c in selected if c.answer_id in open_ids}) > MAX_KIND_REQUESTS:

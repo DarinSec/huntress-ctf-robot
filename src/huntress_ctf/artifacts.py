@@ -11,6 +11,7 @@ import re
 import zipfile
 
 from .client import GameMasterError
+from .containers import ZIP_ERRORS
 from .macho import kind as macho_kind
 
 
@@ -73,7 +74,7 @@ def artifact_kind(artifact: bytes) -> str:
         try:
             with zipfile.ZipFile(BytesIO(artifact)) as archive:
                 entries = archive.infolist()
-        except (zipfile.BadZipFile, ValueError, UnicodeError):
+        except (*ZIP_ERRORS, UnicodeError):
             return "damaged ZIP archive"
         names = {entry.filename for entry in entries}
         if "AndroidManifest.xml" in names and any(name.endswith(".dex") for name in names):
@@ -105,7 +106,7 @@ def artifact_summary(artifact: bytes) -> list[str]:
                 )
                 if len(entries) > 40:
                     lines.append("  ... listing truncated")
-        except (zipfile.BadZipFile, ValueError, UnicodeError):
+        except (*ZIP_ERRORS, UnicodeError):
             lines.append("Format: damaged ZIP or unsupported ZIP metadata")
         return lines
     try:

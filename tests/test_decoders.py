@@ -192,5 +192,85 @@ class LayeredSolverTests(unittest.TestCase):
         self.assertEqual([a.answer for a in layered], ["brave-otter-lamp-42"])
 
 
+SENTENCE = "Nice work decoding this warmup! To solve, submit this exact answer to the Game Master: deft-blanket-clover-43"
+
+
+def _big(data, alphabet):
+    number, out = int.from_bytes(data, "big"), ""
+    while number:
+        number, digit = divmod(number, len(alphabet))
+        out = alphabet[digit] + out
+    return out
+
+
+def _letters(text, shift):
+    """Apply shift(index, letter 0-25) to each letter, keeping case and everything else."""
+    out, index = [], 0
+    for char in text:
+        if char.isalpha():
+            base = 65 if char.isupper() else 97
+            out.append(chr(shift(index, ord(char.lower()) - 97) % 26 + base))
+            index += 1
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+class AnticipatedWarmupTests(unittest.TestCase):
+    """Formats and ciphers no warmup day has used yet: each peels to the one answer."""
+
+    def answers(self, blob):
+        return {answer for _, _, answer in peel(blob.encode())}
+
+    def test_published_vectors(self):
+        from huntress_ctf import decoders
+        self.assertEqual(decoders.base45(b"%69 VD92EX0"), b"Hello!!")      # RFC 9285
+        self.assertEqual(decoders.base45(b"UJCLQE7W581"), b"base-45")
+        self.assertEqual(decoders.base58(b"2NEpo7TZRRrLZSi2U"), b"Hello World!")
+        self.assertEqual(decoders.base91(b">OwJh>}AQ;r@@Y?F"), b"Hello, World!")
+
+    def test_new_formats(self):
+        from huntress_ctf import decoders
+        data = SENTENCE.encode()
+        blobs = {
+            "base58": _big(data, decoders._BASE58), "base62": _big(data, decoders._BASE62),
+            "base100": "".join(chr(0x1F3F7 + b) for b in data),
+            "brainfuck": "".join("+" * b + ".>" for b in data),
+        }
+        for name, blob in blobs.items():
+            with self.subTest(name):
+                self.assertEqual(self.answers(blob), {"deft-blanket-clover-43"})
+
+    def test_keyed_ciphers_from_the_crib(self):
+        key = [11, 4, 12, 14, 13]  # "lemon"
+        autokey = [16, 20, 4, 4, 13]  # "queen", then the plaintext itself
+        letters = [ord(c.lower()) - 97 for c in SENTENCE if c.isalpha()]
+        ciphers = {
+            "vigenere": _letters(SENTENCE, lambda i, p: p + key[i % 5]),
+            "beaufort": _letters(SENTENCE, lambda i, p: key[i % 5] - p),
+            "autokey": _letters(SENTENCE, lambda i, p: p + (autokey[i] if i < 5 else letters[i - 5])),
+            "affine": _letters(SENTENCE, lambda i, p: 5 * p + 8),
+            "other opening": _letters(PHRASE, lambda i, p: p + key[i % 5]),
+        }
+        for name, blob in ciphers.items():
+            with self.subTest(name):
+                expected = "brave-otter-lamp-42" if name == "other opening" else "deft-blanket-clover-43"
+                self.assertEqual(self.answers(blob), {expected})
+        # A keyed alphabet decodes when the slug uses only letters the crib maps.
+        table = "qwertyuiopasdfghjklzxcvbnm"
+        mild = SENTENCE.replace("deft-blanket-clover-43", "mild-banner-otter-07")
+        self.assertEqual(self.answers(_letters(mild, lambda i, p: ord(table[p]) - 97)), {"mild-banner-otter-07"})
+        self.assertEqual(self.answers(_letters(SENTENCE, lambda i, p: ord(table[p]) - 97)), set())  # "f": unknown
+        self.assertEqual(self.answers("".join(SENTENCE[c::5] for c in range(5))), {"deft-blanket-clover-43"})
+
+    def test_keyed_step_never_drops_a_fragment(self):
+        from huntress_ctf.decoders import decode_fragment
+        # A proven ("vigenere",) chain on a crib-less Mastery fragment: no piece, not "".
+        self.assertIsNone(decode_fragment("Xpsl ", ("vigenere",)))
+
+    def test_plain_text_is_not_an_answer_by_itself(self):
+        self.assertEqual(self.answers(SENTENCE), set())
+
+
 if __name__ == "__main__":
     unittest.main()

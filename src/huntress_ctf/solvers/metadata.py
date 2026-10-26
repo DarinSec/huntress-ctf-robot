@@ -32,6 +32,7 @@ import zipfile
 import zlib
 
 from .. import formats, formats_dfir
+from ..containers import MAX_TOTAL_BYTES, ZIP_ERRORS, read_member
 from ..macho import field as macho_field, slices as macho_slices
 from ..state import deliveries
 from .base import AnswerCandidate, Question, SolveContext, fits_format, question_items
@@ -47,7 +48,7 @@ def _zip_members(blob: bytes) -> list[zipfile.ZipInfo] | None:
     try:
         with zipfile.ZipFile(BytesIO(blob)) as archive:
             return [info for info in archive.infolist() if not info.is_dir()]
-    except (zipfile.BadZipFile, ValueError, EOFError):
+    except ZIP_ERRORS:
         return None
 
 
@@ -59,8 +60,8 @@ def _read_member(blob: bytes, name: str) -> bytes | None:
             exact = [info for info in infos if info.filename == name]
             loose = [info for info in infos if PurePosixPath(info.filename).name == name]
             chosen = exact or loose
-            return archive.read(chosen[0]) if len(chosen) == 1 else None
-    except (zipfile.BadZipFile, ValueError, EOFError, RuntimeError, KeyError):
+            return read_member(archive, chosen[0]) if len(chosen) == 1 else None
+    except (*ZIP_ERRORS, KeyError):
         return None
 
 
@@ -68,10 +69,11 @@ def _fast_member(blob: bytes, info: zipfile.ZipInfo) -> bytes | None:
     """A stored or deflated member straight from its local header, without the CRC pass.
 
     The assigned artifact's SHA-256 already covers every byte, and the CRC pass was a
-    third of the solve on a 3 MB Mastery bundle (19 Oct 2026). Encrypted or unusual
+    third of the solve on a 3 MB Mastery bundle (19 Oct 2026). Encrypted, unusual or damaged
     entries return None and go through zipfile as before.
     """
-    if info.flag_bits & 0x1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+    if (info.flag_bits & 0x1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+            or info.file_size > MAX_TOTAL_BYTES):  # _read_member then refuses it (read_member's limit).
         return None
     start = info.header_offset
     if blob[start:start + 4] != b"PK\x03\x04":
@@ -79,7 +81,10 @@ def _fast_member(blob: bytes, info: zipfile.ZipInfo) -> bytes | None:
     name_length, extra_length = struct.unpack_from("<HH", blob, start + 26)
     begin = start + 30 + name_length + extra_length
     raw = blob[begin:begin + info.compress_size]
-    data = raw if info.compress_type == zipfile.ZIP_STORED else zlib.decompressobj(-15).decompress(raw, info.file_size + 1)
+    try:
+        data = raw if info.compress_type == zipfile.ZIP_STORED else zlib.decompressobj(-15).decompress(raw, info.file_size + 1)
+    except zlib.error:
+        return None
     return data if len(data) == info.file_size else None
 
 
@@ -111,7 +116,7 @@ class Files:
                             by_name.setdefault(info.filename, []).append(info)
                             by_name.setdefault("\0" + PurePosixPath(info.filename).name, []).append(info)
                 self._directories[key] = (blob, by_name)  # Holding blob keeps id() unique.
-            except (zipfile.BadZipFile, ValueError, EOFError):
+            except ZIP_ERRORS:
                 self._directories[key] = None
         entry = self._directories[key]
         return entry[1] if entry else None
@@ -468,6 +473,8 @@ def lnk_target_path_windows(data: bytes) -> str | None:
         start = info + at
         end = start
         while data[end:end + 2] != b"\0\0":
+            if end + 2 > len(data):  # No terminator: damaged, as ansi()'s missing NUL (it looped forever).
+                raise ValueError("unterminated UTF-16 string")
             end += 2
         return data[start:end].decode("utf-16-le", "replace")
 
@@ -491,12 +498,12 @@ def ooxml_external_relationship_targets(data: bytes) -> str | None:
             for name in archive.namelist():
                 if not name.endswith(".rels"):
                     continue
-                root = ElementTree.fromstring(archive.read(name))
+                root = ElementTree.fromstring(read_member(archive, name))
                 targets += [
                     item.get("Target") for item in root.iter(_RELS)
                     if item.get("TargetMode") == "External" and item.get("Target") is not None
                 ]
-    except (zipfile.BadZipFile, ElementTree.ParseError, ValueError, KeyError):
+    except (*ZIP_ERRORS, ElementTree.ParseError, KeyError):
         return None
     # Sorted: the relationship file's own order was rejected (19 Oct 2026).
     return json.dumps(sorted(targets), separators=(",", ":"), ensure_ascii=False)
@@ -619,8 +626,8 @@ def jar_main_class(data: bytes) -> str | None:
             names = [name for name in archive.namelist() if name.upper() == "META-INF/MANIFEST.MF"]
             if not names:
                 return "none"
-            manifest = archive.read(names[0])
-    except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, zlib.error):
+            manifest = read_member(archive, names[0])
+    except ZIP_ERRORS:
         return None
     text = manifest.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
     main = text.replace("\n ", "").split("\n\n", 1)[0]  # A line continues after "\n ".
@@ -643,6 +650,15 @@ def registry_hive_root_name(data: bytes) -> str | None:
     for label, fields in formats_dfir.formats(data):
         if label == "regf" and fields and fields.get("root_key_name"):
             return str(fields["root_key_name"])
+    return None
+
+
+def evtx_record_count(data: bytes) -> str | None:
+    """EVTX: records over every ElfChnk (last - first record id + 1 per chunk), Day 24. A mapping
+    of its own, so the Day 24 kind no longer depends on an autoprop hint kept on one Homebase."""
+    for label, fields in formats_dfir.formats(data):
+        if label == "evtx" and fields and fields.get("record_count") is not None:
+            return str(fields["record_count"])
     return None
 
 
@@ -669,6 +685,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "jar.main_class": jar_main_class,
     "sqlite.page_size_bytes": sqlite_page_size_bytes,
     "registry.hive_root_name": registry_hive_root_name,
+    "evtx.record_count": evtx_record_count,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
@@ -747,8 +764,8 @@ class MetadataSolver:
                 continue
             try:
                 answer, evidence = self._answer(question, files, items)
-            except (struct.error, ValueError, IndexError, UnicodeError, zipfile.BadZipFile):
-                continue
+            except (struct.error, ValueError, IndexError, UnicodeError, OverflowError, zipfile.BadZipFile):
+                continue  # A damaged file answers nothing; the other questions still do.
             if answer is not None and fits_format(answer, question.answer_format):
                 candidates.append(AnswerCandidate(question.answer_id, answer, self.name, evidence,
                                                   alternatives=_orderings(answer, question)))

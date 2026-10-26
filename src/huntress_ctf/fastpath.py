@@ -16,6 +16,8 @@ from datetime import datetime
 import gc
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -33,7 +35,9 @@ from .display import print_result
 from .hints import get_hint, record_hint
 from . import corpus, network
 from .solvers import LOAD_ERRORS, SOLVERS, AnswerCandidate, Solver, SolveContext
+from .solvers.base import question_items
 from .state import AttemptState, current_fields, deliveries, mode_name, remember_identity
+from .watchdog import Outcome, race_deadline, run_solvers
 from .workspace import write_workspace
 
 KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
@@ -68,6 +72,9 @@ class Run:
     pipeline_failure: str | None = None
     marks: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Solvers the watchdog left out, killed or skipped (Outcome.report), for daily's summary.
+    problems: list[dict[str, Any]] = field(default_factory=list)
+    solver_ms: dict[str, float] = field(default_factory=dict)  # Each solver that ran, in the race.
     attempt: Any = None
     started: AttemptState | None = None
     artifact: bytes | None = None
@@ -76,6 +83,8 @@ class Run:
     selected: list[AnswerCandidate] = field(default_factory=list)
     conflict: bool = False
     submitted: dict[str, str] = field(default_factory=dict)
+    # The solvers warm-up found fit to race (None: all of them); a warm-up hang is left out.
+    solvers: tuple[Solver, ...] | None = None
     result: Any = None
     targets: list[Any] = field(default_factory=list)  # Web: live sites, no artifact.
 
@@ -111,19 +120,40 @@ def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tupl
     return "start", None
 
 
-def warm_up(solvers: tuple[Solver, ...]) -> None:
-    """Run every code path once before the clock: imports, regex caches, allocations."""
+def warm_up(solvers: tuple[Solver, ...], left_out: list[Outcome] | None = None) -> tuple[Solver, ...]:
+    """Run every code path once before the clock: imports, regex caches, allocations.
+
+    Returns the solvers fit to race. Each warm-up is tried first in a forked child the
+    watchdog can kill: a solver that hangs even on this tiny dummy is broken, not slow, so it
+    is reported (and added to `left_out`) and left out of this run (a crash on the dummy was
+    always fine: many solvers reject it). The rest then warm up here, in this process, because
+    the race's solver children inherit what this process has warmed. Without fork, a watched
+    thread does both.
+    """
     dummy = SolveContext(
         "warm-up", {}, {"answer_ids": ["warm-up"]}, b"d2FybS11cA==", Path("warm-up"), ("warm-up",),
     )
-    for solver in solvers:
-        try:
-            solver.solve(dummy)
-        except Exception:
-            pass
+    setting = os.environ.get("HUNTRESS_WATCHDOG")
+    if setting == "off":
+        run_solvers(solvers, dummy, mode="off")
+        fit = tuple(solvers)
+    else:
+        hung = []
+        if setting != "thread" and "fork" in multiprocessing.get_all_start_methods():
+            _, probed = run_solvers(solvers, dummy, budget=WARM_UP_BUDGET_S, mode="fork")
+            hung = [(s, o) for s, o in zip(solvers, probed) if o.status == "timeout"]
+        fit = tuple(s for s in solvers if all(s is not h for h, _ in hung))
+        _, warmed = run_solvers(fit, dummy, budget=WARM_UP_BUDGET_S, mode="thread")
+        stuck = [(s, o) for s, o in zip(fit, warmed) if o.status == "timeout"]
+        fit = tuple(s for s in fit if all(s is not h for h, _ in stuck))
+        for _, outcome in hung + stuck:
+            print(f"warm-up: {outcome.note()}; left out of this run")
+            if left_out is not None:
+                left_out.append(outcome)
     prepare_tools()
     hashlib.sha256(b"warm-up").hexdigest()
     json.loads(json.dumps({"warm": "up"}))
+    return fit
 
 
 def solver_timings(
@@ -176,6 +206,8 @@ def solver_timings(
 
 
 DELIVERY_CONNECTIONS = 6
+# A warm-up solve on the tiny dummy input takes milliseconds; this only ends a hang.
+WARM_UP_BUDGET_S = 5.0
 
 
 def _helpers(client: GameMasterClient, count: int) -> list[Any]:
@@ -417,16 +449,32 @@ def _race(
     run.members = context.members
     needed = set(answer_ids) - run.started.accepted_ids
     proven_names = set((hint or {}).get("solvers") or ())
-    proven = tuple(s for s in SOLVERS if getattr(s, "name", None) in proven_names)
-    others = tuple(s for s in SOLVERS if getattr(s, "name", None) not in proven_names)
-    candidates = [candidate for solver in proven for candidate in solver.solve(context)]
+    racing = SOLVERS if run.solvers is None else run.solvers
+    proven = tuple(s for s in racing if getattr(s, "name", None) in proven_names)
+    others = tuple(s for s in racing if getattr(s, "name", None) not in proven_names)
+    # Every solver runs under the watchdog: a hang is killed, a crash is reported, and on the
+    # clock nothing solves past the attempt's deadline minus the submit margin.
+    # The server's deadline is in true time; clock_offset (NTP, measured before the clock) is
+    # how far this machine's clock runs ahead of it.
+    true_now = time.time if run.clock_offset is None else (lambda: time.time() - run.clock_offset)
+    deadline = race_deadline(run.started.deadline, now=true_now) if run.timed else None
+    try:
+        question_items(context)  # Parsed once here; the solver children inherit the cache.
+    except Exception:
+        pass
+    candidates, outcomes = run_solvers(proven, context, deadline=deadline)
     run.selected, run.conflict = select_candidates(candidates, answer_ids, run.notes)
     if proven and not run.conflict and needed <= {c.answer_id for c in run.selected}:
         run.notes.append("The proven solver answered every open question; other solvers were skipped.")
     else:
-        candidates += [candidate for solver in others for candidate in solver.solve(context)]
+        found, more = run_solvers(others, context, deadline=deadline)
+        candidates += found
+        outcomes += more
         run.notes.clear()
         run.selected, run.conflict = select_candidates(candidates, answer_ids, run.notes)
+    run.notes.extend(outcome.note() for outcome in outcomes if outcome.status != "ok")
+    run.problems += [outcome.report("race") for outcome in outcomes if outcome.status != "ok"]
+    run.solver_ms = {o.solver: round(o.seconds * 1000, 1) for o in outcomes if o.status != "skipped"}
     run.submitted = {
         candidate.answer_id: candidate.answer for candidate in run.selected
         if candidate.answer_id in needed
@@ -486,6 +534,8 @@ def _timings(run: Run) -> dict[str, Any]:
         for name, begin, end in spans if begin in marks and end in marks
     }
     timings["pipelined"] = run.pipelined and run.pipeline_failure is None
+    if run.solver_ms:
+        timings["solver_ms"] = dict(run.solver_ms)  # Printed per route; daily ranks the slowest.
     server_clock = _server_clock(run)
     if server_clock:
         timings["server_clock_ms"] = server_clock
@@ -759,7 +809,9 @@ def run_fast(
                 helper.close()
         run.clock_offset = ntp()
     hint = get_hint(challenge_id, hints_path)
-    warm_up(SOLVERS)
+    left_out: list[Outcome] = []
+    run.solvers = warm_up(SOLVERS, left_out)
+    run.problems = [outcome.report("warm-up") for outcome in left_out]
     # No collector pauses on the clock; the race allocates little. Untimed runs leave the
     # collector alone: `daily` runs them in parallel threads, and gc is process-wide.
     collecting = timed and gc.isenabled()
@@ -781,6 +833,8 @@ def run_fast(
         if run.unpacked is not None:
             run.unpack_notes = run.unpacked.notes  # Unpacks now, off the clock, if no solver did.
         responses["attempt"], responses["result"] = run.attempt, run.result
+        if report is not None and run.problems:
+            report["solver_problems"] = list(run.problems)  # Before _report, which may fail.
         _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets,
                 corpus_root=(hints_path.parent / "corpus") if hints_path else None)
         if report is not None:

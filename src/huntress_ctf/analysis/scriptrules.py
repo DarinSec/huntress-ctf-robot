@@ -13,7 +13,6 @@ import base64
 import binascii
 import codecs
 import functools
-import gzip
 import hashlib
 import json
 import os
@@ -23,6 +22,10 @@ import zlib
 
 
 from . import answers, scripts  # noqa: E402
+from .deobfuscate import deobfuscate
+from ..containers import ZIP_ERRORS, decompress
+
+MAX_LAYER_BYTES = 16 * 1024 * 1024  # A zlib/gzip layer inflates to at most this (ROBUSTNESS.md workstream 4).
 
 # Each script gets ~12 questions: decode it once per text, not once per question.
 recover = functools.lru_cache(maxsize=None)(scripts.recover)
@@ -305,15 +308,48 @@ def _undo(layer, data):
     if layer == "a85":
         return base64.a85decode(data, adobe=data.startswith(b"<~"))
     if layer == "zlib":
-        return zlib.decompress(data)
+        return decompress(data, "zlib", MAX_LAYER_BYTES)
     if layer in ("gz", "gzip"):
-        return gzip.decompress(data)
+        return decompress(data, "gzip", MAX_LAYER_BYTES)
     if layer == "url":
         return urllib.parse.unquote_to_bytes(data)
     if layer == "bin":
         bits = data.decode().replace(" ", "")
         return int(bits, 2).to_bytes(len(bits) // 8, "big")
-    raise ValueError(layer)
+    if layer in ("xz", "lzma", "bz2", "bzip2", "deflate", "raw"):
+        try:
+            return decompress(data, {"lzma": "xz", "bzip2": "bz2", "deflate": "raw"}.get(layer, layer), MAX_LAYER_BYTES)
+        except ZIP_ERRORS as exc:  # lzma.LZMAError is no ValueError: the header must fall back, not crash.
+            raise ValueError(layer) from exc
+    m = re.fullmatch(r"xor([0-9a-f]{2})", layer)
+    if m:
+        return bytes(b ^ int(m.group(1), 16) for b in data)
+    if layer in ("rot47", "atbash", "rot18"):
+        return _TEXT_LAYERS[layer](data.decode("latin-1")).encode("latin-1")
+    # Any other name the decoder library knows (base58, base91, base45, uu, qp, morse, ...).
+    from .. import decoders
+    decode = dict(decoders.LAYERS).get(LAYER_NAMES.get(layer, layer))
+    out = decode(data) if decode else None
+    if out is None:
+        raise ValueError(layer)
+    return out
+
+
+LAYER_NAMES = {"b58": "base58", "b62": "base62", "b91": "base91", "b45": "base45", "b36": "base36",
+               "oct": "octal", "dec": "decimal", "uue": "uu", "quoted": "qp", "puny": "punycode",
+               "a1z26": "a1z26", "ent": "html", "uni": "unicode", "esc": "json"}
+
+
+def _rot47(text):
+    return "".join(chr(33 + (ord(c) - 33 + 47) % 94) if "!" <= c <= "~" else c for c in text)
+
+
+def _atbash(text):
+    return "".join(chr(155 - ord(c)) if "A" <= c <= "Z" else chr(219 - ord(c)) if "a" <= c <= "z" else c for c in text)
+
+
+_TEXT_LAYERS = {"rot47": _rot47, "atbash": _atbash,
+                "rot18": lambda t: codecs.decode(t, "rot13").translate(str.maketrans("0123456789", "5678901234"))}
 
 
 def lyr_decode(spec, payload):
@@ -529,7 +565,15 @@ def answer(fam, field, text):
         return sf.get(field)
     fam_key = "bash" if fam.startswith("bash") else fam
     if fam_key not in FAMILIES:
-        return None
+        # A family no day has used yet (php, lua, hta, ...): the descriptor-field rules every
+        # non-graph family shares. Only ids nothing else answered reach this.
+        if field == "campaign-token":
+            c = family_generic("campaign", text, fam_key)
+            return c.split("-", 1)[1] if isinstance(c, str) and "-" in c else None
+        if field == "indicator":
+            rec = record_of(text)
+            return next((rec[k] for k in IND_ORDER if rec.get(k) not in (None, "")), None)
+        return family_generic(field, text, fam_key)
     if fam_key == "python" and field in PY_PAIRS:
         rec = record_of(text)
         parts = [rec.get(k) for k in PY_PAIRS[field]]
@@ -564,6 +608,13 @@ def answer(fam, field, text):
     return base(field, text, fam_key)
 
 
+def _answer(fam, field, text):
+    try:
+        return answer(fam, field, text)
+    except (KeyError, ValueError, TypeError, IndexError, AttributeError):
+        return None
+
+
 def solve(source, qs, only=None):
     """The per-family rules (days 18-22), then the Day 23 id shapes for what they could not answer."""
     out, _ = _solve_families(source, qs, only)
@@ -582,10 +633,11 @@ def solve(source, qs, only=None):
             text = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else None
         if text is None:
             continue
-        try:
-            v = answer(m.group(1).split("-")[0], m.group(3), text)
-        except (KeyError, ValueError, TypeError, IndexError, AttributeError):
-            v = None
+        v = _answer(m.group(1).split("-")[0], m.group(3), text)
+        if v is None:
+            # Unanswered: retry once on the text with common obfuscators undone (deobfuscate.py).
+            plain = deobfuscate(text)
+            v = _answer(m.group(1).split("-")[0], m.group(3), plain) if plain != text else None
         if v is None:
             continue
         cands = v if isinstance(v, tuple) else (v,)

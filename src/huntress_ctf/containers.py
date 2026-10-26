@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
+import lzma
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,72 @@ import zlib
 MAX_MEMBERS = 5000
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_DEPTH = 3
+# What reading a damaged ZIP member raises: a bad header or CRC (BadZipFile), a cut or corrupt
+# stream (zlib.error, EOFError, lzma/bz2's LZMAError/OSError), a flipped method field
+# (NotImplementedError) or encryption flag (RuntimeError). Every reader catches all of them:
+# a damaged member is no data, never a crash (found by fuzz.py; ROBUSTNESS.md workstream 3).
+ZIP_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError, ValueError, NotImplementedError, RuntimeError,
+              OSError, lzma.LZMAError)
+
+
+class TooLarge(ValueError):
+    """A member or stream past its reader's size limit: no data, like damage (it is in ZIP_ERRORS)."""
+
+
+def read_member(archive: zipfile.ZipFile, member: str | zipfile.ZipInfo, limit: int = MAX_TOTAL_BYTES,
+                pwd: bytes | None = None) -> bytes:
+    """`archive.read(member)` that never inflates more than `limit` bytes (ROBUSTNESS.md workstream 4).
+
+    The declared size is checked first, and the read stops at it: zipfile's read() inflates
+    the whole stream before it cuts it to that size, so a header that understates a bomb
+    would cost all of it. The result is what read() returns, CRC-checked the same way.
+    """
+    info = member if isinstance(member, zipfile.ZipInfo) else archive.getinfo(member)
+    if info.file_size > limit:
+        raise TooLarge(f"{info.filename}: {info.file_size} bytes, past the {limit} byte limit")
+    with archive.open(info, pwd=pwd) as stream:
+        return stream.read(info.file_size + 1)
+
+
+def _unpacker(kind: str):
+    if kind in ("zlib", "raw", "gzip"):
+        return zlib.decompressobj({"zlib": zlib.MAX_WBITS, "raw": -zlib.MAX_WBITS, "gzip": 16 + zlib.MAX_WBITS}[kind])
+    import bz2
+
+    return lzma.LZMADecompressor() if kind == "xz" else bz2.BZ2Decompressor()
+
+
+def decompress(data: bytes, kind: str, limit: int = MAX_TOTAL_BYTES, *, head: bool = False) -> bytes:
+    """zlib/gzip/lzma/bz2.decompress (`kind` "zlib", "raw" deflate, "gzip", "xz" or "bz2") that
+    stops past `limit` output bytes: TooLarge, or with `head` the first `limit` bytes.
+
+    Otherwise as those calls: concatenated gzip, xz and bz2 streams are read on (gzip after
+    zero padding; xz and bz2 ignore trailing junk), and a stream cut short or damaged raises
+    one of ZIP_ERRORS (gzip's junk as zlib.error where gzip.decompress says BadGzipFile).
+    """
+    if not data and kind in ("gzip", "bz2"):
+        return b""  # As gzip.decompress and bz2.decompress answer it.
+    parts: list[bytes] = []
+    left = limit + 1
+    while True:
+        unpacker = _unpacker(kind)
+        try:
+            parts.append(unpacker.decompress(data, left))
+        except (lzma.LZMAError, OSError):
+            if parts and kind in ("xz", "bz2"):
+                return b"".join(parts)  # Not another stream: lzma.decompress and bz2.decompress stop here too.
+            raise
+        left -= len(parts[-1])
+        if left <= 0:
+            if head:
+                return b"".join(parts)[:limit]
+            raise TooLarge(f"{kind} data past the {limit} byte limit")
+        if not unpacker.eof:
+            raise {"xz": lzma.LZMAError, "bz2": ValueError, "gzip": EOFError}.get(kind, zlib.error)(
+                "Compressed data ended before the end-of-stream marker was reached")
+        data = unpacker.unused_data.lstrip(b"\0") if kind == "gzip" else unpacker.unused_data
+        if kind in ("zlib", "raw") or not data:
+            return b"".join(parts)
 # Packaged formats are files in their own right, not folders of evidence: one nested JAR's
 # 3,134 classes used up the member limit before Day 23 Binary's d08-d23 samples were reached.
 # Their solvers read them whole (binary, metadata apk/jar/ooxml, evidence docProps, mobile).
@@ -287,8 +354,8 @@ def _aes_member(blob: bytes, info: zipfile.ZipInfo, passwords: tuple[str, ...]) 
         size = len(cipher_text)
         plain = (int.from_bytes(cipher_text, "big") ^ int.from_bytes(stream[:size], "big")).to_bytes(size, "big")
         try:
-            content = zlib.decompress(plain, -15) if method == 8 else plain
-        except zlib.error:
+            content = decompress(plain, "raw", info.file_size) if method == 8 else plain
+        except (zlib.error, TooLarge):
             return None
         if info.CRC and zlib.crc32(content) != info.CRC:  # AE-1 keeps the CRC too.
             return None
@@ -324,7 +391,7 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
         if blob.startswith(_ZIP_MAGIC):
             try:
                 archive = zipfile.ZipFile(BytesIO(blob))
-            except (zipfile.BadZipFile, ValueError):
+            except ZIP_ERRORS:
                 notes.append(f"{name or 'artifact'}: damaged ZIP")
                 return
             with archive:
@@ -340,6 +407,9 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
                     if info.is_dir() or len(members) >= MAX_MEMBERS:
                         continue
                     inner = f"{name}/{info.filename}" if name else info.filename
+                    if info.file_size > budget[0]:  # Declared too large: skipped before inflating any of it.
+                        notes.append(f"Size limit: skipped {inner!r}.")
+                        continue
                     if index in fast:
                         if take(len(fast[index]), inner):
                             keep(inner, fast[index], depth)
@@ -355,11 +425,9 @@ def unwrap(data: bytes, passwords: tuple[str, ...] = DEFAULT_PASSWORDS) -> Unwra
                     content = None
                     for password in ((None,) if not info.flag_bits & 0x1 else passwords):
                         try:
-                            with archive.open(info, pwd=password.encode() if password else None) as stream:
-                                content = stream.read(budget[0] + 1)
+                            content = read_member(archive, info, budget[0], password.encode() if password else None)
                             break
-                        except (RuntimeError, zipfile.BadZipFile, zlib.error, EOFError,
-                                ValueError, NotImplementedError):
+                        except ZIP_ERRORS:
                             continue
                     if content is None:
                         notes.append(f"{inner}: could not be decrypted with the known passwords")
