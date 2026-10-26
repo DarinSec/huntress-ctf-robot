@@ -980,8 +980,61 @@ def _signers(apk: bytes) -> list[Signature]:
     except (*ZIP_ERRORS, KeyError, IndexError, ValueError) as error:
         raise Unsupported(f"signing certificate: {error}") from None
     if not found:
-        raise Unsupported("no v1 signing certificate")  # A v2/v3-only APK: its signing block is not read.
+        found = [Signature(certificate) for certificate in _block_certificates(apk)]
+    if not found:
+        raise Unsupported("no v1, v2 or v3 signing certificate")
     return found
+
+
+SIGNING_BLOCK_IDS = (0xF05368C0, 0x7109871A)  # v3 first, as Android prefers it; then v2.
+
+
+def _block_certificates(apk: bytes) -> list[bytes]:
+    """Each signer's first certificate from the APK Signing Block (v3, else v2), for a v1-less APK.
+
+    The block sits before the central directory: size, (u64 length, u32 id, value) pairs, size,
+    "APK Sig Block 42". A v2/v3 value: signers; each signer: signed data, whose second field holds
+    the certificates; every sequence and element is u32 length-prefixed."""
+    end = apk.rfind(b"PK\x05\x06", max(0, len(apk) - 65557))
+    if end < 0 or end + 22 > len(apk):
+        return []
+    directory = struct.unpack_from("<I", apk, end + 16)[0]
+    if directory < 24 or directory > len(apk) or apk[directory - 16:directory] != b"APK Sig Block 42":
+        return []
+    size = struct.unpack_from("<Q", apk, directory - 24)[0]
+    start = directory - size - 8
+    if start < 0 or struct.unpack_from("<Q", apk, start)[0] != size:
+        return []
+
+    def sequence(blob: bytes, limit: int = 64) -> list[bytes]:
+        items, at = [], 0  # Only the leading elements: v3 signed data has bare u32 SDK fields later.
+        while at + 4 <= len(blob) and len(items) < limit:
+            length = struct.unpack_from("<I", blob, at)[0]
+            if at + 4 + length > len(blob):
+                raise ValueError("signing block element past its sequence")
+            items.append(blob[at + 4:at + 4 + length])
+            at += 4 + length
+        return items
+
+    pairs, at = {}, start + 8
+    while at + 12 <= directory - 24:
+        length, kind = struct.unpack_from("<QI", apk, at)
+        if length < 4 or at + 8 + length > directory - 24:
+            return []
+        pairs.setdefault(kind, apk[at + 12:at + 8 + length])
+        at += 8 + length
+    for kind in SIGNING_BLOCK_IDS:
+        if kind in pairs:
+            try:
+                found = []
+                for signer in sequence(sequence(pairs[kind], 1)[0]):
+                    certificates = sequence(sequence(sequence(signer, 1)[0], 2)[1])
+                    if certificates:
+                        found.append(certificates[0])
+                return found
+            except (IndexError, ValueError, struct.error):
+                return []
+    return []
 
 
 def _manifest(apk: bytes) -> dict[str, str]:
@@ -1955,6 +2008,18 @@ def answer_code(apk_bytes: bytes, package: str | None = None, splits: list[bytes
             libraries = [read_member(apk, name) for name in names if name.startswith("lib/x86_64/") and name.endswith(".so")]
     except (*ZIP_ERRORS, KeyError, struct.error, IndexError, UnicodeDecodeError, Unsupported):
         return None
+    # Splits load into the app's class loader: a feature split's code, a config split's
+    # lib/x86_64 (the base keeps any class both define). A damaged split is left out.
+    for split in splits or ():
+        try:
+            with zipfile.ZipFile(BytesIO(split)) as other:
+                more = other.namelist()
+                found = [Dex(read_member(other, name)) for name in sorted(more) if re.fullmatch(r"classes\d*\.dex", name)]
+                native = [read_member(other, name) for name in more if name.startswith("lib/x86_64/") and name.endswith(".so")]
+        except (*ZIP_ERRORS, KeyError, struct.error, IndexError, UnicodeDecodeError, Unsupported):
+            continue
+        dexes += found
+        libraries += native
     if not dexes:
         return None
     natives: dict[str, bytes] = {}

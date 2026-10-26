@@ -278,8 +278,14 @@ def _package_apks(context: SolveContext, package: str) -> list[bytes]:
     return [blob for blob in unique if (formats.apk(blob) or {}).get("package_name") == package]
 
 
+# An .aab module's directories and where an APK keeps them (bundletool's layout).
+_AAB_PLACES = {"dex": "", "root": "", "manifest": "", "assets": "assets/", "lib": "lib/", "res": "res/"}
+MAX_AAB_ENTRIES = 4096
+
+
 def _bundle_apks(data: bytes) -> list[bytes]:
-    """The split APKs inside an .apks bundle (a ZIP of APKs without its own manifest), bounded."""
+    """The split APKs inside an .apks bundle (a ZIP of APKs without its own manifest), or each
+    module of an Android App Bundle (.aab: base/manifest/AndroidManifest.xml) as an APK, bounded."""
     if not data.startswith(b"PK"):
         return []
     try:
@@ -287,10 +293,27 @@ def _bundle_apks(data: bytes) -> list[bytes]:
             names = bundle.namelist()
             if "AndroidManifest.xml" in names:
                 return []
+            modules = sorted({name.split("/", 1)[0] for name in names
+                              if name.count("/") == 2 and name.endswith("/manifest/AndroidManifest.xml")})
+            if modules and len(names) <= MAX_AAB_ENTRIES:
+                return [_module_apk(bundle, names, module) for module in modules[:16]]
             return [read_member(bundle, name, MAX_MEMBER_BYTES) for name in names
                     if name.endswith(".apk") and not name.endswith("/")][:16]
     except (*ZIP_ERRORS, KeyError):
         return []
+
+
+def _module_apk(bundle: zipfile.ZipFile, names: list[str], module: str) -> bytes:
+    """One .aab module laid out as an APK: base/dex/classes.dex -> classes.dex, base/assets/x ->
+    assets/x, base/manifest/AndroidManifest.xml -> AndroidManifest.xml (still protobuf)."""
+    out = BytesIO()
+    with zipfile.ZipFile(out, "w") as apk:
+        for name in names:
+            head, _, rest = name.partition("/")
+            place, _, path = rest.partition("/")
+            if head == module and place in _AAB_PLACES and path and not name.endswith("/"):
+                apk.writestr(_AAB_PLACES[place] + path, read_member(bundle, name, MAX_MEMBER_BYTES))
+    return out.getvalue()
 
 
 def _with_asset(blob: bytes, suffix: str) -> list[str]:
