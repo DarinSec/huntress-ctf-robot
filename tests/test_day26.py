@@ -1,23 +1,30 @@
-"""Day 26 kinds, with generated data only: a JAR's crash trace and .apks split bundles.
+"""Day 26 kinds, with generated data only: a JAR's crash trace and .apks split bundles, plus the
+Binary Mastery speed-ups (magic-first encoded HCFG scan, parallel AES delivery unpack).
 
 Binary "Crash Course" adds crash/trace.json to its JAR block; Mobile "Split Decision" splits the
 evidence between a base APK and a feature split, either as puzzle parts or as an asset the app's code
 opens through ApplicationInfo.splitSourceDirs. (Metadata's MAM Prefetch: test_formats_dfir.py.)
 """
 
+import base64
 from io import BytesIO
 import json
 import struct
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from huntress_ctf import dexvm
 from huntress_ctf.containers import Member
 from huntress_ctf.solvers.base import SolveContext
+from huntress_ctf.solvers._binary_assignment import AssignedArchive
+from huntress_ctf.solvers._binary_files import BinaryFiles
+from huntress_ctf.solvers._binary_formats import ParseError
 from huntress_ctf.solvers.binary import BinarySolver
 from huntress_ctf.solvers.mobile_puzzle import MobilePuzzleSolver
-from tests.test_binary_assignment import archive_context
+from tests.test_binary import bundle
+from tests.test_binary_assignment import archive_context, config_record
 from tests.test_dexvm import manifest
 
 
@@ -157,6 +164,65 @@ class SplitApkTests(unittest.TestCase):
         alone = dexvm.Machine([], package=PACKAGE, apk=base)  # A plain APK has no splits: null, as on Android.
         info = dexvm._platform("Landroid/content/Context;", "getApplicationInfo", "", [alone.context], alone)
         self.assertIsNone(info.fields["splitSourceDirs"])
+
+
+VALUES = {"campaign": "synthetic-campaign", "domain": "example.invalid", "note": "x" * 60}
+
+
+def assigned():
+    context = archive_context({"unit--a.bin": b"x"}, [("unit_analysis_format", PREFIX + "Identify it.")])
+    return AssignedArchive(context, BinaryFiles(context))
+
+
+def aes_flagged(**files):
+    """A ZIP whose entries claim WinZip AES (method 99); zipfile lists them, only the tool reads them."""
+    raw = bytearray(bundle(**files))
+    for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        at = raw.find(signature)
+        while at >= 0:
+            struct.pack_into("<H", raw, at + offset, 99)
+            at = raw.find(signature, at + 4)
+    return bytes(raw)
+
+
+class BinarySpeedTests(unittest.TestCase):
+    def test_encoded_record_behind_many_look_alike_runs(self):
+        carrier = base64.b64encode(config_record(VALUES))
+        self.assertTrue(carrier.startswith(b"SENG") and len(carrier) >= 100)
+        noise = b"\0".join([b"QUFB" * 30] * 5000)  # 5000 Base64-looking runs: past the old 4096-run bound.
+        node = assigned().encoded_config(noise + b"\0" + carrier + b"\0", "base64", True)
+        self.assertEqual(node.values["campaign"], "synthetic-campaign")
+        hexed = config_record(VALUES).hex().encode()
+        self.assertEqual(assigned().encoded_config(b"zz" + hexed + b"zz", "hex", True).values["domain"], "example.invalid")
+
+    def test_only_whole_runs_that_start_with_the_magic_count(self):
+        carrier = base64.b64encode(config_record(VALUES))
+        self.assertIsNone(assigned().encoded_config(b"\0QQQQ" + carrier + b"\0", "base64", True))  # Mid-run.
+        self.assertIsNone(assigned().encoded_config(b"\0" + carrier[:60] + b"\0", "base64", True))  # Too short.
+        with self.assertRaises(ParseError):  # Two valid carriers are ambiguous, as before.
+            assigned().encoded_config(b"\0" + carrier + b"\0" + carrier + b"\0", "base64", False)
+
+    def test_the_scan_stays_bounded(self):
+        fakes = b"\0".join([b"SENG" + b"A" * 120] * 4097)  # Magic-led runs that are not records.
+        with self.assertRaises(ParseError):
+            assigned().encoded_config(fakes, "base64", True)
+        with self.assertRaises(ParseError):
+            assigned().encoded_config(b"48434647" + b"0" * (1024 * 1024), "hex", True)
+        self.assertIsNone(assigned().encoded_config(fakes[:5000], "base64", True))  # A few fakes: no record.
+
+    def test_warm_unpacks_each_aes_delivery_once(self):
+        first, second = aes_flagged(**{"a.bin": b"alpha"}), aes_flagged(**{"b.bin": b"beta"})
+        files = BinaryFiles(archive_context({"unit--a.bin": b"x"}, [("unit_analysis_format", PREFIX + "Identify it.")]))
+        payload = {id(first): {0: b"alpha"}, id(second): {0: b"beta"}}
+        with patch("huntress_ctf.solvers._binary_files.unzip_tool", return_value=object()), \
+                patch("huntress_ctf.solvers._binary_files._external_unzip",
+                      side_effect=lambda blob, *rest: dict(payload[id(blob)])) as unzip:
+            files.warm([first, second, first])
+            self.assertEqual(unzip.call_count, 2)
+            self.assertEqual((files.read_index(first, 0), files.read_index(second, 0)), (b"alpha", b"beta"))
+            self.assertEqual(unzip.call_count, 2)  # read_index used the warmed results.
+            files.warm([aes_flagged(**{"c.bin": b"c"})])  # One delivery: nothing to overlap, left lazy.
+            self.assertEqual(unzip.call_count, 2)
 
 
 if __name__ == "__main__":

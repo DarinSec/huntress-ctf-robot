@@ -138,6 +138,15 @@ def _bytecode_kind(data: bytes) -> str | None:
     return None
 
 
+# codec -> (whole-run pattern, encoded HCFG magic, run alphabet) for encoded_config.
+_ENCODED_RUNS = {
+    "hex": (re.compile(rb"[0-9a-fA-F]{24,}"), b"48434647", frozenset(b"0123456789abcdefABCDEF")),
+    "base64url": (re.compile(rb"[A-Za-z0-9_-]{24,}={0,2}"), b"SENG",
+                  frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")),
+    "base64": (re.compile(rb"[A-Za-z0-9+/]{100,}={0,2}"), b"SENG",
+               frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")),
+}
+
 class AssignedArchive:
     def __init__(self, context: SolveContext, files: Files):
         self.context = context
@@ -184,23 +193,24 @@ class AssignedArchive:
         return self.records[key][1]
 
     def encoded_config(self, data: bytes, codec: str, first: bool) -> Config | None:
-        patterns = {"hex": rb"[0-9a-fA-F]{24,}", "base64url": rb"[A-Za-z0-9_-]{24,}={0,2}",
-                    "base64": rb"[A-Za-z0-9+/]{100,}={0,2}"}
+        pattern, magic, alphabet = _ENCODED_RUNS[codec]
         found = []
-        for index, match in enumerate(re.finditer(patterns[codec], data)):
-            if index >= 4096 or len(match.group()) > 1024 * 1024:
+        candidates = 0
+        # A record is only ever read from byte 0 of the carrier (`record(raw, 0)`) and begins
+        # with b"HCFG", so a carrier is a whole run of the codec's alphabet that starts with that
+        # magic encoded: "48434647" in hex, "SENG" in both Base64 alphabets (base64(b"HCF")).
+        # Finding the magic first skips the look-alike runs a binary is full of: walking every
+        # run of the 64 MiB ELF in days 25/26 Mastery cost 1.9-5 s, and day 25 hit the old
+        # 4096-run bound before its record. The bound now counts carriers that start with the magic.
+        at = data.find(magic)
+        while at >= 0:
+            match = pattern.match(data, at) if at == 0 or data[at - 1] not in alphabet else None
+            at = data.find(magic, at + 1)
+            if match is None:
+                continue  # Mid-run, or a run too short to be a carrier.
+            candidates += 1
+            if candidates > 4096 or len(match.group()) > 1024 * 1024:
                 raise ParseError("Encoded HCFG scan exceeds bound")
-            # A record is only ever read from byte 0 of the carrier (`record(raw, 0)`) and
-            # begins with b"HCFG", so a candidate must start with that magic encoded:
-            # "48434647" in hex, or "SENG" in both Base64 alphabets (base64(b"HCF")).
-            # A megabyte of binary is full of runs that look like hex or Base64; rejecting
-            # them on four bytes skips decoding each one. Day 23's Binary Single Solve
-            # spent 369 ms in four of these scans, a quarter of the whole solve.
-            if codec == "hex":
-                if match.group()[:8].lower() != b"48434647":
-                    continue
-            elif match.group()[:4] != b"SENG":  # Base64 is case-sensitive.
-                continue
             try:
                 encoded = match.group()
                 if codec == "hex":

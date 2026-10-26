@@ -547,6 +547,8 @@ class BinarySolver:
             return []
         files, resolved, analyses, result = BinaryFiles(context), {}, {}, []
         assigned = AssignedArchive(context, files)
+        if len(files.deliveries) > 1:
+            files.warm(list(files.deliveries.values()))  # A Mastery's AES deliveries, unpacked in parallel.
         for question in question_items(context):
             try:
                 family = assigned.family(question)
