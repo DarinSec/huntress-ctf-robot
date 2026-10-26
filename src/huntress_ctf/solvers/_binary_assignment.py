@@ -147,6 +147,63 @@ _ENCODED_RUNS = {
                frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")),
 }
 
+_JSON_MEMBER = re.compile(r"\bParse ([\w./-]+\.json)\b", re.I)
+_KEY = r"([A-Za-z_][\w.]*)"
+_JSON_ASKS = (  # (pattern on the text after "Parse <member>.json", what to take)
+    (re.compile(rf"\b(first|last|final) (?:\w+ )?(?:string|value|element|entry|item|integer|number) in its {_KEY} (?:array|list)\b", re.I), "end"),
+    (re.compile(rf"\b(?:number|count) of (?:\w+ )?(?:strings|values|elements|entries|items|integers|objects|frames) in its {_KEY} (?:array|list)\b", re.I), "count"),
+    (re.compile(rf"\bhow many (?:\w+ )?(?:strings|values|elements|entries|items|integers|objects|frames)? ?(?:are )?in its {_KEY} (?:array|list)\b", re.I), "count"),
+    (re.compile(rf"\bits {_KEY} (?:array|list) as (?:a |one )?(?:compact )?JSON\b", re.I), "json"),
+    (re.compile(rf"\b(?:value|string|text|integer|number) (?:of|in) its {_KEY} (?:field|property|key|member)\b", re.I), "scalar"),
+    (re.compile(rf"\bits {_KEY} (?:field|property|key|member)(?: value)?\b", re.I), "scalar"),
+)
+
+
+def json_member_answer(text: str, read) -> tuple[bool, str | None]:
+    """'Parse <member>.json and submit ...' for a JSON member no rule names (Day 26: crash/trace.json).
+
+    Takes the first or last element of a named array, its length, the array as compact JSON,
+    or a named scalar field (dotted paths and list indexes allowed). Unrecognized wording is
+    not handled; a member that is missing or not JSON, or a value of the wrong shape, answers
+    nothing rather than a guess.
+    """
+    named = _JSON_MEMBER.search(text)
+    if named is None:
+        return False, None
+    rest = text[named.end():]
+    for pattern, take in _JSON_ASKS:
+        asked = pattern.search(rest)
+        if asked:
+            break
+    else:
+        return False, None
+    try:
+        value = json.loads(read(named.group(1)))
+    except (ValueError, UnicodeDecodeError, KeyError, zipfile.BadZipFile):
+        return True, None
+    end, key = (asked.group(1).casefold(), asked.group(2)) if take == "end" else (None, asked.group(1))
+    for part in key.split("."):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            return True, None
+    if take == "count":
+        return True, str(len(value)) if isinstance(value, list) else None
+    if take == "json":
+        return True, json.dumps(value, separators=(",", ":")) if isinstance(value, list) else None
+    if take == "end":
+        if not (isinstance(value, list) and value):
+            return True, None
+        value = value[0] if end == "first" else value[-1]
+    if isinstance(value, bool):
+        return True, str(value).lower()
+    if isinstance(value, (str, int)):
+        return True, str(value)
+    return True, None
+
+
 class AssignedArchive:
     def __init__(self, context: SolveContext, files: Files):
         self.context = context
@@ -753,7 +810,9 @@ class AssignedArchive:
                     return True, frames[0]
                 if "every string in crash/trace.json frames is present in the primary classfile method-name set" in q:
                     return True, str(set(frames) <= set(jar.main.methods)).lower()
-                return True, None
+            handled, value = json_member_answer(q, jar.read)
+            if handled or "crash/trace.json" in q:
+                return True, value
             if "method names in classfile method-table order" in q:
                 return True, json.dumps(jar.main.methods, separators=(",", ":"))
             if "classfile access_flags" in q:

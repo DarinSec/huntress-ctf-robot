@@ -79,6 +79,30 @@ class CrashTraceTests(unittest.TestCase):
         for trace in ("{not json", json.dumps({"frames": []}), json.dumps({"frames": ["a", 3]}), json.dumps([1])):
             self.assertEqual(crash_answers(crash_jar([], trace=trace)), {}, trace)
 
+    def test_any_named_json_member_of_the_jar(self):
+        # A later day may ship another JSON member: the same "Parse <member>.json and submit ..." wording.
+        info = {"stages": ["load", "verify", "run"], "meta": {"owner": "unit", "retries": 3, "debug": False}}
+        out = BytesIO(crash_jar(["stageThree"]))
+        with zipfile.ZipFile(out, "a") as archive:
+            archive.writestr("build/info.json", json.dumps(info))
+        asks = {
+            "last": ("the exact last string in its stages array.", "run"),
+            "count": ("the number of strings in its stages array.", "3"),
+            "owner": ("the exact value of its meta.owner field.", "unit"),
+            "array": ("its stages array as compact JSON.", '["load","verify","run"]'),
+            "debug": ("lowercase true or false for its meta.debug field.", "false"),
+            "retries": ("the integer value of its meta.retries field.", "3"),
+        }
+        questions = [(f"unit_analysis_{key}", f"{PREFIX}Parse build/info.json and submit {text}")
+                     for key, (text, _) in asks.items()]
+        questions += [("unit_analysis_kind", PREFIX + "Parse crash/trace.json and submit the exact value of its kind field."),
+                      ("unit_analysis_missing", PREFIX + "Parse build/none.json and submit the exact value of its kind field."),
+                      ("unit_analysis_unknown", PREFIX + "Parse build/info.json and submit its SHA-256.")]
+        answers = {c.answer_id: c.answer
+                   for c in BinarySolver().solve(archive_context({"unit--sample.jar": out.getvalue()}, questions))}
+        self.assertEqual(answers, {**{f"unit_analysis_{key}": value for key, (_, value) in asks.items()},
+                                   "unit_analysis_kind": "IllegalStateException"})
+
 
 PACKAGE = "com.huntress.mobile.d26.vsynthetic"
 CODE = "ANS-0123456789ABCDEF"
