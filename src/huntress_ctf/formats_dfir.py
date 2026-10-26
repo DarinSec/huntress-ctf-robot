@@ -963,6 +963,194 @@ def _x509(data: bytes, f: dict) -> None:
     f.update(certificate(data))
 
 
+# --- Forecast for days 26-31: disk images, mail stores, kernel dumps, Linux journal and logins ----
+# Day 23-25 asked about SQLite, EVTX and registry hives; these are the DFIR staples after them
+# that no reader above covers (tests/test_forecast.py). Header fields only, from the specs.
+
+_CAMEL_KEY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+VMDK_COMPRESSION = {0: "none", 1: "deflate"}
+
+
+def _vmdk_descriptor(text: str, f: dict) -> None:
+    """`key = "value"` lines (createType -> create_type, ddb.adapterType -> adapter_type) and
+    extent lines such as `RW 4192256 SPARSE "disk-s001.vmdk"`."""
+    extents = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        extent = re.fullmatch(r'(RW|RDONLY|NOACCESS)\s+(\d+)\s+(\w+)(?:\s+"([^"]*)")?.*', line)
+        if extent:
+            extents.append({"access": extent[1], "sectors": int(extent[2]), "type": extent[3], "file": extent[4]})
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            name = _CAMEL_KEY.sub("_", key.strip().removeprefix("ddb.").replace(".", "_")).lower()
+            f["descriptor_version" if name == "version" else name] = value.strip().strip('"')
+    if extents:
+        f.update(extents=extents, extent_files=[e["file"] for e in extents if e["file"]],
+                 extent_types=[e["type"] for e in extents],
+                 descriptor_capacity_sectors=sum(e["sectors"] for e in extents))
+
+
+def _vmdk(data: bytes, f: dict) -> None:
+    """A hosted sparse extent (magic "KDMV") and its embedded descriptor, or a descriptor file."""
+    text = data[:1 << 20]
+    if data[:4] == b"KDMV":
+        (version, flags, capacity, grain, descriptor_at, descriptor_size, entries, redundant, directory,
+         overhead) = struct.unpack_from("<IIQQQQIQQQ", data, 4)
+        compression, = struct.unpack_from("<H", data, 77)
+        f.update(version=version, flags=flags, capacity_sectors=capacity, capacity=capacity * 512,
+                 grain_size_sectors=grain, grain_size=grain * 512, descriptor_offset=descriptor_at,
+                 descriptor_size=descriptor_size, grain_table_entries=entries,
+                 redundant_grain_directory_offset=redundant, grain_directory_offset=directory,
+                 overhead_sectors=overhead, unclean_shutdown=bool(data[72]), compress_algorithm=compression,
+                 compression=VMDK_COMPRESSION.get(compression, "unknown"))
+        text = data[descriptor_at * 512:(descriptor_at + descriptor_size) * 512] if descriptor_at else b""
+    _vmdk_descriptor(text.split(b"\0", 1)[0].decode("utf-8", "replace"), f)
+
+
+QCOW_ENCRYPTION = {0: "none", 1: "aes", 2: "luks"}
+
+
+def _qcow2(data: bytes, f: dict) -> None:
+    """QEMU copy-on-write header (big-endian), version 2 or 3."""
+    (version, backing_at, backing_size, cluster_bits, size, crypt, l1_size, l1_at, refcount_at, refcount_clusters,
+     snapshots, snapshots_at) = struct.unpack_from(">IQIIQIIQQIIQ", data, 4)
+    f.update(version=version, virtual_size=size, cluster_bits=cluster_bits,
+             cluster_size=1 << cluster_bits if cluster_bits < 64 else None, crypt_method=crypt,
+             encryption=QCOW_ENCRYPTION.get(crypt, "unknown"), l1_size=l1_size, l1_table_offset=l1_at,
+             refcount_table_offset=refcount_at, refcount_table_clusters=refcount_clusters,
+             snapshot_count=snapshots, snapshots_offset=snapshots_at,
+             backing_file=data[backing_at:backing_at + backing_size].decode("utf-8", "replace")
+             if backing_at and 0 < backing_size <= 1023 else None)
+    if version >= 3 and len(data) >= 104:
+        incompatible, compatible, autoclear, refcount_order, header_length = struct.unpack_from(">QQQII", data, 72)
+        f.update(incompatible_features=incompatible, compatible_features=compatible, autoclear_features=autoclear,
+                 dirty=bool(incompatible & 1), corrupt=bool(incompatible & 2), refcount_order=refcount_order,
+                 header_length=header_length)
+        if header_length > 104 and len(data) > 104:
+            f["compression_type"] = {0: "zlib", 1: "zstd"}.get(data[104], "unknown")
+
+
+PST_CLIENTS = {b"SM": "pst", b"SO": "ost", b"AB": "pab"}
+PST_CRYPT = {0: "none", 1: "permute", 2: "cyclic", 0x10: "edp"}
+
+
+def _pst(data: bytes, f: dict) -> None:
+    """Outlook PST/OST header (MS-PST 2.2.2.6): ANSI (wVer 14/15) or Unicode (23, 36 with 4K pages)."""
+    version, client_version, created_on, accessed_on = struct.unpack_from("<HHBB", data, 10)
+    unicode = version >= 23
+    crypt = data[513 if unicode else 461]
+    f.update(file_type=PST_CLIENTS.get(data[8:10], "unknown"), format_version=version,
+             format="ansi" if not unicode else "unicode_4k" if version == 36 else "unicode",
+             client_version=client_version, platform_create=created_on, platform_access=accessed_on,
+             crypt_method=crypt, crypt_method_name=PST_CRYPT.get(crypt, "unknown"),
+             file_eof=struct.unpack_from("<Q", data, 184)[0] if unicode else struct.unpack_from("<I", data, 168)[0])
+
+
+DUMP_MACHINES = {0x14C: "i386", 0x1C4: "arm", 0x8664: "amd64", 0xAA64: "arm64"}
+
+
+def _kernel_dump(data: bytes, f: dict) -> None:
+    """A Windows kernel crash dump (MEMORY.DMP): DUMP_HEADER64 "PAGEDU64" or DUMP_HEADER32 "PAGEDUMP"."""
+    wide = data[4:8] == b"DU64"
+    major, minor = struct.unpack_from("<II", data, 8)
+    if wide:
+        table, pfn, modules, processes, machine, processors, code = struct.unpack_from("<QQQQIII", data, 16)
+        parameters = [f"0x{value:016x}" for value in struct.unpack_from("<4Q", data, 0x40)]
+    else:
+        table, pfn, modules, processes, machine, processors, code = struct.unpack_from("<7I", data, 16)
+        parameters = [f"0x{value:08x}" for value in struct.unpack_from("<4I", data, 0x2C)]
+    f.update(bitness=64 if wide else 32, major_version=major, minor_version=minor, build_number=minor,
+             checked_build=major == 0xC, directory_table_base=table, pfn_database=pfn,
+             ps_loaded_module_list=modules, ps_active_process_head=processes, machine_type=machine,
+             machine_name=DUMP_MACHINES.get(machine, "unknown"), number_processors=processors,
+             processor_count=processors, bugcheck_code=code, bugcheck_parameters=parameters)
+    if wide and len(data) >= 0xFB0:
+        dump_type, = struct.unpack_from("<I", data, 0xF98)
+        system_time, = struct.unpack_from("<Q", data, 0xFA8)
+        f.update(dump_type=dump_type, system_time_utc=_filetime(system_time))
+
+
+JOURNAL_STATES = {0: "offline", 1: "online", 2: "archived"}
+JOURNAL_INCOMPATIBLE = {1: "compressed_xz", 2: "compressed_lz4", 4: "keyed_hash", 8: "compressed_zstd", 16: "compact"}
+
+
+def _journal_time(microseconds: int) -> str | None:
+    return _unix(microseconds // 1_000_000)
+
+
+def _journald(data: bytes, f: dict) -> None:
+    """A systemd journal file header (journal-def.h); 128-bit ids as 32 hex digits, like journalctl."""
+    compatible, incompatible, state = struct.unpack_from("<IIB", data, 8)
+    (header_size, arena_size, _, _, _, _, _, objects, entries, tail_seqnum, head_seqnum, _,
+     head_realtime, tail_realtime, tail_monotonic) = struct.unpack_from("<15Q", data, 88)
+    f.update(compatible_flags=compatible, incompatible_flags=incompatible, sealed=bool(compatible & 1),
+             features=[name for bit, name in JOURNAL_INCOMPATIBLE.items() if incompatible & bit],
+             state=state, state_name=JOURNAL_STATES.get(state, "unknown"), file_id=data[24:40].hex(),
+             machine_id=data[40:56].hex(), boot_id=data[56:72].hex(), seqnum_id=data[72:88].hex(),
+             header_size=header_size, arena_size=arena_size, object_count=objects, entry_count=entries,
+             head_entry_seqnum=head_seqnum, tail_entry_seqnum=tail_seqnum,
+             head_entry_realtime_utc=_journal_time(head_realtime), tail_entry_realtime_utc=_journal_time(tail_realtime),
+             tail_entry_monotonic=tail_monotonic)
+    if header_size >= 224 and len(data) >= 224:
+        f["data_object_count"], f["field_object_count"] = struct.unpack_from("<QQ", data, 208)
+
+
+UTMP_TYPES = {0: "EMPTY", 1: "RUN_LVL", 2: "BOOT_TIME", 3: "NEW_TIME", 4: "OLD_TIME", 5: "INIT_PROCESS",
+              6: "LOGIN_PROCESS", 7: "USER_PROCESS", 8: "DEAD_PROCESS", 9: "ACCOUNTING"}
+UTMP_SIZE = 384  # glibc struct utmp on x86-64 (and wtmp, btmp): no magic, so every record is checked.
+MAX_UTMP_RECORDS = 100_000
+
+
+def _utmp_text(field: bytes) -> str:
+    text, _, rest = field.partition(b"\0")
+    if rest.strip(b"\0") or not all(32 <= c < 127 for c in text):
+        raise ValueError("not a utmp string")
+    return text.decode("ascii")
+
+
+def _utmp_record(data: bytes, at: int) -> tuple[int, int, str, str, str, int, bytes]:
+    kind, pad, pid = struct.unpack_from("<hHi", data, at)
+    if not 0 <= kind <= 9 or pad or pid < 0:
+        raise ValueError("not a utmp record")
+    line, user, host = (_utmp_text(data[at + start:at + end]) for start, end in ((8, 40), (44, 76), (76, 332)))
+    seconds, = struct.unpack_from("<i", data, at + 340)
+    return kind, pid, line, user, host, seconds, data[at + 348:at + 364]
+
+
+def _utmp_ok(data: bytes) -> bool:
+    if len(data) < UTMP_SIZE or len(data) % UTMP_SIZE:
+        return False
+    try:
+        return _utmp_record(data, 0)[0] > 0  # A zero-filled file is not a login record.
+    except (ValueError, struct.error):
+        return False
+
+
+def _address(raw: bytes) -> str | None:
+    import ipaddress
+
+    if not raw.strip(b"\0"):
+        return None
+    return str(ipaddress.ip_address(raw[:4] if not raw[4:].strip(b"\0") else raw))
+
+
+def _utmp(data: bytes, f: dict) -> None:
+    records = [_utmp_record(data, at) for at in range(0, min(len(data), MAX_UTMP_RECORDS * UTMP_SIZE), UTMP_SIZE)]
+    logins = [record for record in records if record[0] == 7]
+    times = [record[5] for record in records if record[5] > 0]
+    unique = lambda values: list(dict.fromkeys(value for value in values if value))
+    f.update(record_count=len(records), record_types=unique(UTMP_TYPES[record[0]] for record in records),
+             login_count=len(logins), boot_count=sum(record[0] == 2 for record in records),
+             user_names=unique(record[3] for record in logins), hosts=unique(record[4] for record in logins),
+             terminals=unique(record[2] for record in logins),
+             ip_addresses=unique(_address(record[6]) for record in logins),
+             first_time_utc=_unix(min(times)) if times else None, last_time_utc=_unix(max(times)) if times else None,
+             last_login_user=logins[-1][3] if logins else None, last_login_host=logins[-1][4] if logins else None)
+
+
 def formats(data: bytes) -> list[tuple[str, dict]]:
     checks = (
         ("evtx", data.startswith(b"ElfFile\0") and len(data) >= 0x80, _evtx),
@@ -1006,6 +1194,14 @@ def formats(data: bytes) -> list[tuple[str, dict]]:
         ("ds_store", data.startswith(b"\0\0\0\x01Bud1"), _ds_store),
         ("x509", (data[:1] == b"\x30" and data[1:2] in (b"\x82", b"\x81") and data[4:5] == b"\x30")
          or data[:4096].lstrip()[:27] == b"-----BEGIN CERTIFICATE-----", _x509),
+        # Forecast for days 26-31.
+        ("vmdk", (data[:4] == b"KDMV" and len(data) >= 512)
+         or data[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"# Disk DescriptorFile"), _vmdk),
+        ("qcow2", data[:4] == b"QFI\xfb" and len(data) >= 72, _qcow2),
+        ("pst", data[:4] == b"!BDN" and len(data) >= 514, _pst),
+        ("kernel_dump", data[:8] in (b"PAGEDU64", b"PAGEDUMP") and len(data) >= 0x100, _kernel_dump),
+        ("journald", data[:8] == b"LPKSHHRH" and len(data) >= 208, _journald),
+        ("utmp", _utmp_ok(data), _utmp),
     )
     found = [(label, _guarded(parse, data)) for label, match, parse in checks if match]
     if data.startswith(b"\x04\x22\x4d\x18") and len(data) >= 7:

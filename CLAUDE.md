@@ -311,6 +311,11 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   script layer once parsed 64 MiB of a bomb's zeros into a "record". `scripts/fuzz.py --bomb 1024`
   and `tests/test_resources.py` send bombs past every cap (256 MiB unpacker, 16 MiB layers).
 
+`tests/test_forecast.py` is the forecast for days 26-31 (PLAN.md, "Läget 26 okt"): likely
+property names per format in the grader's style, each checked to get the right field on the
+first untimed answer, and the likely next Warmups encodings. A new day's property missing
+from it: add the row first, then the alias (`suggest._ALIASES`) or the reader.
+
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds
 clearly (named like the property, e.g. `macho.uuid` -> `uuid`; a unit suffix such as

@@ -17,6 +17,8 @@ import re
 from urllib.parse import unquote_to_bytes
 import zlib
 
+from .containers import ZIP_ERRORS, decompress
+
 MAX_LAYER_DEPTH = 5
 MAX_NODES = 64
 
@@ -49,10 +51,14 @@ _LAYOUT = str.maketrans("", "", "\t\r\n")
 def raw_text(data: bytes) -> str | None:
     """Printable text with its own edge spaces kept (message fragments need them).
 
-    UTF-8, or UTF-16 when the bytes start with a byte-order mark (Warmups Day 19).
+    UTF-8, or UTF-16 (Warmups Day 19-20) or UTF-32 when the bytes start with a byte-order mark.
     """
+    if data[:4] in (b"\xff\xfe\0\0", b"\0\0\xfe\xff"):
+        encoding = "utf-32"
+    else:
+        encoding = "utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
     try:
-        text = data.decode("utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8")
+        text = data.decode(encoding)
     except UnicodeDecodeError:
         return None
     if not text or not text.translate(_LAYOUT).isprintable():
@@ -563,6 +569,145 @@ def base100(data: bytes) -> bytes | None:
     return _texty(bytes(ord(c) - 0x1F3F7 for c in compact))
 
 
+# Forecast for days 26-31 (tests/test_forecast.py): the next steps of series the course is in.
+# Compression (Day 21 gzip, Day 22 zlib), number bases (64, 32, 85), character encodings
+# (Day 19-20 UTF-16, Day 25 code points) and Day 24's "the comma knows where to stop".
+_BASE36_TEXT = re.compile(r"(?=\D*\d)(?:(?=[^a-z]*[a-z])[0-9a-z]{8,4096}|(?=[^A-Z]*[A-Z])[0-9A-Z]{8,4096})")
+_BIGINT_TEXT = re.compile(r"[1-9]\d{19,4095}")  # int() refuses past 4300 digits.
+_BASE32HEX_TEXT = re.compile(r"(?=[^A-V]*[A-V])[0-9A-V]{8,}={0,6}")
+_UTF7_RUN = re.compile(r"\+[A-Za-z0-9+/]+-?")
+_DUMP_OFFSET = re.compile(r"([0-9a-fA-F]{6,16}):?(?:\s+|$)")
+_DUMP_GROUP = re.compile(r"(?:[0-9a-fA-F]{2}){1,4}")
+_MIME_WORD = re.compile(r"=\?([\w.:-]+)\?([BbQq])\?([^?\s]*)\?=")
+_NETSTRING_LENGTH = re.compile(rb"(0|[1-9]\d{0,5}):")
+
+
+def unpacked(data: bytes) -> bytes | None:
+    """bzip2, xz or LZMA-alone by their headers, or a raw deflate stream (no header, so only
+    from binary input and only to text): the compressors after gzip and zlib."""
+    if data[:3] == b"BZh" and data[4:10] == b"1AY&SY":
+        kind = "bz2"
+    elif data[:6] == b"\xfd7zXZ\0" or (data[:1] == b"\x5d" and int.from_bytes(data[1:5], "little").bit_count() == 1):
+        kind = "xz"  # The xz decompressor reads LZMA-alone too.
+    elif raw_text(data) is None:
+        kind = "raw"
+    else:
+        return None
+    try:
+        out = decompress(data, kind, MAX_INFLATED)
+    except ZIP_ERRORS:
+        return None
+    return _texty(out) if kind == "raw" else out or None
+
+
+def base36(data: bytes) -> bytes | None:
+    """Base36 (0-9 and one case of a-z) as a big number; needs digits and letters, unlike a word."""
+    text = as_text(data)
+    if text is None or not _BASE36_TEXT.fullmatch(text):
+        return None
+    value = int(text, 36)
+    return _texty(value.to_bytes((value.bit_length() + 7) // 8, "big"))
+
+
+def bigint(data: bytes) -> bytes | None:
+    """The message's bytes as one big decimal number (int.from_bytes of the text)."""
+    text = as_text(data)
+    if text is None or not _BIGINT_TEXT.fullmatch(text):
+        return None
+    value = int(text)
+    return _texty(value.to_bytes((value.bit_length() + 7) // 8, "big"))
+
+
+def base32hex(data: bytes) -> bytes | None:
+    """RFC 4648 base32hex (0-9A-V), the extended-hex alphabet of Base32."""
+    text = as_text(data)
+    if text is None or not _BASE32HEX_TEXT.fullmatch(text):
+        return None
+    try:
+        return _texty(base64.b32hexdecode(text.rstrip("=") + "=" * (-len(text.rstrip("=")) % 8)))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def ebcdic(data: bytes) -> bytes | None:
+    """EBCDIC (code page 037): bytes UTF-8 cannot read, mostly letters and spaces as cp037."""
+    if len(data) < 4 or raw_text(data) is not None:
+        return None
+    text = data.decode("cp037")
+    if not text.translate(_LAYOUT).isprintable() or sum(c.isalnum() or c == " " for c in text) < 0.7 * len(text):
+        return None
+    return text.encode("utf-8")
+
+
+def utf7(data: bytes) -> bytes | None:
+    """UTF-7 ("warmup+ACE- To"); a stray "+" in Base64 decodes to CJK noise, which is refused."""
+    text = as_text(data)
+    if text is None or not _UTF7_RUN.search(text):
+        return None
+    try:
+        decoded = text.encode("ascii").decode("utf-7")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    if decoded == text or not decoded.translate(_LAYOUT).isprintable() or any(ord(c) >= 0x800 for c in decoded):
+        return None
+    return decoded.encode("utf-8")
+
+
+def hexdump(data: bytes) -> bytes | None:
+    """`xxd` ("00000000: 4e69 6365  Nice") or `hexdump -C` ("00000000  4e 69  |Ni|") back to bytes."""
+    text = as_text(data)
+    if text is None:
+        return None
+    out = bytearray()
+    for number, line in enumerate(text.splitlines()):
+        match = _DUMP_OFFSET.match(line)
+        if not match or (number == 0 and int(match[1], 16) != 0):
+            return None
+        body = line[match.end():]
+        # hexdump -C has a double space mid-row, so its |ASCII| column is cut first; xxd's follows two spaces.
+        body = body.split("|", 1)[0] if "|" in body else body.split("  ", 1)[0]
+        for group in body.split():
+            if not _DUMP_GROUP.fullmatch(group):
+                return None
+            out += bytes.fromhex(group)
+    return bytes(out) or None
+
+
+def mime_words(data: bytes) -> bytes | None:
+    """RFC 2047 encoded words ("=?utf-8?B?TmljZQ==?=", "=?utf-8?Q?Nice_work?="), as in mail headers."""
+    text = as_text(data)
+    if text is None or not text.startswith("=?") or _MIME_WORD.sub("", text).strip():
+        return None
+    out = []
+    for charset, kind, payload in _MIME_WORD.findall(text):
+        try:
+            raw = (base64.b64decode(payload + "=" * (-len(payload) % 4), validate=True) if kind in "Bb"
+                   else quopri.decodestring(payload.encode("ascii"), header=True))
+            out.append(raw.decode(charset))
+        except (binascii.Error, LookupError, UnicodeError, ValueError):
+            return None
+    return "".join(out).encode("utf-8") or None
+
+
+def netstrings(data: bytes) -> bytes | None:
+    """Netstrings `<length>:<bytes>,` back to back ("4:Nice,5: work,"); Day 24's one-character
+    tokens without the last comma stay the runlength layer's."""
+    blob = data.strip(_WHITESPACE)
+    out, at = bytearray(), 0
+    while at < len(blob):
+        match = _NETSTRING_LENGTH.match(blob, at)
+        if not match:
+            return None
+        end = match.end() + int(match[1])
+        if blob[end:end + 1] != b",":
+            return None
+        out += blob[match.end():end]
+        at = end + 1
+        while blob[at:at + 1] in (b"\n", b"\r"):
+            at += 1
+    return _texty(bytes(out))
+
+
 _OOK = {("Ook.", "Ook?"): ">", ("Ook?", "Ook."): "<", ("Ook.", "Ook."): "+", ("Ook!", "Ook!"): "-",
         ("Ook!", "Ook."): ".", ("Ook.", "Ook!"): ",", ("Ook!", "Ook?"): "[", ("Ook?", "Ook!"): "]"}
 
@@ -765,9 +910,13 @@ LAYERS = (
     # Anticipated (no day yet): strict, text-only results, last so known chains come first.
     ("base58", base58), ("base62", base62), ("base91", base91), ("base45", base45),
     ("base100", base100), ("brainfuck", brainfuck),
+    # Forecast for days 26-31 (tests/test_forecast.py), strict like the ones above.
+    ("unpacked", unpacked), ("base36", base36), ("bigint", bigint), ("base32hex", base32hex),
+    ("ebcdic", ebcdic), ("utf7", utf7), ("hexdump", hexdump), ("mime", mime_words), ("netstring", netstrings),
 )
 # The anticipated layers above, kept out of guessed two-step chains (warmups._guess_fragment).
-ANTICIPATED = frozenset({"base58", "base62", "base91", "base45", "base100", "brainfuck"})
+ANTICIPATED = frozenset({"base58", "base62", "base91", "base45", "base100", "brainfuck", "unpacked", "base36",
+                         "bigint", "base32hex", "ebcdic", "utf7", "hexdump", "mime", "netstring"})
 # Letter rotations apply to any text, so they are tried only as a last step.
 FINAL_STEPS = (("rot13", rot13), ("rot47", rot47))
 # Weaker text ciphers turn any text into other text, so they are tried as a last step

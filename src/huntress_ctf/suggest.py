@@ -51,18 +51,60 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "customdestinations": "custom_destinations", "custom_destinations": "custom_destinations",
                "mft": "mft", "ntfs": "ntfs", "usn": "usn", "usnjrnl": "usn", "usn_journal": "usn",
                "recycle": "recycle_bin_i", "recyclebin": "recycle_bin_i", "recycle_bin": "recycle_bin_i",
-               "minidump": "minidump", "mdmp": "minidump", "dmp": "minidump", "crashdump": "minidump",
+               # A tuple names every label the namespace may mean (str.startswith takes one).
+               "minidump": "minidump", "mdmp": "minidump", "dmp": ("minidump", "kernel_dump"),
+               "crashdump": ("minidump", "kernel_dump"), "crash_dump": ("minidump", "kernel_dump"),
+               "dump": ("minidump", "kernel_dump"),
                "task": "scheduled_task", "scheduled_task": "scheduled_task", "schtask": "scheduled_task",
                "ewf": "ewf", "e01": "ewf", "encase": "ewf", "mbr": "mbr", "gpt": "gpt", "dmg": "dmg",
                "udif": "dmg", "ds_store": "ds_store", "dsstore": "ds_store", "x509": "x509",
-               "certificate": "x509", "cert": "x509", "pem": "x509", "der": "x509"}
+               "certificate": "x509", "cert": "x509", "pem": "x509", "der": "x509",
+               # Forecast for days 26-31 (tests/test_forecast.py): disk images, mail stores, memory, Linux logs.
+               "vmdk": "vmdk", "vmware": "vmdk", "qcow": "qcow2", "qcow2": "qcow2", "qemu": "qcow2",
+               "pst": "pst", "ost": "pst", "outlook": "pst", "kernel_dump": "kernel_dump",
+               "memory_dump": "kernel_dump", "bugcheck": "kernel_dump", "journal": "journald",
+               "journald": "journald", "systemd_journal": "journald", "utmp": "utmp", "wtmp": "utmp",
+               "btmp": "utmp"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
+# Plist keys are CamelCase ("CFBundleIdentifier"): split them like snake_case words.
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def _words(text: str) -> set[str]:
     words = {word[:-1] if len(word) > 3 and word.endswith("s") else word
-             for word in re.split(r"[^a-z0-9]+", text.lower()) if word}
+             for word in re.split(r"[^a-z0-9]+", _CAMEL.sub("_", text).lower()) if word}
     return words - _NOISE
+
+
+# DFIR words for fields the readers name otherwise. A property is scored under both its own
+# name and the aliased one, so an alias can only add a match. Without them the forecast
+# (tests/test_forecast.py) had "x509.subject_common_name" clearly `subject` ("CN=..., O=...").
+_ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in (
+    (r"common_name", "cn"),
+    (r"thumbprint", "fingerprint"),
+    (r"^(?:ads|alternate_data_stream)(?:_names)?(?=$|_count|_set|_list|_present)", "alternate_data_streams"),
+    (r"^(?:valid_to|not_valid_after|expir(?:y|ation|es))(?:_date|_time)?", "not_after"),
+    (r"^(?:valid_from|not_valid_before)(?:_date|_time)?", "not_before"),
+    (r"^(?:sans?|san_dns|subject_alternative)(?:_names)?(?=$|_count|_set|_list)", "subject_alt_names"),
+    (r"(?:execution|launch)_count", "run_count"),
+    (r"last_(?:execution|executed|run)(?:_time)?", "last_run"),
+    (r"snapshot_length", "snaplen"),
+    (r"link_type", "linktype"),
+    (r"standard_information", "si"),
+    (r"^file_name_(created|modified|accessed|mft_modified)", r"fn_\1"),
+    (r"^timestomp(?:ed|ing)?", "si_before_fn_created"),
+    (r"deletion_(?:time|date)", "deleted"),
+    (r"^process_name", "main_module_name"),
+    (r"(?<=[a-z])_filename", "_name"),
+    (r"^filename", "file_name"),
+    (r"(md5|sha1|sha256)_(?:hash|digest)", r"\1"),
+))
+
+
+def _aliased(name: str) -> str:
+    for pattern, replacement in _ALIASES:
+        name = pattern.sub(replacement, name)
+    return name
 
 
 # Units name what a field measures, not the field: "sqlite.page_size_bytes" is the header's page_size.
@@ -94,21 +136,33 @@ def formatted(prop: str, value: Any) -> str:
     return str(value)
 
 
+def _score(name: str, key: str) -> int:
+    joined = key.replace("_", "").lower()
+    # The exact name beats the unit-stripped one: time_date_stamp_utc over time_date_stamp.
+    return (len(_words(name) & _words(key)) + (3 if key == name else 2 if key == _bare(name) else 0)
+            # "cputype" is one word in the header but "cpu_type" in a property.
+            + (1 if len(joined) > 3 and joined in _bare(name).replace("_", "") else 0))
+
+
+def _one_value(name: str) -> bool:
+    """A scalar property: no collection suffix, not plural. A list field is then the wrong
+    reading: "prefetch.last_run_time_utc" is last_run_utc, not last_run_times_utc."""
+    return not name.endswith(("_set", "_list", "_count", "_present")) and not _bare(name).endswith("s")
+
+
 def ranked(prop: str, data: bytes) -> list[tuple[int, str, str, Any]]:
     """(score, format label, field, value), best first, for the fields matching `prop`."""
     namespace, _, name = prop.partition(".")
-    wanted = _words(name)
+    names = {name, _aliased(name)}
     label_kind = _NAMESPACES.get(namespace)
     scored = []
     for label, fields in describe(data):
         if label_kind and not label.startswith(label_kind):
             continue
         for key, value in fields.items():
-            joined = key.replace("_", "").lower()
-            # The exact name beats the unit-stripped one: time_date_stamp_utc over time_date_stamp.
-            score = (len(wanted & _words(key)) + (3 if key == name else 2 if key == _bare(name) else 0)
-                     # "cputype" is one word in the header but "cpu_type" in a property.
-                     + (1 if len(joined) > 3 and joined in _bare(name).replace("_", "") else 0))
+            score = max(_score(spelling, key) for spelling in names)
+            if score and isinstance(value, list) and _one_value(name):
+                score -= 1
             if score:
                 scored.append((score, len(key), label, key, value))
     scored.sort(key=lambda item: (-item[0], item[1]))

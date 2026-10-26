@@ -227,6 +227,50 @@ liten och entydig, och agenten kan hålla sig till att skriva en regel per utpek
 på en egen gren, utan att starta, lämna in eller driftsätta något. Gör den läs-only mot
 Game Master (`status`, `artifact`) och låt replay-grinden (`verify_fields.py`) avgöra.
 
+## Läget 26 okt: prognos för dag 26–31
+
+Titlarna för dag 1–25 (`list`) och frågetyperna i korpusen på Homebase visar att varje lane
+följer en kursplan, och att nyheten per dag är liten och förutsägbar:
+
+| Lane | Mönster dag 1–25 | Troligt dag 26–31 |
+| --- | --- | --- |
+| Warmups | en kodning per dag; serier: baser (64, 32, 85), komprimering (dag 21 gzip, 22 zlib), teckenkodning (dag 19–20 UTF-16, 25 kodpunkter) | nästa steg i serierna: bzip2/xz/raw deflate, base36, UTF-32, EBCDIC, UTF-7, hexdump, MIME-ord |
+| Metadata | **exakt en ny egenskap per dag** (`text.utf8_bom_present` dag 3 … `sqlite.page_size_bytes`, `evtx.record_count`, `registry.hive_root_name` dag 23–25) | Windows-forensik efter registret: Prefetch, $MFT/USN, papperskorg, Jump Lists, schemalagda uppgifter, minnesdumpar, diskavbilder, certifikat, PST, Linux-loggar |
+| Script | ett nytt språk eller en ny plattform per dag (dag 19 C# … dag 25 Elixir) | ny familj; täcks av `f9fa9cd` (regler för okända familjer, RC4/AES, nya lager) |
+| Binary | dag 1–14 språk, dag 15–25 tekniker; nya frågetyper är rollord (`corrected`/`vulnerable`) | täcks generiskt av `e7dedad` och `972d5c6` (roll från ID, okänd egenskap som autoprop) |
+| Android | en skyddsmekanism per dag; svaret är alltid en `ANS-`-kod | täcks av `403194f` (javax.crypto, egen signatur, egen APK i `dexvm`) |
+
+Kursmaterial från andra CTF:er hjälper lite: uppgifterna är syntetiska och graderarens
+konventioner står inte i bytena. Däremot är det Metadata som oftast tagit dagens sista flagga,
+och den lanens risk syns redan nu: dag 25 hade läsaren men inte namnet (`hive_root_name`
+mot fältet `root_key_name`), så lanen väntade på en människa.
+
+**`tests/test_forecast.py`** gör prognosen körbar. Den har 97 troliga egenskapsnamn i
+graderarens stil (`<format>.<struktur>_<fält>[_suffix]`), och för var och en kontrolleras att
+robotens första otidsatta svar är rätt fält. Den har också 21 kodningar som `peel` ska avkoda
+till exakt ett svar. Läget före och efter:
+
+| | Före | Efter |
+| --- | --- | --- |
+| Rätt svar på första otidsatta försöket, befintliga läsare (67 namn) | 52 | 67 |
+| Säkra men fel svar (inga alternativ, så lanen fastnar) | 7 | 0 |
+| Nya läsare: VMDK, QCOW2, PST/OST, kernel-dump, systemd-journal, utmp/wtmp (30 namn) | 0 | 30 |
+| Warmups-kodningar som avkodas till exakt ett svar | 5 av 21 | 21 av 21 |
+
+Ändringarna är generella: `suggest.py` delar CamelCase (plist-nycklar), har en aliaslista för
+DFIR-ord (`common_name` → `cn`, `thumbprint` → `fingerprint`, `ads` → `alternate_data_streams`,
+…) där ett alias bara kan lägga till en träff, och straffar ett listfält när egenskapen är
+singular. Autoprop erbjuder sorterade varianter och basnamn för listsvar (`_orderings`, som
+parsrarna). Replay av hela korpusen på Homebase gav inga ändrade svar och inga långsammare lösare.
+
+Kvar, medvetet:
+- **Graderarens val** som inte går att läsa ur bytena: kod eller namn (`crypt_method` 1 eller
+  `permute`), listans ordning. Otidsat prövas alternativen; på klockan används bara bekräftat.
+- **rot18** (ROT13 plus ROT5 på siffror) avkodas i dag som ROT13 med fel siffror. a1z26, tap
+  code och Polybius kan inte bära svarets siffror, så de är inte troliga som hela dagar.
+- **Releasedagen:** finns dagens egenskap inte i tabellen, lägg först till raden i
+  `test_forecast.py` och sedan alias eller läsare. Testet visar då att det blev rätt fält.
+
 ## Grenen `work-in-progress` (Codex, 21 okt): inte inslagen
 
 Provad 21 okt 14:10 på dag 20:s riktiga uppgifter (kopia på Homebase, ingen inlämning):
