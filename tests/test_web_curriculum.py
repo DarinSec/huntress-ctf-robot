@@ -333,5 +333,44 @@ class StoredXssPollTests(unittest.TestCase):
         self.assertLess(elapsed, 2.0)
 
 
+class ParallelMasteryTests(unittest.TestCase):
+    def test_distinct_mastery_targets_solve_concurrently(self):
+        proof1 = "proof_11111111111111111111111111111111"
+        proof2 = "proof_22222222222222222222222222222222"
+        routes1 = {
+            "/robots.txt": (200, {}, b"User-agent: *\nDisallow: /backups/\n"),
+            "/backups/": (200, {}, b'<html><a href="app.bak">app.bak</a></html>'),
+            "/backups/app.bak": (200, {}, f"archived note: {proof1}".encode()),
+        }
+        routes2 = {
+            "/robots.txt": (200, {}, b"User-agent: *\nDisallow: /backups/\n"),
+            "/backups/": (200, {}, b'<html><a href="app.bak">app.bak</a></html>'),
+            "/backups/app.bak": (200, {}, f"archived note: {proof2}".encode()),
+        }
+        with _RoutedServer(routes1, http11=True) as s1, _RoutedServer(routes2, http11=True) as s2:
+            targets = (
+                {"id": "Target 1", "url": s1.url},
+                {"id": "Target 2", "url": s2.url},
+            )
+            attempt = {
+                "questions": [
+                    {"id": "q1", "artifact": "Target 1"},
+                    {"id": "q2", "artifact": "Target 2"},
+                ]
+            }
+            context = TargetContext(
+                challenge_id="web-exploitation-day-01-backup-exposure/mastery",
+                challenge={"curriculum_day": 1},
+                attempt=attempt,
+                answer_ids=("q1", "q2"),
+                targets=targets,
+                http=scoped_http(targets),
+            )
+            candidates = CurriculumWebSolver().solve(context)
+            cand_map = {c.answer_id: c.answer for c in candidates}
+            self.assertEqual(cand_map.get("q1"), proof1)
+            self.assertEqual(cand_map.get("q2"), proof2)
+
+
 if __name__ == "__main__":
     unittest.main()
