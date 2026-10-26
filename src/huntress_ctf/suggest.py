@@ -112,6 +112,13 @@ _ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in 
     (r"(md5|sha1|sha256)_(?:hash|digest)", r"\1"),
     (r"^(?:oldest|earliest)_record(?:_number|_id)?", "first_record_id"),
     (r"^(?:newest|latest)_record(?:_number|_id)?", "last_record_id"),
+    # Archive and image listings (CAB members, the files of a WIM image).
+    (r"^(?:file|member)_?names$", "names"),
+    (r"^(?:file|member)_sha256s?$", "member_sha256"),
+    (r"^(?:total_)?uncompressed(?:_size|_bytes)?$", "total_uncompressed"),
+    (r"^(?:file_|member_)?(?:timestamps|modified_dates|mtimes)$", "modified_times"),
+    (r"^(?:dir|folder)(?:ectory)?_count$", "directory_count"),
+    (r"^(?:newest|latest|last_modified|most_recent)(?:_written)?_file(?:_path)?$", "latest_write_path"),
 ))
 
 

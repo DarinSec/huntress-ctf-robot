@@ -11,9 +11,11 @@ format, every parser guarded so damaged bytes give `damaged` instead of an excep
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import plistlib
 import re
 import struct
+import zlib
 from typing import Callable
 
 
@@ -266,18 +268,104 @@ def _vhdx(data: bytes, f: dict) -> None:
             f.setdefault("log_version", log_version)
 
 
+CAB_COMPRESSION = {0: "none", 1: "mszip", 2: "quantum", 3: "lzx"}
+CAB_ATTRIBUTES = ((0x01, "readonly"), (0x02, "hidden"), (0x04, "system"), (0x20, "archive"), (0x40, "exec"))
+
+
+def _dos_time(date: int, time: int) -> str | None:
+    """A FAT/CAB/ZIP date and time word: local time with 2-second steps, no time zone."""
+    try:
+        return datetime(1980 + (date >> 9), date >> 5 & 15, date & 31, time >> 11, time >> 5 & 63,
+                        (time & 31) * 2).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _cab_folder(data: bytes, start: int, blocks: int, kind: int, data_reserve: int) -> bytes:
+    """One CAB folder's bytes: its CFDATA blocks, stored, MSZIP (a raw deflate stream per 32 KiB block,
+    each primed with the block before) or LZX (the blocks' payloads form one stream)."""
+    method, at, payloads, sizes = kind & 0xF, start, [], []
+    for _ in range(blocks):
+        packed, unpacked = struct.unpack_from("<HH", data, at + 4)
+        at += 8 + data_reserve
+        if at + packed > len(data):
+            raise ValueError("CAB data block past the cabinet")
+        payloads.append(data[at:at + packed])
+        sizes.append(unpacked)
+        at += packed
+    if sum(sizes) > MAX_DECOMPRESSED:
+        raise ValueError("CAB folder too large")
+    if method == 0:
+        return b"".join(payloads)
+    if method == 1:
+        out = bytearray()
+        for payload, unpacked in zip(payloads, sizes):
+            if payload[:2] != b"CK":
+                raise ValueError("MSZIP block without its CK signature")
+            inflate = zlib.decompressobj(-15, zdict=bytes(out[-32768:])) if out else zlib.decompressobj(-15)
+            block = inflate.decompress(payload[2:], unpacked)
+            if len(block) != unpacked:
+                raise ValueError("MSZIP block shorter than stated")
+            out += block
+        return bytes(out)
+    if method == 3:
+        return lzx(b"".join(payloads), sum(sizes), kind >> 8 & 0x1F)
+    raise ValueError(f"CAB compression {CAB_COMPRESSION.get(method, method)} not supported")
+
+
 def _cab(data: bytes, f: dict) -> None:
     size, files_at = struct.unpack_from("<I4xI", data, 8)
     minor, major, folders, files, flags, set_id, index = struct.unpack_from("<BBHHHHH", data, 24)
     f.update(cabinet_size=size, version=f"{major}.{minor}", folder_count=folders, file_count=files,
              flags=flags, set_id=set_id, cabinet_index=index)
     names, at = [], files_at
+    entries = []
     for _ in range(min(files, 65535)):
+        length, offset, folder, date, time, attributes = struct.unpack_from("<IIHHHH", data, at)
         at += 16
         end = data.index(b"\0", at)
-        names.append(data[at:end].decode("utf-8" if struct.unpack_from("<H", data, at - 2)[0] & 0x80 else "latin-1"))
+        names.append(data[at:end].decode("utf-8" if attributes & 0x80 else "latin-1"))
+        entries.append((length, offset, folder, date, time, attributes))
         at = end + 1
     f["names"] = names
+    f.update(file_sizes=[entry[0] for entry in entries], total_uncompressed=sum(entry[0] for entry in entries),
+             modified_times=[_dos_time(entry[3], entry[4]) for entry in entries],
+             file_attributes=[[name for bit, name in CAB_ATTRIBUTES if entry[5] & bit] for entry in entries],
+             folder_indexes=[entry[2] for entry in entries])
+    at, data_reserve = 36, 0
+    if flags & 4:  # Reserved areas in the header, each folder entry and each data block.
+        header_reserve, folder_reserve, data_reserve = struct.unpack_from("<HBB", data, 36)
+        at = 40 + header_reserve
+        f.update(header_reserve_size=header_reserve, folder_reserve_size=folder_reserve,
+                 data_reserve_size=data_reserve)
+    else:
+        folder_reserve = 0
+    for bit, side in ((1, "previous"), (2, "next")):  # A cabinet set's neighbours.
+        if flags & bit:
+            for part in ("cabinet", "disk"):
+                end = data.index(b"\0", at)
+                f[f"{side}_{part}"] = data[at:end].decode("latin-1")
+                at = end + 1
+    table = []
+    for _ in range(min(folders, 4096)):
+        table.append(struct.unpack_from("<IHH", data, at))
+        at += 8 + folder_reserve
+    kinds = [CAB_COMPRESSION.get(kind & 0xF, f"0x{kind & 0xF:x}") for _, _, kind in table]
+    f.update(compression_types=kinds, compression=kinds[0] if kinds else "none",
+             data_block_count=sum(blocks for _, blocks, _ in table))
+    if any(kind & 0xF == 3 for _, _, kind in table):
+        f["lzx_window_bits"] = next(kind >> 8 & 0x1F for _, _, kind in table if kind & 0xF == 3)
+    hashes: list[str | None] = [None] * len(entries)
+    for number, (start, blocks, kind) in enumerate(table):
+        try:
+            folder = _cab_folder(data, start, blocks, kind, data_reserve)
+        except (ValueError, IndexError, struct.error, zlib.error) as exc:
+            f.setdefault("folders_unreadable", []).append(f"{number}: {exc}")
+            continue
+        for i, (length, offset, at_folder, *_rest) in enumerate(entries):
+            if at_folder == number and offset + length <= len(folder):
+                hashes[i] = hashlib.sha256(folder[offset:offset + length]).hexdigest()
+    f["member_sha256"] = hashes
 
 
 XZ_CHECKS = {0: "none", 1: "crc32", 4: "crc64", 10: "sha256"}
@@ -1295,6 +1383,220 @@ def lz4_block(data: bytes, size: int) -> bytes:
     return bytes(out)
 
 
+LZX_SLOTS = {15: 30, 16: 32, 17: 34, 18: 36, 19: 38, 20: 42, 21: 50}  # Position slots per window size.
+LZX_EXTRA_BITS = tuple(min(max(slot // 2 - 1, 0), 17) for slot in range(51))
+LZX_POSITION_BASE = tuple(sum(1 << bits for bits in LZX_EXTRA_BITS[:slot]) for slot in range(51))
+LZX_FRAME = 32768
+LZX_WIM_E8_SIZE = 12_000_000  # WIM chunks always undo the E8 call translation against this size.
+
+
+class _LzxBits:
+    """LZX's bitstream: 16-bit little-endian words, each read from its high bit."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.at, self.buffer, self.count = data, 0, 0, 0
+
+    def need(self, n: int) -> None:
+        while self.count < n:
+            if self.at > len(self.data) + 8:  # A few words of zero padding, as decoders allow.
+                raise ValueError("LZX stream ends early")
+            self.buffer = self.buffer << 16 | int.from_bytes(self.data[self.at:self.at + 2].ljust(2, b"\0"), "little")
+            self.at += 2
+            self.count += 16
+
+    def read(self, n: int) -> int:
+        if n == 0:
+            return 0
+        self.need(n)
+        self.count -= n
+        value = self.buffer >> self.count
+        self.buffer &= (1 << self.count) - 1
+        return value
+
+    def symbol(self, tree: tuple[int, list[int]] | None) -> int:
+        if tree is None:
+            raise ValueError("LZX symbol from an empty Huffman tree")
+        width, table = tree
+        self.need(width)
+        entry = table[self.buffer >> (self.count - width) & ((1 << width) - 1)]
+        if entry < 0:
+            raise ValueError("LZX: no Huffman code matches")
+        self.count -= entry & 31
+        self.buffer &= (1 << self.count) - 1
+        return entry >> 5
+
+    def align(self, skip_aligned: bool = False) -> None:
+        """To the next 16-bit boundary of the input; an uncompressed block also skips a whole
+        word when it is already there ("1-16 bits of padding")."""
+        consumed = self.at * 8 - self.count
+        pad = -consumed % 16 or (16 if skip_aligned else 0)
+        self.at, self.buffer, self.count = (consumed + pad) // 8, 0, 0
+
+
+def _lzx_tree(lengths: list[int]) -> tuple[int, list[int]] | None:
+    """A canonical Huffman decode table indexed by the next `width` bits: symbol << 5 | length."""
+    used = sorted((length, symbol) for symbol, length in enumerate(lengths) if length)
+    if not used:
+        return None
+    width = used[-1][0]
+    table = [-1] * (1 << width)
+    code, previous = 0, used[0][0]
+    for length, symbol in used:
+        code <<= length - previous
+        previous = length
+        span = 1 << (width - length)
+        if (code + 1) * span > len(table):
+            raise ValueError("LZX Huffman lengths oversubscribed")
+        table[code * span:(code + 1) * span] = [symbol << 5 | length] * span
+        code += 1
+    return width, table
+
+
+def _lzx_lengths(bits: _LzxBits, lengths: list[int], first: int, last: int) -> None:
+    """Code lengths as deltas from the previous block's, coded with a 20-symbol pretree."""
+    pretree = _lzx_tree([bits.read(4) for _ in range(20)])
+    x = first
+    while x < last:
+        z = bits.symbol(pretree)
+        if z == 17:
+            run, value = bits.read(4) + 4, 0
+        elif z == 18:
+            run, value = bits.read(5) + 20, 0
+        elif z == 19:
+            run = bits.read(1) + 4
+            value = (lengths[x] - bits.symbol(pretree)) % 17
+        else:
+            run, value = 1, (lengths[x] - z) % 17
+        run = min(run, last - x)
+        lengths[x:x + run] = [value] * run
+        x += run
+
+
+def _lzx_e8(out: bytearray, start: int, end: int, file_size: int) -> None:
+    """Undo the encoder's x86 CALL translation in one frame: absolute targets back to relative."""
+    i = start
+    while i < end - 10:
+        if out[i] != 0xE8:
+            i += 1
+            continue
+        target = int.from_bytes(out[i + 1:i + 5], "little", signed=True)
+        if -i <= target < file_size:
+            out[i + 1:i + 5] = ((target - i) if target >= 0 else (target + file_size)).to_bytes(4, "little", signed=True)
+        i += 5
+
+
+def lzx(data: bytes, size: int, window_bits: int = 16, *, wim: bool = False, reset_frames: int = 0) -> bytes:
+    """[MS-PATCH] LZX, the LZ77 + Huffman coder of CAB folders (typeCompress 3, window 2^15-2^21),
+    WIM chunks and CHM: verbatim, aligned-offset and uncompressed blocks over 32 KiB frames, three
+    repeat offsets. CAB streams open with an E8-translation bit (+ 32-bit file size), carry 24-bit
+    block sizes and re-align the input after every frame; a WIM chunk (wim=True) has a 1-bit "32 KiB
+    block" flag instead and always undoes E8 against 12,000,000. reset_frames restarts the coder
+    state every N frames (CHM's reset interval)."""
+    if not 0 <= size <= MAX_DECOMPRESSED:
+        raise ValueError("LZX output size out of range")
+    if window_bits not in LZX_SLOTS:
+        raise ValueError(f"LZX window of 2^{window_bits} bytes")
+    bits, out = _LzxBits(data), bytearray()
+    window, mains = 1 << window_bits, 256 + 8 * LZX_SLOTS[window_bits]
+    e8_frames: list[tuple[int, int, int]] = []
+    fresh, raw, e8_size = True, False, LZX_WIM_E8_SIZE if wim else 0
+    block_end = block_type = 0
+    main = aligned = lengths = None
+    frame_start, frame_index = 0, 0
+    while len(out) < size:
+        if fresh:  # Stream start or a CHM reset: empty trees, repeat offsets 1.
+            main_lengths, length_lengths, r0, r1, r2 = [0] * mains, [0] * 249, 1, 1, 1
+            block_end, fresh = len(out), False
+            if not wim:
+                e8_size = bits.read(16) << 16 | bits.read(16) if bits.read(1) else 0
+        frame_end = min(frame_start + LZX_FRAME, size)
+        if len(out) >= block_end:
+            block_type = bits.read(3)
+            if wim:
+                if bits.read(1):
+                    block_size = LZX_FRAME
+                else:
+                    block_size = bits.read(16)
+                    if window_bits >= 16:
+                        block_size = block_size << 8 | bits.read(8)
+            else:
+                block_size = bits.read(16) << 8 | bits.read(8)
+            block_end += block_size
+            if block_end <= len(out):
+                raise ValueError("LZX block of zero length")
+            if block_type in (1, 2):
+                aligned = _lzx_tree([bits.read(3) for _ in range(8)]) if block_type == 2 else None
+                _lzx_lengths(bits, main_lengths, 0, 256)
+                _lzx_lengths(bits, main_lengths, 256, mains)
+                main = _lzx_tree(main_lengths)
+                _lzx_lengths(bits, length_lengths, 0, 249)
+                lengths = _lzx_tree(length_lengths)
+            elif block_type == 3:
+                bits.align(skip_aligned=True)
+                if bits.at + 12 > len(data):
+                    raise ValueError("LZX uncompressed block header past the input")
+                r0, r1, r2 = struct.unpack_from("<3I", data, bits.at)
+                bits.at += 12
+                raw = True
+            else:
+                raise ValueError(f"LZX block type {block_type}")
+        stop = min(block_end, frame_end)
+        if raw:
+            chunk = data[bits.at:bits.at + stop - len(out)]
+            if len(chunk) != stop - len(out):
+                raise ValueError("LZX uncompressed block past the input")
+            out += chunk
+            bits.at += len(chunk)
+            if len(out) >= block_end:  # Odd blocks pad to a word; the bitstream starts afresh.
+                bits.at += block_size & 1
+                raw = False
+        while len(out) < stop:
+            symbol = bits.symbol(main)
+            if symbol < 256:
+                out.append(symbol)
+                continue
+            symbol -= 256
+            length, slot = symbol & 7, symbol >> 3
+            if length == 7:
+                length += bits.symbol(lengths)
+            length += 2
+            if slot > 2:
+                extra = LZX_EXTRA_BITS[slot]
+                if block_type == 2 and extra >= 3:
+                    offset = LZX_POSITION_BASE[slot] - 2 + (bits.read(extra - 3) << 3) + bits.symbol(aligned)
+                else:
+                    offset = LZX_POSITION_BASE[slot] - 2 + bits.read(extra)
+                r0, r1, r2 = offset, r0, r1
+            elif slot == 1:
+                offset, r0, r1 = r1, r1, r0
+            elif slot == 2:
+                offset, r0, r2 = r2, r2, r0
+            else:
+                offset = r0
+            if not 0 < offset <= min(len(out), window):
+                raise ValueError("LZX match before the start of the window")
+            start = len(out) - offset
+            if length <= offset:
+                out += out[start:start + length]
+            else:
+                for i in range(length):
+                    out.append(out[start + i])
+        if len(out) >= frame_end:  # A frame is complete.
+            if e8_size:
+                e8_frames.append((frame_start, frame_end, e8_size))
+            if not raw and not wim:
+                bits.align()
+            frame_start, frame_index = frame_end, frame_index + 1
+            if reset_frames and frame_index % reset_frames == 0:
+                fresh = True
+        if len(out) > MAX_DECOMPRESSED:
+            raise ValueError("LZX output too large")
+    del out[size:]
+    for start, end, file_size in e8_frames:  # The window kept the translated bytes matches copy.
+        _lzx_e8(out, start, end, file_size)
+    return bytes(out)
+
+
 def _unwrap_mam(data: bytes) -> tuple[bytes, str] | None:
     """A MAM container in LZNT1 (2) or plain Xpress (3) holding a Prefetch file; Xpress Huffman (4),
     the format Windows writes, is the Prefetch reader's own."""
@@ -1378,6 +1680,100 @@ def _wim(data: bytes, f: dict) -> None:
         f["image_names"] = [match.group(1) for block in blocks if (match := re.search(r"<NAME>(.*?)</NAME>", block))]
         f["image_descriptions"] = [match.group(1) for block in blocks
                                    if (match := re.search(r"<DESCRIPTION>(.*?)</DESCRIPTION>", block))]
+    try:
+        _wim_image(data, chunk or LZX_FRAME, compression, f)
+    except (ValueError, IndexError, struct.error) as exc:
+        f["image_tree_damaged"] = f"{type(exc).__name__}: {exc}"
+
+
+MAX_WIM_ENTRIES = 50000
+
+
+def _wim_resource(data: bytes, header: int, chunk: int, compression: str) -> bytes:
+    """A resource header (7-byte stored size, flags, offset, original size) -> its bytes."""
+    stored, flags = int.from_bytes(data[header:header + 7], "little"), data[header + 7]
+    offset, original = struct.unpack_from("<QQ", data, header + 8)
+    return _wim_read(data, stored, flags, offset, original, chunk, compression)
+
+
+def _wim_read(data: bytes, stored: int, flags: int, offset: int, original: int, chunk: int, compression: str) -> bytes:
+    """Compressed resources (flag 4) start with a table of chunk offsets (32-bit, or 64-bit past 4 GiB)
+    relative to its end; a chunk whose stored size equals its full size is kept raw."""
+    if offset + stored > len(data) or original > MAX_DECOMPRESSED:
+        raise ValueError("WIM resource past the file or too large")
+    if not flags & 4:
+        return data[offset:offset + original]
+    if flags & 0x10:
+        raise ValueError("solid (LZMS) WIM resource")
+    count = -(-original // chunk)
+    entry = 8 if original > 0xFFFFFFFF else 4
+    table = (count - 1) * entry
+    starts = [0] + [int.from_bytes(data[offset + i * entry:offset + (i + 1) * entry], "little") for i in range(count - 1)]
+    ends, body = starts[1:] + [stored - table], offset + table
+    out = bytearray()
+    for i, (start, end) in enumerate(zip(starts, ends)):
+        want = min(chunk, original - i * chunk)
+        piece = data[body + start:body + end]
+        if not 0 < len(piece) <= want or body + end > offset + stored:
+            raise ValueError("WIM chunk table out of range")
+        if len(piece) == want:
+            out += piece
+        elif compression == "lzx":
+            out += lzx(piece, want, max(15, (chunk - 1).bit_length()), wim=True)
+        else:
+            raise ValueError(f"WIM {compression} chunks not supported")
+    return bytes(out)
+
+
+def _wim_image(data: bytes, chunk: int, compression: str, f: dict) -> None:
+    """The first image's metadata resource: security data, then the root directory entry; each
+    directory's children follow its subdir offset until a zero length. Entries list their times and
+    the SHA-1 of their unnamed stream, which the blob table maps to a size."""
+    table = _wim_resource(data, 0x30, chunk, compression)
+    sizes, metadata = {}, None
+    for at in range(0, len(table) - 49, 50):
+        stored, flags = int.from_bytes(table[at:at + 7], "little"), table[at + 7]
+        offset, original = struct.unpack_from("<QQ", table, at + 8)
+        sizes[table[at + 30:at + 50]] = original
+        if flags & 2 and metadata is None:
+            metadata = (stored, flags, offset, original)
+    if metadata is None:
+        return
+    meta = _wim_read(data, *metadata, chunk, compression)
+    root = max(8, struct.unpack_from("<I", meta, 0)[0] + 7 & ~7)
+    paths, names, file_sizes, directories, latest, seen = [], [], [], 0, (0, ""), set()
+    stack = [(struct.unpack_from("<Q", meta, root + 16)[0], "", 0)]
+    while stack:
+        at, parent, depth = stack.pop()
+        while 0 < at < len(meta) and len(seen) < MAX_WIM_ENTRIES and at not in seen:
+            seen.add(at)
+            length = struct.unpack_from("<Q", meta, at)[0]
+            if length < 102:  # The end of this directory's list.
+                break
+            attributes, _, subdir = struct.unpack_from("<IiQ", meta, at + 8)
+            written = struct.unpack_from("<Q", meta, at + 56)[0]
+            streams, _, name_bytes = struct.unpack_from("<HHH", meta, at + 96)
+            name = meta[at + 102:at + 102 + name_bytes].decode("utf-16-le", "replace")
+            path = f"{parent}/{name}"
+            if attributes & 0x10:
+                directories += 1
+                if subdir and depth < 64:
+                    stack.append((subdir, path, depth + 1))
+            else:
+                paths.append(path)
+                names.append(name)
+                file_sizes.append(sizes.get(meta[at + 64:at + 84], 0))
+                latest = max(latest, (written, path))
+            at += length + 7 & ~7
+            for _ in range(streams):  # Named data streams follow the entry, each with its own length.
+                at += struct.unpack_from("<Q", meta, at)[0] + 7 & ~7
+    # Also under the plain words ("wim.file_names"): `name` is a noise word when fields are scored.
+    f.update(image_file_paths=paths, image_file_names=names, image_file_sizes=file_sizes,
+             image_file_count=len(paths), image_directory_count=directories,
+             image_total_bytes=sum(file_sizes), file_paths=paths, file_names=names, file_count=len(paths),
+             directory_count=directories)
+    if latest[0]:
+        f.update(image_latest_write_utc=_filetime(latest[0]), image_latest_write_path=latest[1])
 
 
 EXT_OS = {0: "linux", 1: "hurd", 2: "masix", 3: "freebsd", 4: "lites"}
