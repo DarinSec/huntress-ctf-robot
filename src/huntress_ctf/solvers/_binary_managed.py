@@ -2,6 +2,7 @@
 from io import BytesIO
 import zipfile
 
+from ..containers import read_member
 from ._binary_formats import PE, ParseError, Reader
 
 
@@ -100,7 +101,7 @@ class Jar:
         infos = [i for i in self.infos if i.filename == name and not i.is_dir()]
         if len(infos) != 1 or infos[0].file_size > 16 * 1024 * 1024:
             raise ParseError("Missing, ambiguous or oversized JAR member")
-        return self.archive.read(infos[0])
+        return read_member(self.archive, infos[0])
 
     @property
     def main(self) -> JavaClass:
@@ -134,6 +135,6 @@ class Jar:
             if info.file_size > 16 * 1024 * 1024:
                 raise ParseError("Oversized JAR classfile")
             try:
-                yield JavaClass(self.archive.read(info))
+                yield JavaClass(read_member(self.archive, info))
             except ParseError:
                 continue

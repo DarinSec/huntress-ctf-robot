@@ -174,6 +174,11 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   blocks its 8-deep mastery pools). A brand-new vuln class the prober cannot crack is the
   only manual case -> Ilse or David take that single challenge by hand.
   Samples look like malware: analyse on Homebase over SSH, not on a PC with antivirus.
+  Each target is probed under a `Budget` (ROBUSTNESS.md #2): at most `HUNTRESS_WEB_MAX_REQUESTS`
+  (300) requests in `HUNTRESS_WEB_BUDGET_S` (45 s), so the autonomous prober/crawl/fuzzer
+  (288 requests against a dead "maze") can't blow the race deadline. Spent, it stops that
+  target with no guess (`BudgetExhausted`, a BaseException so the handlers' `except Exception`
+  can't swallow it); `scoped_http` attaches the budget, the adapter resets it per target.
 - Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
   new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
 
@@ -289,7 +294,22 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   replay and coverage itself. A human reviews, merges and deploys.
 - `scripts/replay.py` re-solves every scored assignment in `~/.huntress/corpus` (the robot
   records them after each CORRECT/accepted submit); `homebase.sh deploy` refuses a
-  deploy that regresses an accepted answer (`SKIP_REPLAY=1` overrides).
+  deploy that regresses an accepted answer, makes a solver over twice as slow as in the
+  previous replay of an entry (`ALLOW_SLOWER=1` accepts that), or breaks a solver that ran
+  fine there (`SKIP_REPLAY=1` overrides all three). Each replay ends with the slowest
+  solvers, and the daily summary with the day's (`slowest_solvers`; `homebase.sh report`).
+- `scripts/fuzz.py` feeds every solver broken copies of the corpus (a member truncated, bits
+  flipped, a length field forged; one ZIP member deep) and names each input that hangs or
+  raises, as `<seed>#<index>` that `--repro` replays with the traceback. A damaged file must
+  answer nothing: catch `containers.ZIP_ERRORS` (everything a damaged ZIP member raises) at
+  every zipfile read. `tests/test_fuzz.py` runs synthetic seeds of every non-web lane each test run.
+- Memory: a forked solver may grow `HUNTRESS_SOLVER_MEMORY_MB` (4096) past its size at the fork
+  and is the OOM killer's first pick; past it, it gets MemoryError and only that solver is lost.
+  Read ZIP members with `containers.read_member` and inflate with `containers.decompress`, never
+  `archive.read` or a bare `zlib/gzip/lzma/bz2.decompress`: zipfile inflates a whole member before
+  it cuts it to the stated size, so a header that understates a bomb costs all of it, and a
+  script layer once parsed 64 MiB of a bomb's zeros into a "record". `scripts/fuzz.py --bomb 1024`
+  and `tests/test_resources.py` send bombs past every cap (256 MiB unpacker, 16 MiB layers).
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds

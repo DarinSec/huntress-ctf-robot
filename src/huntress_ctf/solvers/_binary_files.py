@@ -4,7 +4,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 import zipfile
 
-from ..containers import LazyMembers, MAX_MEMBERS, _external_unzip, passwords_from
+from ..containers import LazyMembers, MAX_MEMBERS, ZIP_ERRORS, _external_unzip, passwords_from
 from ._binary_archive import aes_members
 from ._binary_formats import ParseError
 from .base import instruction_text
@@ -95,7 +95,7 @@ class BinaryFiles(Files):
                         if len(candidate) == info.file_size:
                             data = candidate  # ZipExtFile verified CRC at EOF.
                         break
-                    except (RuntimeError, zipfile.BadZipFile):
+                    except ZIP_ERRORS:
                         continue
         self.content[key] = data
         return data

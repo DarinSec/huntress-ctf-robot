@@ -16,7 +16,7 @@ import struct
 import zipfile
 import zlib
 
-from .containers import Member
+from .containers import ZIP_ERRORS, Member
 
 MAX_STREAMS = 200
 MAX_STREAM_BYTES = 4 * 1024 * 1024
@@ -233,7 +233,7 @@ _OFFICE_CUSTOM = re.compile(r"<property\b[^>]*\bname=\"([^\"]+)\"[^>]*>\s*<vt:[a
 def _office_and_zip(data: bytes, out: dict[str, list[str]]) -> None:
     try:
         archive = zipfile.ZipFile(BytesIO(data))
-    except (zipfile.BadZipFile, ValueError):
+    except ZIP_ERRORS:
         return
     with archive:
         if archive.comment:
@@ -245,8 +245,9 @@ def _office_and_zip(data: bytes, out: dict[str, list[str]]) -> None:
             try:
                 if archive.getinfo(name).flag_bits & 0x1:
                     continue
-                xml = archive.read(name)[:MAX_STREAM_BYTES].decode("utf-8", "replace")
-            except (KeyError, RuntimeError, zipfile.BadZipFile, zlib.error):
+                with archive.open(name) as stream:  # Only the part that is used is inflated.
+                    xml = stream.read(MAX_STREAM_BYTES).decode("utf-8", "replace")
+            except (KeyError, *ZIP_ERRORS):
                 continue
             pattern = _OFFICE_CUSTOM if prefix == "Office:custom" else _OFFICE_ELEMENT
             for key, value in pattern.findall(xml):

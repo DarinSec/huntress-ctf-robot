@@ -30,7 +30,7 @@ from typing import Any, Iterator
 from urllib.parse import urljoin, urlsplit
 
 from ..base import AnswerCandidate
-from . import HostNotAllowed, ScopedHttp
+from . import BudgetExhausted, HostNotAllowed, ScopedHttp
 from . import sessions
 
 try:  # handlers.py is third-party within the repo; a broken import must not kill discovery.
@@ -134,6 +134,11 @@ class _ScopedTransport:
     def _send(self, scheme: str, host: str, port: int, method: str, target: str,
               data: bytes | None, req_headers: dict[str, str],
               timeout: float) -> tuple[int, str, dict[str, str]]:
+        # Count this request against the per-target budget and clamp its own timeout to what
+        # is left, so one slow request near the end can never overrun the ceiling. A redirect
+        # hop is a fresh _send, so it is counted too; the stale-socket retry below is not.
+        if self._http.budget is not None:
+            timeout = min(timeout, self._http.budget.charge())
         last_exc: Exception | None = None
         for _ in range(2):  # one retry, but only when a pooled socket turns out stale
             conn, reused, key = self._connection(scheme, host, port, timeout)
@@ -237,8 +242,13 @@ class CurriculumWebSolver:
                         seen_before = len(transport.seen_cookies)
                         proof = None
                         chain = ()
+                        if context.http.budget is not None:
+                            context.http.budget.reset()  # A fresh allowance for each target.
                         try:
                             result = handlers.detect_and_solve(turl, day_int)
+                        except BudgetExhausted:
+                            # The prober spent this target's request/time budget: stop, no guess.
+                            result = None
                         except Exception:
                             # WebHandlerError, HostNotAllowed, transport errors: never guessed.
                             result = None
@@ -265,7 +275,7 @@ class CurriculumWebSolver:
                         AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
                                         evidence=evidence, chain=chain)
                     )
-        except Exception:
+        except (Exception, BudgetExhausted):  # BudgetExhausted is a BaseException; never escape.
             return []
         return candidates
 

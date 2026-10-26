@@ -450,12 +450,305 @@ def rail_fence(text: str, rails: int) -> str:
     """Undo a rail-fence (zigzag) transposition with `rails` rails."""
     if not 2 <= rails < len(text):
         return text
-    period = 2 * (rails - 1)
-    rail_of = [min(i % period, period - i % period) for i in range(len(text))]
-    order = sorted(range(len(text)), key=lambda i: (rail_of[i], i))
-    plain = [""] * len(text)
+    period, size = 2 * (rails - 1), len(text)
+    # Rail r holds positions r, P-r, P+r, 2P-r, ... (P = period): built per rail, no per-character sort.
+    order = list(range(0, size, period))
+    for rail in range(1, rails - 1):
+        order += sorted((*range(rail, size, period), *range(period - rail, size, period)))
+    order += range(rails - 1, size, period)
+    plain = [""] * size
     for char, position in zip(text, order):
         plain[position] = char
+    return "".join(plain)
+
+
+# --- Formats no warmup day has used yet (anticipated). Each is strict on its whole input and
+# must decode to printable text, so on an earlier day's blob it rejects at once or adds nothing.
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_BASE91 = ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+           "!#$%&()*+,./:;<=>?@[]^_`{|}~\"")
+_BASE45 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+_INDEX58, _INDEX62, _INDEX91, _INDEX45 = ({c: i for i, c in enumerate(a)} for a in (_BASE58, _BASE62, _BASE91, _BASE45))
+_BASE58_TEXT = re.compile(r"[1-9A-HJ-NP-Za-km-z]{6,4096}")
+_BASE62_TEXT = re.compile(r"(?=[^\d]*\d)(?=[^A-Z]*[A-Z])(?=[^a-z]*[a-z])[0-9A-Za-z]{8,4096}")
+_BASE91_TEXT = re.compile(r"[A-Za-z0-9!#$%&()*+,./:;<=>?@\[\]^_`{|}~\"]{8,}")
+_BASE45_TEXT = re.compile(r"[0-9A-Z $%*+\-./:]{3,}")
+MAX_BF_STEPS = 2_000_000
+
+
+def _big_base(text: str, index: dict[str, int], radix: int, zero: str) -> bytes:
+    value = 0
+    for char in text:
+        value = value * radix + index[char]
+    body = value.to_bytes((value.bit_length() + 7) // 8, "big") if value else b""
+    return b"\0" * (len(text) - len(text.lstrip(zero))) + body
+
+
+def _texty(decoded: bytes) -> bytes | None:
+    return decoded if decoded and raw_text(decoded) is not None else None
+
+
+def base58(data: bytes) -> bytes | None:
+    """Bitcoin Base58 (no 0, O, I, l): a big number, leading "1"s are zero bytes."""
+    text = as_text(data)
+    if text is None or not _BASE58_TEXT.fullmatch(text):
+        return None
+    return _texty(_big_base(text, _INDEX58, 58, "1"))
+
+
+def base62(data: bytes) -> bytes | None:
+    """Base62 (0-9A-Za-z), as a big number; needs digits and both cases, unlike a plain word."""
+    text = as_text(data)
+    if text is None or not _BASE62_TEXT.fullmatch(text):
+        return None
+    return _texty(_big_base(text, _INDEX62, 62, "0"))
+
+
+def base91(data: bytes) -> bytes | None:
+    """basE91 (Joachim Henke's reference decoder)."""
+    text = as_text(data)
+    if text is None or not _BASE91_TEXT.fullmatch(text):
+        return None
+    out, value, bits, count = bytearray(), -1, 0, 0
+    for char in text:
+        digit = _INDEX91[char]
+        if value < 0:
+            value = digit
+            continue
+        value += digit * 91
+        bits |= value << count
+        count += 13 if (value & 8191) > 88 else 14
+        while True:
+            out.append(bits & 255)
+            bits >>= 8
+            count -= 8
+            if count <= 7:
+                break
+        value = -1
+    if value >= 0:
+        out.append((bits | value << count) & 255)
+    return _texty(bytes(out))
+
+
+def base45(data: bytes) -> bytes | None:
+    """RFC 9285 Base45 (QR-code friendly): three characters per two bytes."""
+    text = as_text(data)
+    if text is None or len(text) % 3 == 1 or not _BASE45_TEXT.fullmatch(text):
+        return None
+    out = bytearray()
+    for i in range(0, len(text), 3):
+        chunk = [_INDEX45[c] for c in text[i:i + 3]]
+        value = sum(d * 45 ** n for n, d in enumerate(chunk))
+        if len(chunk) == 3:
+            if value > 0xFFFF:
+                return None
+            out += value.to_bytes(2, "big")
+        elif value > 0xFF:
+            return None
+        else:
+            out.append(value)
+    return _texty(bytes(out))
+
+
+def base100(data: bytes) -> bytes | None:
+    """base100 (emoji): every byte b is the code point U+1F3F7 + b."""
+    text = as_text(data)
+    if text is None:
+        return None
+    compact = "".join(text.split())
+    if len(compact) < 2 or not all(0x1F3F7 <= ord(c) <= 0x1F4F6 for c in compact):
+        return None
+    return _texty(bytes(ord(c) - 0x1F3F7 for c in compact))
+
+
+_OOK = {("Ook.", "Ook?"): ">", ("Ook?", "Ook."): "<", ("Ook.", "Ook."): "+", ("Ook!", "Ook!"): "-",
+        ("Ook!", "Ook."): ".", ("Ook.", "Ook!"): ",", ("Ook!", "Ook?"): "[", ("Ook?", "Ook!"): "]"}
+
+
+def brainfuck(data: bytes) -> bytes | None:
+    """What a Brainfuck (or Ook!) program prints, run with a step cap and no input."""
+    text = as_text(data)
+    if text is None:
+        return None
+    if text.startswith("Ook"):
+        words = text.split()
+        if len(words) % 2 or not all(pair in _OOK for pair in zip(words[::2], words[1::2])):
+            return None
+        text = "".join(_OOK[pair] for pair in zip(words[::2], words[1::2]))
+    program = "".join(text.split())
+    if "." not in program or program.strip("+-<>[].") or "," in program:
+        return None
+    jumps, stack = {}, []
+    for at, op in enumerate(program):
+        if op == "[":
+            stack.append(at)
+        elif op == "]":
+            if not stack:
+                return None
+            start = stack.pop()
+            jumps[start], jumps[at] = at, start
+    if stack:
+        return None
+    tape, cell, pc, out = bytearray(30000), 0, 0, bytearray()
+    for _ in range(MAX_BF_STEPS):
+        if pc >= len(program):
+            return _texty(bytes(out))
+        op = program[pc]
+        if op == "+":
+            tape[cell] = (tape[cell] + 1) & 255
+        elif op == "-":
+            tape[cell] = (tape[cell] - 1) & 255
+        elif op == ">":
+            cell += 1
+            if cell >= len(tape):
+                return None
+        elif op == "<":
+            cell -= 1
+            if cell < 0:
+                return None
+        elif op == ".":
+            out.append(tape[cell])
+        elif op == "[" and not tape[cell]:
+            pc = jumps[pc]
+        elif op == "]" and tape[cell]:
+            pc = jumps[pc]
+        pc += 1
+    return None
+
+
+# --- Keyed letter ciphers, broken with the warmup sentence as a crib ----------------------------
+# Every warmup states "Nice work decoding this warmup! To solve, submit this exact answer to the
+# Game Master: <slug>". These ciphers keep word boundaries, so the ciphertext's word-length
+# pattern places the crib; the key then follows from the aligned letters, no key search.
+
+CRIB = "nice work decoding this warmup to solve submit this exact answer to the game master".split()
+_CRIB_PATTERNS = ("".join(chr(len(w)) for w in CRIB), "".join(chr(len(w)) for w in CRIB[7:]))
+_WORD = re.compile(r"[A-Za-z]+")
+
+
+@lru_cache(maxsize=8)
+def _aligned(text: str) -> tuple[list[int], dict[int, int]] | None:
+    """(cipher letters 0-25 in order, {letter index: crib plain letter}) or None."""
+    if text.count(" ") < 7 or len(text) > MAX_WEAK_TEXT:
+        return None
+    words = [(m.start(), m.group()) for m in _WORD.finditer(text)]
+    shape = "".join(chr(min(len(w), 0x10FFFF)) for _, w in words)
+    for pattern, crib in zip(_CRIB_PATTERNS, (CRIB, CRIB[7:])):
+        at = shape.find(pattern)
+        if at >= 0:
+            break
+    else:
+        return None
+    letters = [ord(c.lower()) - 97 for _, w in words for c in w]
+    first = sum(len(w) for _, w in words[:at])
+    plain = [ord(c) - 97 for c in "".join(crib)]
+    return letters, {first + i: p for i, p in enumerate(plain)}
+
+
+def _render(text: str, plain: list[int | None]) -> str:
+    """The text with its letters replaced by `plain` (case kept); "" if a letter is unknown."""
+    if any(p is None for p in plain):
+        return ""
+    stream = iter(plain)
+    out = _WORD.sub(lambda m: "".join(chr(next(stream) + (65 if c.isupper() else 97)) for c in m.group()), text)
+    return "" if out == text else out
+
+
+def _periodic(stream: dict[int, int]) -> list[int] | None:
+    for period in range(1, 21):
+        key: dict[int, int] = {}
+        if all(key.setdefault(i % period, k) == k for i, k in stream.items()) and len(key) == period:
+            return [key[i] for i in range(period)]
+    return None
+
+
+def vigenere(text: str) -> str:
+    found = _aligned(text)
+    if not found:
+        return ""
+    letters, crib = found
+    key = _periodic({i: (letters[i] - p) % 26 for i, p in crib.items()})
+    if not key:
+        return ""
+    return _render(text, [(c - key[i % len(key)]) % 26 for i, c in enumerate(letters)])
+
+
+def beaufort(text: str) -> str:
+    found = _aligned(text)
+    if not found:
+        return ""
+    letters, crib = found
+    key = _periodic({i: (letters[i] + p) % 26 for i, p in crib.items()})
+    if not key or len(key) == 1 and key[0] == 25:  # Beaufort with key "z" is Atbash: WEAK_STEPS has it.
+        return ""
+    return _render(text, [(key[i % len(key)] - c) % 26 for i, c in enumerate(letters)])
+
+
+def autokey(text: str) -> str:
+    """Plaintext autokey: c[i] = p[i] + (key[i] if i < len(key) else p[i - len(key)])."""
+    found = _aligned(text)
+    if not found:
+        return ""
+    letters, crib = found
+    for period in range(1, 17):
+        checks = [i for i in crib if i - period in crib]
+        if len(checks) < 12 or any((letters[i] - crib[i]) % 26 != crib[i - period] for i in checks):
+            continue
+        plain: list[int | None] = [None] * len(letters)
+        for i, p in crib.items():
+            plain[i] = p
+        for i in range(len(letters) - 1, period - 1, -1):  # backwards: p[i - P] = c[i] - p[i]
+            if plain[i] is not None and plain[i - period] is None:
+                plain[i - period] = (letters[i] - plain[i]) % 26
+        for i in range(period, len(letters)):              # forwards: p[i] = c[i] - p[i - P]
+            if plain[i] is None and plain[i - period] is not None:
+                plain[i] = (letters[i] - plain[i - period]) % 26
+        return _render(text, plain)
+    return ""
+
+
+def affine(text: str) -> str:
+    """c = a*p + b (mod 26); Caesar (a = 1) and Atbash (a = b = 25) have steps of their own."""
+    found = _aligned(text)
+    if not found:
+        return ""
+    letters, crib = found
+    pairs = {(letters[i], p) for i, p in crib.items()}
+    for a in (3, 5, 7, 9, 11, 15, 17, 19, 21, 23, 25):
+        c0, p0 = next(iter(pairs))
+        b = (c0 - a * p0) % 26
+        if (a, b) != (25, 25) and all((a * p + b) % 26 == c for c, p in pairs):
+            inverse = pow(a, -1, 26)
+            return _render(text, [(inverse * (c - b)) % 26 for c in letters])
+    return ""
+
+
+def substitution(text: str) -> str:
+    """A keyed alphabet: the crib maps 21 letters; only a text using no other letter decodes."""
+    found = _aligned(text)
+    if not found:
+        return ""
+    letters, crib = found
+    table: dict[int, int] = {}
+    for i, p in crib.items():
+        if table.setdefault(letters[i], p) != p:
+            return ""
+    if len(set(table.values())) != len(table):
+        return ""
+    return _render(text, [table.get(c) for c in letters])
+
+
+def scytale(text: str, columns: int) -> str:
+    """Undo a columnar transposition with the columns in order (scytale): read back row-wise."""
+    if not 2 <= columns < len(text):
+        return ""
+    sizes = [len(range(c, len(text), columns)) for c in range(columns)]
+    plain, at = [""] * len(text), 0
+    for c, size in enumerate(sizes):
+        plain[c::columns] = text[at:at + size]
+        at += size
     return "".join(plain)
 
 
@@ -469,7 +762,12 @@ LAYERS = (
     ("ascii85", ascii85), ("base85", base85), ("qp", quoted_printable), ("uu", uuencoded),
     ("zlib", inflated), ("braille", braille), ("nato", nato), ("unicode", codepoints),
     ("runlength", runlength),  # Day 24: "1:N,1:i,1:c,1:e" -> "Nice".
+    # Anticipated (no day yet): strict, text-only results, last so known chains come first.
+    ("base58", base58), ("base62", base62), ("base91", base91), ("base45", base45),
+    ("base100", base100), ("brainfuck", brainfuck),
 )
+# The anticipated layers above, kept out of guessed two-step chains (warmups._guess_fragment).
+ANTICIPATED = frozenset({"base58", "base62", "base91", "base45", "base100", "brainfuck"})
 # Letter rotations apply to any text, so they are tried only as a last step.
 FINAL_STEPS = (("rot13", rot13), ("rot47", rot47))
 # Weaker text ciphers turn any text into other text, so they are tried as a last step
@@ -478,6 +776,11 @@ WEAK_STEPS = (
     ("reverse", reverse), ("atbash", atbash),
     *((f"caesar{shift}", lambda text, table=table: text.translate(table)) for shift, table in _CAESAR.items()),
     *((f"railfence{rails}", lambda text, rails=rails: rail_fence(text, rails)) for rails in range(2, 9)),
+    # Anticipated: keyed ciphers broken with the warmup crib ("" when it does not fit), and the
+    # plain columnar transposition. Each derives its key from the text, so a proven chain replays.
+    ("vigenere", vigenere), ("beaufort", beaufort), ("autokey", autokey), ("affine", affine),
+    ("substitution", substitution),
+    *((f"scytale{columns}", lambda text, columns=columns: scytale(text, columns)) for columns in range(2, 13)),
 )
 MAX_WEAK_TEXT = 16 * 1024
 
@@ -522,6 +825,8 @@ def _run_chain(data: bytes, chain: tuple[str, ...], keep_edges: bool) -> str | N
             if text is None:
                 return None
             value = step(text)
+            if not value:  # A keyed step that does not fit (a crib-less fragment): no piece, not "".
+                return None
         else:
             raw = value.encode() if isinstance(value, str) else value
             value = step(raw)

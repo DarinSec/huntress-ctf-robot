@@ -22,7 +22,7 @@ from itertools import product
 from pathlib import PurePosixPath
 import re
 
-from ..decoders import LAYERS, decode_fragment, extract_answer, peel
+from ..decoders import ANTICIPATED, LAYERS, decode_fragment, extract_answer, peel
 from .base import AnswerCandidate, MAX_TEXT_BYTES, Question, SolveContext, fits_format, question_items
 
 CURRICULUM: dict[int, tuple[str, ...]] = {
@@ -34,6 +34,8 @@ CURRICULUM: dict[int, tuple[str, ...]] = {
 _LINE = re.compile(r"(\d{1,3})\t(.*)")
 _SINGLE_ID = re.compile(r"warmups-day-(\d{1,2})(?:/time_trial)?")
 _STRICT = tuple(name for name, _ in LAYERS)
+# Formats no day has used yet are guessed alone, not paired: 26 layers paired would double the cost.
+_PAIRED = tuple(name for name in _STRICT if name not in ANTICIPATED)
 
 
 def curriculum() -> dict[int, tuple[str, ...]]:
@@ -55,7 +57,7 @@ def _guess_fragment(payload: str) -> str | None:
     Text ciphers (ROT, Atbash, reversal) fit any text, so they are never guessed here.
     """
     found = {
-        piece for chain in (*((name,) for name in _STRICT), *product(_STRICT, repeat=2))
+        piece for chain in (*((name,) for name in _STRICT), *product(_PAIRED, repeat=2))
         if (piece := decode_fragment(payload, chain)) is not None
     }
     return found.pop() if len(found) == 1 else None

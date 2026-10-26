@@ -182,6 +182,20 @@ class BinaryFormatTests(unittest.TestCase):
         self.assertEqual(solve(b"MZ", "Determine pe.resource_count for sample."), {})
         self.assertEqual(solve(bytes(data), "Determine pe.unknown_property for sample."), {})
 
+    def test_unknown_property_falls_back_like_autoprop(self):
+        timed = {"run_for_time": True, "deadline": "2026-10-26T13:01:00Z"}
+        q = "Determine pe.time_date_stamp_utc for sample."
+        self.assertEqual(solve(pe_fixture(), q), {"0": "1970-01-01T00:00:00Z"})
+        self.assertEqual(solve(pe_fixture(), q, attempt=timed), {})  # Never guessed on the clock.
+        with patch("huntress_ctf.solvers.autoprop.confirmed_mappings",
+                        return_value={"pe.time_date_stamp_utc": ("pe", "time_date_stamp_utc")}):
+            self.assertEqual(solve(pe_fixture(), q, attempt=timed), {"0": "1970-01-01T00:00:00Z"})
+        found = BinarySolver().solve(context(pe_fixture(), [q]))
+        self.assertEqual(found[0].chain, ("autoprop", "pe.time_date_stamp_utc=pe:time_date_stamp_utc"))
+        pyc = b"\xcb\r\r\n" + bytes(12) + b"\xe3" + bytes(40)  # No image: only formats.py reads it.
+        self.assertEqual(solve(pyc, "Determine pyc.magic_number for sample."), {"0": "3531"})
+        self.assertEqual(solve(b"MZ" + bytes(62), "Determine pe.time_date_stamp_utc for sample."), {})
+
     def test_elf_32_64_both_byte_orders(self):
         for bits in (32, 64):
             for endian in ("<", ">"):

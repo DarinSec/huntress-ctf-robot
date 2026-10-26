@@ -152,7 +152,68 @@ TRANSFORMS = {
     "reverse_then_xor": lambda d, ks: [_xor1(d[::-1], k) for k in _one(ks, d[::-1], lambda f, s: f ^ s)],
     "xor_then_reverse": lambda d, ks: [_xor1(d, k)[::-1] for k in _one(ks, d[::-1], lambda f, s: f ^ s)],
     "reverse_xor": lambda d, ks: [_xor1(d[::-1], k) for k in _one(ks, d[::-1], lambda f, s: f ^ s)],
+    # Not seen yet (anticipated): real loaders' RC4/AES with the key the script carries. Their
+    # `ks` are (key, iv) pairs from harvest_secrets(), never the XOR key lists; with no secret
+    # in the script they return nothing at once, so the search costs what it did before.
+    "rc4": lambda d, ks: _crypto("rc4", d, ks),
+    "aes_cbc": lambda d, ks: _crypto("aes_cbc", d, ks),
+    "aes_ecb": lambda d, ks: _crypto("aes_ecb", d, ks),
+    "aes_ctr": lambda d, ks: _crypto("aes_ctr", d, ks),
+    "aes_gcm": lambda d, ks: _crypto("aes_gcm", d, ks),
 }
+CRYPTO = frozenset({"rc4", "aes_cbc", "aes_ecb", "aes_ctr", "aes_gcm"})
+
+
+def _starts_record(head):
+    return bool(PROBE_RE.match(head[:8]))
+
+
+def _crypto(name, d, pairs):
+    """Plaintexts of `d` under each (key, iv) pair. A block or keystream probe of the first bytes
+    rejects a wrong key before the whole payload is decrypted. IVs tried: the declared one, the
+    first 16 (GCM: 12) bytes of the data (the common iv||ciphertext layout), then zeros."""
+    if not pairs:
+        return []
+    from .. import ciphers  # Lazy: the S-box tables are built only when a script names a key.
+
+    out = []
+    for key, iv in pairs:
+        try:
+            if name == "rc4":
+                if _starts_record(ciphers.rc4(key, d[:8])):
+                    out.append(ciphers.rc4(key, d))
+                continue
+            if len(key) not in (16, 24, 32):
+                continue
+            if name == "aes_ecb":
+                if len(d) % 16 == 0 and d and _starts_record(ciphers.ecb_decrypt(key, d[:16])):
+                    out.append(_unpadded(ciphers.ecb_decrypt(key, d)))
+                continue
+            layouts = [(iv, d)] if iv else []
+            prefix = 12 if name == "aes_gcm" else 16
+            layouts += [(d[:prefix], d[prefix:])] + ([] if iv or name == "aes_gcm" else [(bytes(16), d)])
+            for vector, body in layouts:
+                if name == "aes_cbc" and len(vector) == 16 and body and len(body) % 16 == 0:
+                    if _starts_record(ciphers.cbc_decrypt(key, vector, body[:16])):
+                        out.append(_unpadded(ciphers.cbc_decrypt(key, vector, body)))
+                elif name == "aes_ctr" and len(vector) == 16 and body:
+                    if _starts_record(ciphers.ctr(key, vector, body[:16])):
+                        out.append(ciphers.ctr(key, vector, body))
+                elif name == "aes_gcm" and len(vector) == 12 and len(body) > 16:
+                    if _starts_record(ciphers.gcm_decrypt(key, vector, body[:16] + bytes(16))):
+                        out.append(ciphers.gcm_decrypt(key, vector, body))
+        except ValueError:
+            continue
+    return out
+
+
+def _unpadded(plain):
+    from .. import ciphers
+
+    try:
+        return ciphers.unpad(plain)
+    except ValueError:
+        return plain.rstrip(b"\0")  # NoPadding with zero fill
 
 
 def _one(keys, d, op):
@@ -169,6 +230,11 @@ def _transform_for(step):
     m = re.fullmatch(r"(add|sub|subtract)_(\d+)", step)
     if m:
         return ("add_modulo_256" if m.group(1) == "add" else "subtract_modulo_256"), [int(m.group(2))]
+    if step in ("arc4", "arcfour", "rc4_stream"):
+        return "rc4", None
+    m = re.fullmatch(r"aes(?:[_-]?(?:128|192|256))?(?:[_-](cbc|ecb|ctr|gcm))?", step)
+    if m:
+        return f"aes_{m.group(1) or 'cbc'}", None
     return step, None
 
 
@@ -191,6 +257,88 @@ def harvest_keys(text):
         if v < 256 and [v] not in keys:
             keys.append([v])
     return keys
+
+
+# RC4/AES secrets: `$key = "..."`, `key = b'...'`, `Encoding.UTF8.GetBytes("...")`, `iv = [..]`.
+SECRET_STRING = re.compile(r"""(?i)\b(\w*(?:key|secret|passw|passphrase|iv|nonce)\w*)\s*[:=]\s*[^"'\r\n;=]{0,60}?["']([^"'\r\n]{1,64})["']""")
+_KEY_NAME = re.compile(r"(?i)key|secret|pass")
+IV_ARRAY = re.compile(r"(?i)\b\w*(?:iv|nonce)\w*\s*[:=]\s*(?:new\s+\w+\s*)?[\[\(\{]\s*((?:(?:0x[0-9a-f]+|\d{1,3})\s*,\s*){7,15}(?:0x[0-9a-f]+|\d{1,3}))\s*,?\s*[\]\)\}]")
+MAX_SECRETS = 4
+
+
+def _spellings(value):
+    """The bytes a string key may stand for: itself, and the hex/Base64 it may spell."""
+    out = [value.encode("utf-8")]
+    if re.fullmatch(r"(?:[0-9a-fA-F]{2}){8,32}", value):
+        out.append(bytes.fromhex(value))
+    elif re.fullmatch(r"[A-Za-z0-9+/]{22,44}={0,2}", value) and len(value) % 4 == 0:
+        try:
+            out.append(base64.b64decode(value, validate=True))
+        except (ValueError, binascii.Error):
+            pass
+    return out
+
+
+_KEY_WORDS = ("key", "secret", "passw", "passphrase")  # not "pass": loop counters
+_SECRET_WORDS = _KEY_WORDS + ("iv", "nonce")
+
+
+def _windows(text, low):
+    """Text around each secret word: the regexes run on these few hundred bytes, not the script."""
+    spans, at = [], 0
+    for word in _SECRET_WORDS:
+        at = low.find(word)
+        while at >= 0 and len(spans) < 32:
+            near = low[at:at + 40]
+            if "=" in near or ":" in near:   # an assignment, not a word inside Base32 or prose
+                spans.append((max(0, at - 48), at + 400))
+            at = low.find(word, at + len(word))
+    spans.sort()
+    merged = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return [text[a:b] for a, b in merged]
+
+
+def harvest_secrets(text, loose=False):
+    """(key, iv-or-None) pairs for the RC4/AES transforms, from keys and IVs the script declares.
+    Only these transforms see them, so the XOR searches keep their old key lists and cost.
+    `loose` (the script declares an RC4/AES codec): any 16/24/32-byte array may be the key."""
+    low = text.lower()
+    if not loose and not any(word in low for word in _KEY_WORDS):
+        return []                            # No key named: nothing to decrypt with (~2 us per script).
+    windows = _windows(text, low)
+    if not loose and not any(word in window.lower() for window in windows for word in _KEY_WORDS):
+        return []
+    keys, ivs = [], []
+    for window in windows:
+        for m in SECRET_STRING.finditer(window):
+            bucket = keys if _KEY_NAME.search(m.group(1)) else ivs  # private_key is a key, not an IV
+            for value in _spellings(m.group(2)):
+                if value not in bucket:
+                    bucket.append(value)
+        for rx, bucket in ((KEY_ARRAY, keys), (IV_ARRAY, ivs)):
+            for m in rx.finditer(window):
+                try:
+                    value = _ints(m.group(1))
+                except ValueError:
+                    continue
+                if value not in bucket:
+                    bucket.append(value)
+    if loose:
+        for m in INT_ARRAY.finditer(text):
+            try:
+                value = _ints(m.group(1))
+            except ValueError:
+                continue
+            for bucket, sizes in ((keys, (16, 24, 32)), (ivs, (12, 16))):
+                if len(value) in sizes and value not in bucket:
+                    bucket.append(value)
+    keys, ivs = keys[:MAX_SECRETS], [v for v in ivs if len(v) in (12, 16)][:MAX_SECRETS]
+    return [(k, v) for k in keys for v in ivs] + [(k, None) for k in keys]
 
 
 def parse_key(text):
@@ -340,6 +488,15 @@ def recover(text):
         name, key = _transform_for(step)
         key = key or parse_key(parts[2] if len(parts) > 2 else "")
         plans.append((d, fmt, name, key))
+    secrets = None                           # harvested once, only if a crypto transform runs
+
+    def keys_for(t, keys):
+        nonlocal secrets
+        if t not in CRYPTO:
+            return keys
+        if secrets is None:
+            secrets = harvest_secrets(text, loose=any(plan[2] in CRYPTO for plan in plans))
+        return list(dict.fromkeys([(bytes(k), None) for k in keys if len(k) > 1] + secrets))
     # Fast pass: declared codec only, cheap material candidates (no concat runs, no brute force).
     for decl, fmt, tname, key in plans:
         if tname not in TRANSFORMS:
@@ -350,23 +507,38 @@ def recover(text):
                     break                    # only the declared format in the fast pass
                 if is_record(data):
                     return _result(decl, flabel, "identity", None, mat, data)
-                for plain in TRANSFORMS[tname](data, [key] if key else []):
+                ks = keys_for(tname, [key] if key else [])
+                for plain in TRANSFORMS[tname](data, ks):
                     if is_record(plain):
-                        return _result(decl, flabel, tname, _used_key(tname, data, plain, [key] if key else []), mat, plain)
+                        return _result(decl, flabel, tname, _used_key(tname, data, plain, ks), mat, plain)
     harvested = harvest_keys(text)
     plans.append((None, None, None, None))  # undeclared search as the fallback
     mats = materials(text)
+    plain_transforms = [t for t in TRANSFORMS if t not in CRYPTO]
     for decl, fmt, tname, key in plans:
         keys = ([key] if key else []) + harvested
-        tnames = [tname] if tname in TRANSFORMS else list(TRANSFORMS)
+        tnames = [tname] if tname in TRANSFORMS else plain_transforms
         for mat in mats:
             for flabel, data in _candidates(mat, fmt):
                 if is_record(data):
                     return _result(decl, flabel, "identity", None, mat, data)
                 for t in tnames:
-                    for plain in _probed(t, data, keys):
+                    ks = keys_for(t, keys) if t in CRYPTO else keys
+                    for plain in _probed(t, data, ks):
                         if is_record(plain):
-                            return _result(decl, flabel, t, _used_key(t, data, plain, keys), mat, plain)
+                            return _result(decl, flabel, t, _used_key(t, data, plain, ks), mat, plain)
+    # Last: RC4/AES with the script's own key, only when it names one. Ciphertext is carried
+    # encoded (hex, Base64, byte arrays), so plain-text and reversed candidates are skipped.
+    pairs = keys_for("rc4", harvested)
+    if pairs:
+        for mat in mats:
+            for flabel, data in _candidates(mat):
+                if flabel == "text" or flabel.endswith("+reversed"):
+                    continue
+                for t in sorted(CRYPTO):
+                    for plain in TRANSFORMS[t](data, pairs):
+                        if is_record(plain):
+                            return _result(None, flabel, t, _used_key(t, data, plain, pairs), mat, plain)
     return None
 
 
@@ -395,6 +567,8 @@ def _probed(t, data, keys):
 def _used_key(t, data, plain, keys):
     if t in ("identity", "reverse", "reverse_bytes", "rotate_left", "rotate_right"):
         return None
+    if t in CRYPTO:
+        return next((list(k) for k, iv in keys if plain in _crypto(t, data, [(k, iv)])), None)
     if t == "repeating_key_xor":
         return next((k for k in keys if len(k) > 1 and (data[0] ^ k[0]) == plain[0]), None)
     src = data[::-1] if t in ("reverse_then_xor", "reverse_xor", "xor_then_reverse") else data

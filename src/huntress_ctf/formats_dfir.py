@@ -21,7 +21,7 @@ def _guarded(parse: Callable[[bytes, dict], None], data: bytes) -> dict:
     fields: dict = {}
     try:
         parse(data, fields)
-    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError) as exc:
+    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError, OverflowError) as exc:
         fields["damaged"] = f"{type(exc).__name__} while reading"
     return fields
 
@@ -33,7 +33,10 @@ def _utf16(blob: bytes) -> str:
 def _filetime(value: int) -> str | None:
     if not value or value >= 0x7FFFFFFFFFFFFFFF:
         return None
-    moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value // 10)
+    try:
+        moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value // 10)
+    except OverflowError:  # Past the year 9999: a damaged field, not a time.
+        return None
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -408,7 +411,10 @@ def _property_set(stream: bytes) -> dict:
         if kind == 0x1E:
             length = struct.unpack_from("<I", stream, body)[0]
             raw = stream[body + 4:body + 4 + length].split(b"\0", 1)[0]
-            out[name] = raw.decode("utf-8" if codepage == 65001 else f"cp{codepage}", "replace")
+            try:
+                out[name] = raw.decode("utf-8" if codepage == 65001 else f"cp{codepage}", "replace")
+            except LookupError:  # A code page Python has no codec for (cp1200, a damaged field): no value.
+                continue
         elif kind == 0x03:
             out[name] = struct.unpack_from("<i", stream, body)[0]
         elif kind == 0x40:
@@ -433,6 +439,528 @@ def _ole(data: bytes, f: dict) -> None:
                     and "Document" not in name), None)
     if summary:
         f.update(_property_set(summary))
+    destlist = next((blob for name, blob in streams.items() if _msi_name(name) == "DestList"), None)
+    if destlist:  # An automaticDestinations-ms Jump List: DestList plus one LNK stream per entry.
+        from .formats import _guarded as guarded, _lnk
+
+        f["document_type"] = "jump_list"
+        try:
+            f.update(_destlist(destlist))
+        except (struct.error, UnicodeDecodeError, ValueError):
+            f["destlist_damaged"] = True
+        links = [guarded(_lnk, blob) for name, blob in sorted(streams.items(), key=lambda item: _msi_name(item[0]))
+                 if blob[:4] == b"L\0\0\0"]
+        f.update(lnk_count=len(links), target_paths=[l["target_path"] for l in links if l.get("target_path")])
+
+
+# --- Days 26+ candidates: NTFS, USN journal, Recycle Bin, Jump Lists, dumps, tasks, images, certs ---
+
+def _unix(value: int) -> str | None:
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _fixups(record: bytes) -> bytes:
+    """An NTFS multi-sector record with its update sequence array applied (sector ends restored)."""
+    usa_offset, usa_count = struct.unpack_from("<HH", record, 4)
+    if not usa_count or usa_offset + 2 * usa_count > len(record):
+        return record
+    fixed = bytearray(record)
+    check = record[usa_offset:usa_offset + 2]
+    for index in range(1, usa_count):
+        end = index * 512 - 2
+        if end + 2 > len(fixed) or fixed[end:end + 2] != check:
+            raise ValueError("NTFS fixup mismatch")
+        fixed[end:end + 2] = record[usa_offset + 2 * index:usa_offset + 2 * index + 2]
+    return bytes(fixed)
+
+
+FILE_NAME_SPACES = {0: "posix", 1: "win32", 2: "dos", 3: "win32_and_dos"}
+ATTRIBUTE_NAMES = {0x10: "$STANDARD_INFORMATION", 0x20: "$ATTRIBUTE_LIST", 0x30: "$FILE_NAME", 0x40: "$OBJECT_ID",
+                   0x50: "$SECURITY_DESCRIPTOR", 0x60: "$VOLUME_NAME", 0x70: "$VOLUME_INFORMATION", 0x80: "$DATA",
+                   0x90: "$INDEX_ROOT", 0xA0: "$INDEX_ALLOCATION", 0xB0: "$BITMAP", 0xC0: "$REPARSE_POINT",
+                   0x100: "$LOGGED_UTILITY_STREAM"}
+
+
+def _mft(data: bytes, f: dict) -> None:
+    size = struct.unpack_from("<I", data, 28)[0] or 1024
+    if not 256 <= size <= 65536:
+        raise ValueError("MFT record size")
+    record = _fixups(data[:size])
+    lsn, sequence, links, first, flags, used, allocated, base, next_id = struct.unpack_from("<QHHHHIIQH", record, 8)
+    f.update(signature=record[:4].decode("ascii"), logfile_sequence_number=lsn, sequence_number=sequence,
+             hard_link_count=links, flags=flags, in_use=bool(flags & 1), is_directory=bool(flags & 2),
+             used_size=used, allocated_size=allocated, record_size=size, base_record_number=base & 0xFFFFFFFFFFFF,
+             next_attribute_id=next_id)
+    if first >= 0x30:
+        f["record_number"] = struct.unpack_from("<I", record, 44)[0]
+    at, types, names, streams = first, [], [], []
+    while at + 16 <= min(used or size, size) and len(types) < 64:
+        kind, length = struct.unpack_from("<II", record, at)
+        if kind == 0xFFFFFFFF or length < 16:
+            break
+        resident = record[at + 8] == 0
+        name_length, name_offset = record[at + 9], struct.unpack_from("<H", record, at + 10)[0]
+        attr_name = record[at + name_offset:at + name_offset + 2 * name_length].decode("utf-16-le", "replace")
+        types.append(ATTRIBUTE_NAMES.get(kind, f"0x{kind:x}"))
+        body = record[at + struct.unpack_from("<H", record, at + 20)[0]:] if resident else b""
+        if kind == 0x10 and resident:
+            created, modified, changed, accessed, attributes = struct.unpack_from("<QQQQI", body, 0)
+            f.update(si_created=_filetime(created), si_modified=_filetime(modified),
+                     si_mft_modified=_filetime(changed), si_accessed=_filetime(accessed), file_attributes=attributes)
+        elif kind == 0x30 and resident:
+            parent, created, modified, changed, accessed, alloc, real = struct.unpack_from("<QQQQQQQ", body, 0)
+            name = body[66:66 + 2 * body[64]].decode("utf-16-le", "replace")
+            names.append((body[65] == 2, name, parent, created, modified, changed, accessed, real))
+        elif kind == 0x80:
+            real = struct.unpack_from("<I", record, at + 16)[0] if resident else struct.unpack_from("<Q", record, at + 48)[0]
+            if attr_name:
+                streams.append(attr_name)
+            else:
+                f["data_size"] = real
+                f["data_resident"] = resident
+        at += length
+    f.update(attribute_types=types, alternate_data_streams=streams, has_alternate_data_stream=bool(streams))
+    if names:
+        names.sort()  # A Win32 name before its DOS 8.3 alias.
+        _, name, parent, created, modified, changed, accessed, real = names[0]
+        f.update(file_name=name, file_names=[n[1] for n in names], parent_record_number=parent & 0xFFFFFFFFFFFF,
+                 parent_sequence_number=parent >> 48, fn_created=_filetime(created), fn_modified=_filetime(modified),
+                 fn_mft_modified=_filetime(changed), fn_accessed=_filetime(accessed), fn_real_size=real)
+        if f.get("si_created") and f.get("fn_created"):
+            f["si_before_fn_created"] = f["si_created"] < f["fn_created"]  # A classic timestomp sign.
+    count = len(data) // size
+    if count > 1:
+        f.update(record_count=count, in_use_record_count=sum(
+            1 for i in range(min(count, 1 << 20)) if data[i * size:i * size + 4] == b"FILE" and data[i * size + 22] & 1))
+
+
+USN_REASONS = ((0x1, "DATA_OVERWRITE"), (0x2, "DATA_EXTEND"), (0x4, "DATA_TRUNCATION"),
+               (0x10, "NAMED_DATA_OVERWRITE"), (0x20, "NAMED_DATA_EXTEND"), (0x40, "NAMED_DATA_TRUNCATION"),
+               (0x100, "FILE_CREATE"), (0x200, "FILE_DELETE"), (0x400, "EA_CHANGE"), (0x800, "SECURITY_CHANGE"),
+               (0x1000, "RENAME_OLD_NAME"), (0x2000, "RENAME_NEW_NAME"), (0x4000, "INDEXABLE_CHANGE"),
+               (0x8000, "BASIC_INFO_CHANGE"), (0x10000, "HARD_LINK_CHANGE"), (0x20000, "COMPRESSION_CHANGE"),
+               (0x40000, "ENCRYPTION_CHANGE"), (0x80000, "OBJECT_ID_CHANGE"), (0x100000, "REPARSE_POINT_CHANGE"),
+               (0x200000, "STREAM_CHANGE"), (0x80000000, "CLOSE"))
+
+
+_NONZERO = re.compile(rb"[^\0]")
+
+
+def _usn_start(data: bytes) -> int | None:
+    """Offset of the first USN_RECORD_V2/V3 ($J starts with sparse zeros), or None."""
+    first = _NONZERO.search(data, 0, 1 << 24)  # No copy of the data, unlike lstrip().
+    if first is None:
+        return None
+    at = first.start() - first.start() % 8
+    if at + 60 > len(data):
+        return None
+    length, major, minor = struct.unpack_from("<IHH", data, at)
+    name_offset = struct.unpack_from("<H", data, at + (58 if major == 2 else 74))[0] if major in (2, 3) else 0
+    if 60 <= length <= 0x10000 and length % 8 == 0 and minor == 0 and name_offset == (60 if major == 2 else 76):
+        return at
+    return None
+
+
+def _usn(data: bytes, f: dict) -> None:
+    at = _usn_start(data)
+    if at is None:
+        raise ValueError("no USN record")
+    records, names, reasons, usns, stamps, deleted, created = 0, [], 0, [], [], [], []
+    while at + 60 <= len(data) and records < 1_000_000:
+        length, major = struct.unpack_from("<IH", data, at)
+        if length == 0:  # Zero padding up to the next record.
+            nxt = _NONZERO.search(data, at)
+            if nxt is None:
+                break
+            at = nxt.start() - nxt.start() % 8
+            continue
+        if length < 60 or at + length > len(data) or major not in (2, 3):
+            break
+        tail = at + (24 if major == 2 else 40)
+        usn, stamp, reason = struct.unpack_from("<QQI", data, tail)
+        name_length, name_offset = struct.unpack_from("<HH", data, tail + 32)
+        name = data[at + name_offset:at + name_offset + name_length].decode("utf-16-le", "replace")
+        records += 1
+        reasons |= reason
+        usns.append(usn)
+        stamps.append(stamp)
+        if name not in names:
+            names.append(name)
+        if reason & 0x200 and name not in deleted:
+            deleted.append(name)
+        if reason & 0x100 and name not in created:
+            created.append(name)
+        at += length
+    f.update(record_count=records, major_version=struct.unpack_from("<H", data, _usn_start(data) + 4)[0],
+             first_usn=min(usns) if usns else None, last_usn=max(usns) if usns else None,
+             first_timestamp=_filetime(min(stamps)) if stamps else None,
+             last_timestamp=_filetime(max(stamps)) if stamps else None,
+             file_names=names, file_name_count=len(names), deleted_file_names=deleted, created_file_names=created,
+             reasons=[label for bit, label in USN_REASONS if reasons & bit])
+
+
+def _recycle_i(data: bytes, f: dict) -> None:
+    version, size, deleted = struct.unpack_from("<QQQ", data, 0)
+    if version == 2:
+        count = struct.unpack_from("<I", data, 24)[0]
+        path = data[28:28 + 2 * count].decode("utf-16-le", "replace").split("\0", 1)[0]
+    else:
+        path = _utf16(data[24:24 + 520])
+    f.update(version=version, original_size=size, file_size=size, deleted_utc=_filetime(deleted),
+             deletion_time=_filetime(deleted), original_path=path, original_name=re.split(r"[\\/]", path)[-1])
+
+
+def _custom_destinations(data: bytes, f: dict) -> None:
+    from .formats import _guarded as guarded, _lnk
+
+    starts = [m.start() for m in re.finditer(re.escape(b"L\0\0\0\x01\x14\x02\0"), data[:16 << 20])][:256]
+    links = [guarded(_lnk, data[a:b]) for a, b in zip(starts, starts[1:] + [len(data)])]
+    f.update(version=struct.unpack_from("<I", data, 0)[0], lnk_count=len(links),
+             target_paths=[l["target_path"] for l in links if l.get("target_path")],
+             arguments=[l["arguments"] for l in links if l.get("arguments")])
+
+
+def _destlist(stream: bytes) -> dict:
+    """Jump List DestList: header, then entries (Windows 7 = version 1; 10 = 3/4)."""
+    version, count, pinned, _, last_id, _, actions = struct.unpack_from("<IIIfIII", stream, 0)
+    out: dict = {"destlist_version": version, "destlist_entry_count": count, "destlist_pinned_count": pinned,
+                 "destlist_last_entry_number": last_id, "destlist_action_count": actions}
+    path_at = 0x6C if version == 1 else 0x7C
+    entries, at = [], 32
+    while at + path_at + 2 <= len(stream) and len(entries) < min(count, 4096):
+        host = stream[at + 0x48:at + 0x58].split(b"\0", 1)[0]
+        number, = struct.unpack_from("<I", stream, at + 0x58)
+        access, pin = struct.unpack_from("<Qi", stream, at + 0x60)
+        length, = struct.unpack_from("<H", stream, at + path_at)
+        path = stream[at + path_at + 2:at + path_at + 2 + 2 * length].decode("utf-16-le")
+        if not host.isascii() or not path.isprintable():
+            break  # A layout this reader does not know: header fields only.
+        entry = {"entry_number": number, "hostname": host.decode(), "path": path, "last_access": _filetime(access),
+                 "pinned": pin >= 0}
+        if version != 1:
+            entry["access_count"] = struct.unpack_from("<I", stream, at + 0x70)[0]
+        entries.append(entry)
+        at += path_at + 2 + 2 * length + (0 if version == 1 else 4)
+    if entries:
+        out.update(destlist_entries=entries, destlist_paths=[e["path"] for e in entries],
+                   destlist_hostnames=sorted({e["hostname"] for e in entries}),
+                   destlist_most_recent_path=max(entries, key=lambda e: e["last_access"] or "")["path"])
+    return out
+
+
+MINIDUMP_STREAMS = {3: "ThreadListStream", 4: "ModuleListStream", 5: "MemoryListStream", 6: "ExceptionStream",
+                    7: "SystemInfoStream", 9: "Memory64ListStream", 10: "CommentStreamA", 11: "CommentStreamW",
+                    12: "HandleDataStream", 15: "MiscInfoStream", 16: "MemoryInfoListStream",
+                    17: "ThreadInfoListStream", 21: "SystemMemoryInfoStream", 22: "ProcessVmCountersStream"}
+PROCESSOR_ARCHITECTURES = {0: "x86", 5: "arm", 6: "ia64", 9: "amd64", 12: "arm64", 0xFFFF: "unknown"}
+
+
+def _minidump(data: bytes, f: dict) -> None:
+    version, count, directory, checksum, stamp, flags = struct.unpack_from("<IIIIIQ", data, 4)
+    f.update(version=version & 0xFFFF, implementation_version=version >> 16, stream_count=count,
+             checksum=checksum, timestamp=_unix(stamp), timestamp_unix=stamp, flags=flags)
+    streams = {}
+    for index in range(min(count, 512)):
+        kind, size, rva = struct.unpack_from("<III", data, directory + 12 * index)
+        streams.setdefault(kind, (size, rva))
+    f["stream_types"] = [MINIDUMP_STREAMS.get(kind, str(kind)) for kind in streams]
+
+    def text(rva: int) -> str:
+        length = struct.unpack_from("<I", data, rva)[0]
+        return data[rva + 4:rva + 4 + min(length, 4096)].decode("utf-16-le", "replace")
+    if 7 in streams:
+        arch, level, revision, cpus, product, major, minor, build, platform, csd = struct.unpack_from(
+            "<HHHBBIIIII", data, streams[7][1])
+        f.update(processor_architecture=PROCESSOR_ARCHITECTURES.get(arch, str(arch)), number_of_processors=cpus,
+                 os_version=f"{major}.{minor}.{build}", os_build=build, product_type=product, platform_id=platform)
+    if 4 in streams:
+        rva = streams[4][1]
+        modules = struct.unpack_from("<I", data, rva)[0]
+        names = []
+        for index in range(min(modules, 4096)):
+            base, size, _, stamp, name_rva = struct.unpack_from("<QIIII", data, rva + 4 + 108 * index)
+            names.append(text(name_rva))
+        f.update(module_count=modules, module_names=names, main_module=names[0] if names else None,
+                 main_module_name=re.split(r"[\\/]", names[0])[-1] if names else None)
+    if 3 in streams:
+        f["thread_count"] = struct.unpack_from("<I", data, streams[3][1])[0]
+    if 15 in streams:
+        size, flags1, pid, created = struct.unpack_from("<IIII", data, streams[15][1])
+        if flags1 & 1:
+            f["process_id"] = pid
+        if flags1 & 2:
+            f["process_create_time"] = _unix(created)
+    if 6 in streams:
+        thread, _, code, _, _, address = struct.unpack_from("<IIIIQQ", data, streams[6][1])
+        f.update(exception_thread_id=thread, exception_code=f"0x{code:08x}", exception_address=f"0x{address:x}")
+
+
+_TASK16, _MIT16 = "<Task".encode("utf-16-le"), "mit/task".encode("utf-16-le")
+
+
+def _scheduled_task(data: bytes, f: dict) -> None:
+    import xml.etree.ElementTree as ET
+
+    text = data.decode("utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig")
+    try:  # (an encoding="UTF-16" declaration does not fit a str, so it is dropped first)
+        root = ET.fromstring(re.sub(r"<\?xml[^>]*\?>", "", text, count=1))
+    except ET.ParseError as exc:  # a SyntaxError, which _guarded does not catch
+        raise ValueError("task XML") from exc
+    local = lambda node: node.tag.rsplit("}", 1)[-1]
+    find = lambda path: next((n for n in root.iter() if local(n) == path), None)
+    value = lambda path: (find(path).text or "").strip() if find(path) is not None else None
+    triggers = find("Triggers")
+    actions = find("Actions")
+    execs = [n for n in actions.iter() if local(n) == "Exec"] if actions is not None else []
+    f.update(task_version=root.get("version"), author=value("Author"), date=value("Date"), uri=value("URI"),
+             description=value("Description"), user_id=value("UserId"), run_level=value("RunLevel"),
+             logon_type=value("LogonType"), hidden=value("Hidden"), enabled=value("Enabled"),
+             trigger_types=[local(n) for n in triggers] if triggers is not None else [],
+             action_count=len(list(actions)) if actions is not None else 0,
+             commands=[(e.find("{*}Command").text or "").strip() for e in execs if e.find("{*}Command") is not None],
+             arguments=[(e.find("{*}Arguments").text or "").strip() for e in execs if e.find("{*}Arguments") is not None],
+             com_class_ids=[(n.text or "").strip() for n in root.iter() if local(n) == "ClassId"])
+    f["command"] = f["commands"][0] if f["commands"] else None
+    f["command_arguments"] = f["arguments"][0] if f["arguments"] else None
+
+
+EWF_HEADER_KEYS = {"c": "case_number", "n": "evidence_number", "a": "description", "e": "examiner_name",
+                   "t": "notes", "av": "acquisition_software_version", "ov": "os_version",
+                   "m": "acquisition_date", "u": "system_date", "p": "password_hash", "md": "model",
+                   "sn": "serial_number", "l": "device_label", "pid": "process_identifier"}
+
+
+def _ewf(data: bytes, f: dict) -> None:
+    from .containers import ZIP_ERRORS, decompress
+
+    f.update(segment_number=struct.unpack_from("<H", data, 9)[0])
+    at, types, seen = 13, [], set()
+    while at + 76 <= len(data) and len(types) < 1024 and at not in seen:
+        seen.add(at)
+        kind = data[at:at + 16].split(b"\0", 1)[0].decode("ascii")
+        following, size = struct.unpack_from("<QQ", data, at + 16)
+        types.append(kind)
+        body = data[at + 76:at + size] if size >= 76 else b""
+        if kind in ("header", "header2") and "case_number" not in f:
+            try:
+                raw = decompress(body, "zlib", 1 << 20)
+            except ZIP_ERRORS as exc:
+                raise ValueError("EWF header") from exc
+            text = raw.decode("utf-16" if kind == "header2" else "latin-1").replace("\r", "")
+            lines = text.split("\n")
+            keys = next((i for i, line in enumerate(lines) if line.startswith("c\t") or "\tc\t" in line), None)
+            if keys is not None and keys + 1 < len(lines):
+                for key, item in zip(lines[keys].split("\t"), lines[keys + 1].split("\t")):
+                    f[EWF_HEADER_KEYS.get(key, f"header_{key}")] = item
+        elif kind in ("volume", "disk") and len(body) >= 24:
+            media, chunks, per_chunk, per_sector, sectors = struct.unpack_from("<B3xIIIQ", body, 0)
+            f.update(media_type=media, chunk_count=chunks, sectors_per_chunk=per_chunk,
+                     bytes_per_sector=per_sector, sector_count=sectors, media_size_bytes=sectors * per_sector)
+        elif kind == "hash" and len(body) >= 16:
+            f["md5"] = body[:16].hex()
+        elif kind == "digest" and len(body) >= 36:
+            f.update(md5=body[:16].hex(), sha1=body[16:36].hex())
+        if kind in ("done", "next") or following <= at:
+            break
+        at = following
+    f["section_types"] = types
+
+
+MBR_TYPES = {0x07: "ntfs_exfat", 0x0B: "fat32_chs", 0x0C: "fat32_lba", 0x0E: "fat16_lba", 0x05: "extended",
+             0x0F: "extended_lba", 0x82: "linux_swap", 0x83: "linux", 0x8E: "linux_lvm", 0xEE: "gpt_protective",
+             0xEF: "efi_system", 0x27: "windows_recovery"}
+
+
+def _mbr(data: bytes, f: dict) -> None:
+    parts = []
+    for index in range(4):
+        status, kind, start, sectors = struct.unpack_from("<B3xB3xII", data, 446 + 16 * index)
+        if kind:
+            parts.append({"index": index + 1, "bootable": status == 0x80, "type": f"0x{kind:02x}",
+                          "type_name": MBR_TYPES.get(kind), "start_lba": start, "sector_count": sectors})
+    f.update(disk_signature=f"0x{struct.unpack_from('<I', data, 440)[0]:08x}", partition_count=len(parts),
+             partitions=parts, partition_types=[p["type"] for p in parts],
+             bootable_partition=next((p["index"] for p in parts if p["bootable"]), None),
+             first_partition_start_lba=parts[0]["start_lba"] if parts else None)
+
+
+def _gpt(data: bytes, f: dict) -> None:
+    at = 512
+    revision, size, _, _, current, backup, first, last = struct.unpack_from("<IIIIQQQQ", data, at + 8)
+    disk = _guid(data[at + 56:at + 72])
+    entries_lba, count, entry_size = struct.unpack_from("<QII", data, at + 72)
+    parts = []
+    for index in range(min(count, 256)):
+        entry = at - 512 + entries_lba * 512 + index * entry_size
+        if entry + 128 > len(data):
+            break
+        kind = data[entry:entry + 16]
+        if kind == bytes(16):
+            continue
+        start, end = struct.unpack_from("<QQ", data, entry + 32)
+        parts.append({"type_guid": _guid(kind), "unique_guid": _guid(data[entry + 16:entry + 32]),
+                      "first_lba": start, "last_lba": end, "name": _utf16(data[entry + 56:entry + 128])})
+    f.update(revision=f"{revision >> 16}.{revision & 0xFFFF}", header_size=size, disk_guid=disk,
+             partition_entry_count=count, partition_count=len(parts), partitions=parts,
+             partition_names=[p["name"] for p in parts], partition_type_guids=[p["type_guid"] for p in parts],
+             first_usable_lba=first, last_usable_lba=last, backup_lba=backup)
+
+
+def _ntfs_boot(data: bytes, f: dict) -> None:
+    per_sector, per_cluster = struct.unpack_from("<HB", data, 11)
+    sectors, mft, mirror, record = struct.unpack_from("<QQQb", data, 40)
+    cluster = per_sector * per_cluster
+    f.update(oem_id=data[3:11].decode("ascii").strip(), bytes_per_sector=per_sector, sectors_per_cluster=per_cluster,
+             cluster_size=cluster, total_sectors=sectors, volume_size_bytes=sectors * per_sector,
+             mft_cluster=mft, mft_offset=mft * cluster, mft_mirror_cluster=mirror,
+             mft_record_size=2 ** -record if record < 0 else record * cluster,
+             volume_serial_number=f"{struct.unpack_from('<Q', data, 72)[0]:016X}")
+
+
+def _dmg(data: bytes, f: dict) -> None:
+    koly = data[-512:]
+    version, size, flags, _, data_offset, data_length, rsrc_offset, rsrc_length, segment, segments = \
+        struct.unpack_from(">IIIQQQQQII", koly, 4)
+    xml_offset, xml_length = struct.unpack_from(">QQ", koly, 0xD8)
+    variant, sectors = struct.unpack_from(">IQ", koly, 0x1E8)
+    f.update(version=version, header_size=size, flags=flags, data_fork_offset=data_offset,
+             data_fork_length=data_length, resource_fork_length=rsrc_length, segment_number=segment,
+             segment_count=segments, segment_id=koly[64:80].hex(), xml_offset=xml_offset, xml_length=xml_length,
+             image_variant=variant, sector_count=sectors, image_size_bytes=sectors * 512)
+
+
+DS_STORE_TYPES = {b"long", b"shor", b"bool", b"blob", b"type", b"ustr", b"comp", b"dutc"}
+
+
+def _ds_store(data: bytes, f: dict) -> None:
+    """Record names of a Finder .DS_Store: (length, UTF-16BE name, 4-char code, known type) runs."""
+    names, codes = [], set()
+    for m in re.finditer(rb"\0\0\0([\x01-\xff])((?:\0[\x20-\x7e]|[\x01-\xff][\0-\xff]){1,255}?)([a-zA-Z]{4})(long|shor|bool|blob|type|ustr|comp|dutc)",
+                         data[:16 << 20]):
+        if len(m.group(2)) != 2 * m.group(1)[0]:
+            continue
+        name = m.group(2).decode("utf-16-be", "replace")
+        codes.add(m.group(3).decode())
+        if name not in names:
+            names.append(name)
+    f.update(file_names=names, file_name_count=len(names), record_codes=sorted(codes))
+
+
+# A small DER reader for X.509 certificates (also used for Authenticode signers).
+
+OIDS = {"1.2.840.113549.1.1.1": "rsaEncryption", "1.2.840.113549.1.1.5": "sha1WithRSAEncryption",
+        "1.2.840.113549.1.1.11": "sha256WithRSAEncryption", "1.2.840.113549.1.1.12": "sha384WithRSAEncryption",
+        "1.2.840.113549.1.1.13": "sha512WithRSAEncryption", "1.2.840.113549.1.1.4": "md5WithRSAEncryption",
+        "1.2.840.10045.2.1": "ecPublicKey", "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+        "1.2.840.10045.4.3.3": "ecdsa-with-SHA384", "1.3.101.112": "Ed25519", "1.2.840.10040.4.1": "dsa"}
+NAME_KEYS = {"2.5.4.3": "CN", "2.5.4.6": "C", "2.5.4.7": "L", "2.5.4.8": "ST", "2.5.4.10": "O", "2.5.4.11": "OU",
+             "1.2.840.113549.1.9.1": "emailAddress", "2.5.4.5": "serialNumber"}
+
+
+def der(data: bytes, at: int = 0) -> tuple[int, int, int]:
+    """(tag, content start, content end) of the DER element at `at`."""
+    tag, length = data[at], data[at + 1]
+    at += 2
+    if length & 0x80:
+        count = length & 0x7F
+        if not 1 <= count <= 4:
+            raise ValueError("DER length")
+        length = int.from_bytes(data[at:at + count], "big")
+        at += count
+    if at + length > len(data):
+        raise ValueError("DER element past the data")
+    return tag, at, at + length
+
+
+def der_children(data: bytes, start: int, end: int) -> list[tuple[int, int, int]]:
+    out = []
+    while start < end and len(out) < 4096:
+        element = der(data, start)
+        out.append(element)
+        start = element[2]
+    return out
+
+
+def _oid(raw: bytes) -> str:
+    parts, value = [], 0
+    for byte in raw:
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            parts.append(value)
+            value = 0
+    first = min(parts[0] // 40, 2) if parts else 0
+    return ".".join(map(str, [first, parts[0] - 40 * first, *parts[1:]])) if parts else ""
+
+
+def _der_time(data: bytes, element) -> str:
+    tag, a, b = element
+    text = data[a:b].decode("ascii").rstrip("Z")
+    if tag == 0x17:  # UTCTime YYMMDDHHMMSS
+        text = ("19" if int(text[:2]) >= 50 else "20") + text
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}T{text[8:10]}:{text[10:12]}:{text[12:14]}Z"
+
+
+def _der_name(data: bytes, element) -> dict:
+    out: dict = {}
+    for _, a, b in der_children(data, element[1], element[2]):            # SET of AttributeTypeAndValue
+        for _, c, d in der_children(data, a, b):
+            (_, oa, ob), (vtag, va, vb) = der_children(data, c, d)[:2]
+            key = NAME_KEYS.get(_oid(data[oa:ob]), _oid(data[oa:ob]))
+            out.setdefault(key, data[va:vb].decode("utf-16-be" if vtag == 0x1E else "utf-8", "replace"))
+    return out
+
+
+def certificate(data: bytes, at: int = 0) -> dict:
+    import hashlib
+
+    _, start, end = der(data, at)
+    blob = data[at:end]
+    tbs, algorithm, _ = der_children(data, start, end)[:3]
+    fields = der_children(data, tbs[1], tbs[2])
+    version = 1
+    if fields[0][0] == 0xA0:
+        version = data[der(data, fields[0][1])[1]] + 1
+        fields = fields[1:]
+    serial, _, issuer, validity, subject, key = fields[:6]
+    times = der_children(data, validity[1], validity[2])
+    key_algorithm = der_children(data, *der_children(data, key[1], key[2])[0][1:])[0]
+    sig_oid = der_children(data, algorithm[1], algorithm[2])[0]
+    issuer_name, subject_name = _der_name(data, issuer), _der_name(data, subject)
+    out = {"version": version, "serial_number": data[serial[1]:serial[2]].lstrip(b"\0").hex() or "00",
+           "signature_algorithm": OIDS.get(_oid(data[sig_oid[1]:sig_oid[2]]), _oid(data[sig_oid[1]:sig_oid[2]])),
+           "issuer": ", ".join(f"{k}={v}" for k, v in issuer_name.items()), "issuer_cn": issuer_name.get("CN"),
+           "subject": ", ".join(f"{k}={v}" for k, v in subject_name.items()), "subject_cn": subject_name.get("CN"),
+           "subject_organization": subject_name.get("O"), "issuer_organization": issuer_name.get("O"),
+           "not_before": _der_time(data, times[0]), "not_after": _der_time(data, times[1]),
+           "public_key_algorithm": OIDS.get(_oid(data[key_algorithm[1]:key_algorithm[2]]),
+                                            _oid(data[key_algorithm[1]:key_algorithm[2]])),
+           "self_signed": issuer_name == subject_name,
+           "sha1_fingerprint": hashlib.sha1(blob).hexdigest(), "sha256_fingerprint": hashlib.sha256(blob).hexdigest()}
+    for extra in fields[6:]:
+        if extra[0] != 0xA3:
+            continue
+        for _, a, b in der_children(data, *der_children(data, extra[1], extra[2])[0][1:]):
+            parts = der_children(data, a, b)
+            if _oid(data[parts[0][1]:parts[0][2]]) == "2.5.29.17":            # subjectAltName
+                inner = der(data, parts[-1][1])
+                out["subject_alt_names"] = [data[c:d].decode("ascii", "replace")
+                                            for tag, c, d in der_children(data, inner[1], inner[2]) if tag in (0x82, 0x81)]
+    return out
+
+
+def _x509(data: bytes, f: dict) -> None:
+    import base64
+
+    if data.lstrip()[:11] == b"-----BEGIN ":
+        m = re.search(rb"-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----", data)
+        if not m:
+            raise ValueError("no PEM certificate")
+        f["certificate_count"] = data.count(b"-----BEGIN CERTIFICATE-----")
+        data = base64.b64decode(b"".join(m.group(1).split()))
+    f.update(certificate(data))
 
 
 def formats(data: bytes) -> list[tuple[str, dict]]:
@@ -440,7 +968,7 @@ def formats(data: bytes) -> list[tuple[str, dict]]:
         ("evtx", data.startswith(b"ElfFile\0") and len(data) >= 0x80, _evtx),
         ("regf", data.startswith(b"regf") and len(data) >= 0x200, _regf),
         ("prefetch", (data[4:8] == b"SCCA" and len(data) >= 0x100) or (data[:3] == b"MAM" and len(data) >= 8), _prefetch),
-        ("plist", data.startswith(b"bplist0") or (data.lstrip()[:5] == b"<?xml" and b"<plist" in data[:1024]), _plist),
+        ("plist", data.startswith(b"bplist0") or (data[:4096].lstrip()[:5] == b"<?xml" and b"<plist" in data[:1024]), _plist),
         ("webp", data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 25, _webp),
         ("tiff", data[:4] in (b"II*\0", b"MM\0*") and len(data) >= 8, _tiff),
         ("ebml", data.startswith(b"\x1a\x45\xdf\xa3") and len(data) >= 8, _ebml),
@@ -457,6 +985,27 @@ def formats(data: bytes) -> list[tuple[str, dict]]:
         ("crx", data.startswith(b"Cr24") and len(data) >= 16, _crx),
         ("ese", len(data) >= 240 and data[4:8] == b"\xef\xcd\xab\x89", _ese),
         ("ole", data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") and len(data) >= 512, _ole),
+        # Days 26+ candidates.
+        ("mft", data[:4] in (b"FILE", b"BAAD") and len(data) >= 0x40, _mft),
+        # A record at offset 0 is version 2 or 3; any other start has sparse zeros before it.
+        ("usn", len(data) >= 60 and (data[:1] == b"\0" or data[4:8] in (b"\2\0\0\0", b"\3\0\0\0"))
+         and _usn_start(data) is not None, _usn),
+        ("recycle_bin_i", len(data) >= 28 and data[:8] in (b"\x01" + bytes(7), b"\x02" + bytes(7))
+         and (len(data) == 544 or len(data) == 28 + 2 * int.from_bytes(data[24:28], "little")), _recycle_i),
+        ("custom_destinations", data[:4] == b"\x02\0\0\0" and data[-4:] == b"\xab\xfb\xbf\xba", _custom_destinations),
+        ("minidump", data.startswith(b"MDMP") and len(data) >= 32, _minidump),
+        ("scheduled_task", len(data) < 1 << 20 and data[:16].lstrip(b"\xef\xbb\xbf\xff\xfe \t\r\n\0")[:1] == b"<"
+         and (data.find(b"<Task", 0, 4096) >= 0 or data.find(_TASK16, 0, 8192) >= 0)
+         and (data.find(b"mit/task", 0, 8192) >= 0 or data.find(_MIT16, 0, 16384) >= 0), _scheduled_task),
+        ("ewf", data.startswith(b"EVF\x09\x0d\x0a\xff\x00") and len(data) >= 13, _ewf),
+        ("ntfs", len(data) >= 512 and data[3:11] == b"NTFS    ", _ntfs_boot),
+        ("mbr", len(data) >= 512 and data[510:512] == b"\x55\xaa" and data[3:11] != b"NTFS    "
+         and any(data[446 + 16 * i + 4] for i in range(4)), _mbr),
+        ("gpt", len(data) >= 1024 and data[512:520] == b"EFI PART", _gpt),
+        ("dmg", len(data) >= 512 and data[-512:-508] == b"koly", _dmg),
+        ("ds_store", data.startswith(b"\0\0\0\x01Bud1"), _ds_store),
+        ("x509", (data[:1] == b"\x30" and data[1:2] in (b"\x82", b"\x81") and data[4:5] == b"\x30")
+         or data[:4096].lstrip()[:27] == b"-----BEGIN CERTIFICATE-----", _x509),
     )
     found = [(label, _guarded(parse, data)) for label, match, parse in checks if match]
     if data.startswith(b"\x04\x22\x4d\x18") and len(data) >= 7:

@@ -8,8 +8,8 @@ import json
 import re
 import struct
 from urllib.parse import urlsplit
-import zipfile
 
+from ..containers import ZIP_ERRORS
 from ..decoders import decode_fragment, extract_answer, peel
 from ..state import deliveries
 from ._binary_formats import ELF, MachO, PE, ParseError, parse_images
@@ -177,7 +177,13 @@ class Analysis:
         return self._decodes[key]
 
 
-def _property(name: str, analysis: Analysis) -> str | None:
+# _property()'s answer for a field it has no rule for, unlike None: a rule that found the field
+# absent, ambiguous or damaged. Only NO_RULE (or a namespace outside _RULED) may be guessed.
+NO_RULE = object()
+_RULED = {"wasm", "zip", "file", "binary", "pe", "elf", "macho"}
+
+
+def _property(name: str, analysis: Analysis):
     if name.startswith("wasm."):
         module = analysis.wasm
         field = name[5:]
@@ -190,7 +196,7 @@ def _property(name: str, analysis: Analysis) -> str | None:
             "imports": lambda: _json({"module": m, "name": n, "kind": k} for m, n, k in module.imports),
             "exports": lambda: _json({"name": n, "kind": k, "index": i} for n, k, i in module.exports),
         }
-        return facts[field]() if field in facts else None
+        return facts[field]() if field in facts else NO_RULE
     if name == "zip.central_directory_member_names":
         return zip_central_directory_member_names(analysis.data)
     if name == "zip.eocd.total_entries":
@@ -258,9 +264,9 @@ def _property(name: str, analysis: Analysis) -> str | None:
             return f"0x{image.machine:04x}"
         if field == "entry_point_va_hex":
             return f"0x{image.entry:0{image.bits // 4}x}"
-    elif field == "entry_point_file_offset_hex" and image.entry is not None:
-        return f"0x{image.entry:0{image.bits // 4}x}"
-    return None
+    elif field == "entry_point_file_offset_hex":
+        return f"0x{image.entry:0{image.bits // 4}x}" if image.entry is not None else None
+    return NO_RULE
 
 
 def _section(question: Question, image):
@@ -506,6 +512,31 @@ def _text_answer(question: Question, analysis: Analysis) -> tuple[str | None, st
     return value, evidence, replayable
 
 
+def _unknown_property(prop: str, data: bytes, timed: bool) -> tuple[str | None, str, tuple]:
+    """A property _property() has no rule for, answered like Metadata's autoprop: a timed race
+    only from a mapping a CORRECT solve confirmed, untimed from the formats.py field that
+    clearly is the property (a new PE header field, say). The chain records the mapping so a
+    CORRECT untimed answer confirms it for the timed runs."""
+    from .autoprop import _field, confirmed_mappings  # Lazy: most questions never get here.
+    from ..suggest import confident, formatted
+
+    known = confirmed_mappings().get(prop)
+    if known:
+        value = _field(data, *known)
+        if value is None:
+            return None, "", ()
+        label, key, answer = known[0], known[1], formatted(prop, value)
+        evidence = f"{prop} = {label} field {key}, a mapping a CORRECT solve confirmed."
+    elif timed:
+        return None, "", ()
+    else:
+        guess = confident(prop, data)
+        if guess is None:
+            return None, "", ()
+        label, key, answer = guess
+        evidence = f"{prop} has no binary rule; {label} field {key} matches it clearly (suggest.py)."
+    return answer, evidence, ("autoprop", f"{prop}={label}:{key}")
+
 class BinarySolver:
     name = "binary-static-facts"
     lanes = frozenset({"binary", "binary-reverse-engineering"})
@@ -551,14 +582,23 @@ class BinarySolver:
                 if not _PROPERTY.search(question.text) and text_query:
                     answer, evidence, chain = _text_answer(question, analysis)
                 else:
-                    answer = _structured(question, analysis)
+                    match = _PROPERTY.search(question.text)
+                    foreign = bool(match) and match[1].casefold().partition(".")[0] not in _RULED
+                    try:
+                        answer = _structured(question, analysis)
+                    except ParseError:
+                        if not foreign:
+                            raise  # A rule's own parser refused damaged bytes: fail closed.
+                        answer = None  # A .pyc, say: no image _property() parses.
                     evidence = f"Parsed the requested static fact from validated assigned bytes: {question.artifact or 'artifact'}."
                     chain = ()
+                    if answer is NO_RULE or (answer is None and foreign):
+                        answer, evidence, chain = _unknown_property(match[1].casefold(), data, assigned.timed)
                 if answer is not None and valid_answer(answer, question.answer_format):
                     result.append(AnswerCandidate(question.answer_id, answer, self.name, evidence, chain,
                                                   _spellings(question, analysis, answer)))
-            except (ParseError, struct.error, ValueError, IndexError, UnicodeError, zipfile.BadZipFile, RuntimeError):
-                continue  # Preserve unsupported/malformed/ambiguous questions.
+            except (ParseError, struct.error, IndexError, UnicodeError, OverflowError, *ZIP_ERRORS):
+                continue  # Preserve unsupported/malformed/ambiguous/damaged questions.
         return result
 
 

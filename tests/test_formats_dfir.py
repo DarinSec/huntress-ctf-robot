@@ -249,5 +249,231 @@ class DfirFormatTests(unittest.TestCase):
         self.assertEqual(formats(b""), [])
 
 
+# --- Days 26+ candidates -------------------------------------------------------------------------
+
+CERT_B64 = "MIIBszCCAVqgAwIBAgIEEjSrzTAKBggqhkjOPQQDAjBCMSMwIQYDVQQDDBphbnRpY2lwYXRlLmV4YW1wbGUuaW52YWxpZDEbMBkGA1UECgwSU3ludGhldGljIFRlc3QgT3JnMB4XDTI2MTAwMTAwMDAwMFoXDTI3MTAwMTAwMDAwMFowQjEjMCEGA1UEAwwaYW50aWNpcGF0ZS5leGFtcGxlLmludmFsaWQxGzAZBgNVBAoMElN5bnRoZXRpYyBUZXN0IE9yZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABND+tU6xlwqWV70zWAkMW8uo3lp+0y8dYAw3yY119CyG7XNdhAX+Drh/YMnam3BkMbwO6otUKIcWvXbadp2KgGSjPjA8MDoGA1UdEQQzMDGCGmFudGljaXBhdGUuZXhhbXBsZS5pbnZhbGlkghNhbHQuZXhhbXBsZS5pbnZhbGlkMAoGCCqGSM49BAMCA0cAMEQCIHrPI6cOU8AVbFWMMSCiYGwYtt8D4qlWGQG4D8AIZeUDAiAvTIPrhP+mFRVpcSkuYEbv3jMUeAUNXaNeI59Un2NHQg=="  # Synthetic self-signed ECDSA certificate (CN=anticipate.example.invalid), made for this test.
+CERT_SHA256 = "4f60f369c2d17690d1d04b178c5674ae09dc5c60e171577872adcd6b7afefd5d"
+
+
+def _resident(kind, content, name=""):
+    raw_name = name.encode("utf-16-le")
+    offset = 24 + len(raw_name)
+    offset += -offset % 8
+    length = offset + len(content)
+    length += -length % 8
+    head = struct.pack("<IIBBHHHIHBB", kind, length, 0, len(name), 24, 0, 0, len(content), offset, 0, 0)
+    return (head + raw_name).ljust(offset, b"\0") + content.ljust(length - offset, b"\0")
+
+
+def mft_record():
+    si = struct.pack("<QQQQI", filetime(2026, 1, 1), filetime(2026, 1, 2), filetime(2026, 1, 3), filetime(2026, 1, 4), 0x20)
+    name = "evil.exe".encode("utf-16-le")
+    fn = struct.pack("<QQQQQQQII", (3 << 48) | 5, filetime(2026, 6, 1), filetime(2026, 6, 1), filetime(2026, 6, 1),
+                     filetime(2026, 6, 1), 4096, 1234, 0x20, 0) + bytes([8, 1]) + name
+    attributes = (_resident(0x10, si.ljust(72, b"\0")) + _resident(0x30, fn) + _resident(0x80, b"hello")
+                  + _resident(0x80, b"[ZoneTransfer]", "Zone.Identifier") + struct.pack("<I", 0xFFFFFFFF))
+    record = bytearray(1024)
+    record[:4] = b"FILE"
+    struct.pack_into("<HHQHHHHIIQH", record, 4, 48, 3, 77, 9, 1, 56, 1, 56 + len(attributes) + 4, 1024, 0, 6)
+    struct.pack_into("<I", record, 44, 42)
+    record[56:56 + len(attributes)] = attributes
+    struct.pack_into("<HHH", record, 48, 0xABCD, struct.unpack_from("<H", record, 510)[0], struct.unpack_from("<H", record, 1022)[0])
+    struct.pack_into("<H", record, 510, 0xABCD)
+    struct.pack_into("<H", record, 1022, 0xABCD)
+    return bytes(record)
+
+
+def usn_record(usn, name, reason):
+    raw = name.encode("utf-16-le")
+    length = 60 + len(raw)
+    length += -length % 8
+    return (struct.pack("<IHHQQQQIIIIHH", length, 2, 0, 0x1000000000005, 0x5000000000005, usn,
+                        filetime(2026, 10, usn % 27 + 1), reason, 0, 0, 0x20, len(raw), 60) + raw).ljust(length, b"\0")
+
+
+def lnk(target):
+    """A shell link with only a LinkInfo local path (MS-SHLLINK)."""
+    path = target.encode() + b"\0"
+    info = struct.pack("<IIIIIII", 28 + len(path) + 1, 28, 1, 0, 28, 0, 28 + len(path)) + path + b"\0"
+    header = struct.pack("<I16sIIQQQIiIH", 0x4C, bytes.fromhex("0114020000000000c000000000000046"), 0x2, 0,
+                         0, 0, 0, 0, 0, 1, 0).ljust(76, b"\0")
+    return header + info
+
+
+def destlist(paths):
+    out = struct.pack("<IIIfIIII", 4, len(paths), 1, 0.0, len(paths), 0, 7, 0)
+    for number, path in enumerate(paths, 1):
+        entry = bytearray(0x7C)
+        entry[0x48:0x48 + 8] = b"WKSTN-01"
+        struct.pack_into("<IIQiiI", entry, 0x58, number, 0, filetime(2026, 10, number), 0 if number == 1 else -1, -1, 3)
+        raw = path.encode("utf-16-le")
+        out += bytes(entry) + struct.pack("<H", len(path)) + raw + bytes(4)
+    return out
+
+
+class Day26CandidateTests(unittest.TestCase):
+    def test_mft_record(self):
+        f = fields(mft_record(), "mft")
+        self.assertEqual((f["file_name"], f["parent_record_number"], f["parent_sequence_number"], f["record_number"]),
+                         ("evil.exe", 5, 3, 42))
+        self.assertEqual((f["in_use"], f["is_directory"], f["data_size"], f["alternate_data_streams"]),
+                         (True, False, 5, ["Zone.Identifier"]))
+        self.assertEqual((f["si_created"], f["fn_created"], f["si_before_fn_created"]),
+                         ("2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z", True))
+        damaged = bytearray(mft_record())
+        damaged[510] ^= 1  # A torn sector: the fixup check fails, no wrong fields.
+        self.assertIn("damaged", dict(formats(bytes(damaged)))["mft"])
+
+    def test_usn_journal(self):
+        data = bytes(8192) + usn_record(100, "invoice.docm", 0x100) + usn_record(200, "invoice.docm", 0x200 | 0x80000000) \
+            + usn_record(300, "payload.dll", 0x2)
+        f = fields(data, "usn")
+        self.assertEqual((f["record_count"], f["first_usn"], f["last_usn"]), (3, 100, 300))
+        self.assertEqual((f["file_names"], f["deleted_file_names"], f["created_file_names"]),
+                         (["invoice.docm", "payload.dll"], ["invoice.docm"], ["invoice.docm"]))
+        self.assertEqual(f["reasons"], ["DATA_EXTEND", "FILE_CREATE", "FILE_DELETE", "CLOSE"])
+
+    def test_recycle_bin_i(self):
+        path = "C:\\Users\\analyst\\Desktop\\secret.xlsx"
+        data = struct.pack("<QQQI", 2, 48213, filetime(2026, 10, 20), len(path) + 1) + (path + "\0").encode("utf-16-le")
+        f = fields(data, "recycle_bin_i")
+        self.assertEqual((f["original_path"], f["original_name"], f["original_size"], f["deleted_utc"]),
+                         (path, "secret.xlsx", 48213, "2026-10-20T00:00:00Z"))
+        legacy = struct.pack("<QQQ", 1, 7, filetime()) + path.encode("utf-16-le").ljust(520, b"\0")
+        self.assertEqual(fields(legacy, "recycle_bin_i")["original_name"], "secret.xlsx")
+
+    def test_jump_lists(self):
+        paths = ["C:\\Tools\\mimikatz.exe", "C:\\Users\\a\\notes.txt"]
+        data = cfb([("DestList", destlist(paths)), ("1", lnk(paths[0])), ("2", lnk(paths[1]))])
+        f = fields(data, "ole")
+        self.assertEqual((f["document_type"], f["destlist_entry_count"], f["destlist_paths"]), ("jump_list", 2, paths))
+        self.assertEqual((f["destlist_hostnames"], f["destlist_most_recent_path"], f["target_paths"]),
+                         (["WKSTN-01"], paths[1], paths))
+        custom = b"\x02\0\0\0" + bytes(28) + lnk(paths[0]) + lnk(paths[1]) + b"\xab\xfb\xbf\xba"
+        self.assertEqual(fields(custom, "custom_destinations")["target_paths"], paths)
+
+    def test_minidump(self):
+        name = "C:\\Windows\\System32\\lsass.exe".encode("utf-16-le")
+        system = struct.pack("<HHHBBIIIII", 9, 6, 0, 4, 1, 10, 0, 19045, 2, 0)
+        modules = struct.pack("<I", 1) + struct.pack("<QIIII", 0x7FF600000000, 0x1000, 0, 0, 200).ljust(108, b"\0")
+        misc = struct.pack("<IIII", 24, 1, 712, 0)
+        directory = struct.pack("<III", 7, len(system), 100) + struct.pack("<III", 4, len(modules), 140) \
+            + struct.pack("<III", 15, len(misc), 280)
+        data = bytearray(400)
+        data[:32] = b"MDMP" + struct.pack("<IIIIIQ", 0xA793, 3, 32, 0, 1793491200, 0x2)
+        data[32:32 + len(directory)] = directory
+        data[100:100 + len(system)] = system
+        data[140:140 + len(modules)] = modules
+        data[200:204 + len(name)] = struct.pack("<I", len(name)) + name
+        data[280:296] = misc
+        f = fields(bytes(data), "minidump")
+        self.assertEqual((f["processor_architecture"], f["os_version"], f["module_count"], f["main_module_name"],
+                          f["process_id"], f["stream_types"]),
+                         ("amd64", "10.0.19045", 1, "lsass.exe", 712, ["SystemInfoStream", "ModuleListStream", "MiscInfoStream"]))
+
+    def test_scheduled_task(self):
+        xml = ('<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" '
+               'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Author>CORP\\svc</Author>'
+               '<URI>\\Updater</URI></RegistrationInfo><Triggers><LogonTrigger/><TimeTrigger/></Triggers>'
+               '<Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>'
+               '<Settings><Hidden>true</Hidden></Settings><Actions><Exec><Command>powershell.exe</Command>'
+               '<Arguments>-w hidden -enc AAAA</Arguments></Exec></Actions></Task>')
+        f = fields(b"\xff\xfe" + xml.encode("utf-16-le"), "scheduled_task")
+        self.assertEqual((f["author"], f["uri"], f["user_id"], f["run_level"], f["hidden"]),
+                         ("CORP\\svc", "\\Updater", "S-1-5-18", "HighestAvailable", "true"))
+        self.assertEqual((f["trigger_types"], f["command"], f["command_arguments"]),
+                         (["LogonTrigger", "TimeTrigger"], "powershell.exe", "-w hidden -enc AAAA"))
+
+    def test_ewf_image(self):
+        import zlib
+        text = "1\nmain\nc\tn\ta\te\tt\tav\tov\tm\tu\nCASE-26\tEV-1\tLaptop\tJ. Analyst\tnone\t20201230\tWindows\t2026 10 01\t2026 10 01\n\n"
+        def section(kind, body, nxt):
+            return kind.ljust(16, b"\0") + struct.pack("<QQ", nxt, 76 + len(body)) + bytes(44) + body
+        header = zlib.compress(text.encode())
+        volume = struct.pack("<B3xIIIQ", 1, 2, 64, 512, 128).ljust(1052, b"\0")
+        digest = bytes.fromhex("00112233445566778899aabbccddeeff") + bytes(20)
+        a = 13
+        b = a + 76 + len(header)
+        c = b + 76 + len(volume)
+        d = c + 76 + len(digest)
+        data = (b"EVF\x09\x0d\x0a\xff\x00" + b"\x01" + struct.pack("<HH", 1, 0) + section(b"header", header, b)
+                + section(b"volume", volume, c) + section(b"digest", digest, d) + section(b"done", b"", d))
+        f = fields(data, "ewf")
+        self.assertEqual((f["case_number"], f["examiner_name"], f["acquisition_software_version"], f["sector_count"],
+                          f["media_size_bytes"], f["md5"]),
+                         ("CASE-26", "J. Analyst", "20201230", 128, 65536, "00112233445566778899aabbccddeeff"))
+        self.assertEqual(f["section_types"], ["header", "volume", "digest", "done"])
+
+    def test_disk_layouts(self):
+        disk = bytearray(512 * 34)
+        struct.pack_into("<I", disk, 440, 0xDEADBEEF)
+        struct.pack_into("<B3xB3xII", disk, 446, 0x00, 0xEE, 1, 0xFFFFFFFF)
+        disk[510:512] = b"\x55\xaa"
+        disk[512:520] = b"EFI PART"
+        struct.pack_into("<IIIIQQQQ", disk, 520, 0x10000, 92, 0, 0, 1, 99, 34, 90)
+        disk[568:584] = bytes(range(16))
+        struct.pack_into("<QII", disk, 584, 2, 128, 128)
+        entry = 1024
+        disk[entry:entry + 16] = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")  # basic data
+        struct.pack_into("<QQ", disk, entry + 32, 34, 90)
+        disk[entry + 56:entry + 56 + 8] = "Data".encode("utf-16-le")
+        mbr, gpt = fields(bytes(disk), "mbr"), fields(bytes(disk), "gpt")
+        self.assertEqual((mbr["disk_signature"], mbr["partition_types"]), ("0xdeadbeef", ["0xee"]))
+        self.assertEqual((gpt["partition_count"], gpt["partition_names"], gpt["partition_type_guids"]),
+                         (1, ["Data"], ["ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"]))
+        boot = bytearray(512)
+        boot[3:11] = b"NTFS    "
+        struct.pack_into("<HB", boot, 11, 512, 8)
+        struct.pack_into("<QQQb", boot, 40, 2048000, 786432, 2, -10)
+        struct.pack_into("<Q", boot, 72, 0x1234ABCD5678EF90)
+        boot[510:512] = b"\x55\xaa"
+        f = fields(bytes(boot), "ntfs")
+        self.assertNotIn("mbr", dict(formats(bytes(boot))))
+        self.assertEqual((f["cluster_size"], f["mft_offset"], f["mft_record_size"], f["volume_serial_number"]),
+                         (4096, 786432 * 4096, 1024, "1234ABCD5678EF90"))
+
+    def test_dmg_and_ds_store(self):
+        koly = bytearray(512)
+        koly[:4] = b"koly"
+        struct.pack_into(">IIIQQQQQII", koly, 4, 4, 512, 1, 0, 0, 8192, 0, 0, 1, 1)
+        struct.pack_into(">QQ", koly, 0xD8, 8192, 300)
+        struct.pack_into(">IQ", koly, 0x1E8, 1, 64)
+        f = fields(bytes(8492) + bytes(koly), "dmg")
+        self.assertEqual((f["data_fork_length"], f["xml_offset"], f["xml_length"], f["sector_count"]), (8192, 8192, 300, 64))
+        record = lambda name: struct.pack(">I", len(name)) + name.encode("utf-16-be") + b"Ilocblob" + bytes(8)
+        store = b"\0\0\0\x01Bud1" + bytes(20) + record("payload.app") + record("readme.txt") + record("payload.app")
+        self.assertEqual(fields(store, "ds_store")["file_names"], ["payload.app", "readme.txt"])
+
+    def test_x509_certificate(self):
+        import base64
+        der = base64.b64decode(CERT_B64)
+        f = fields(der, "x509")
+        self.assertEqual((f["subject_cn"], f["subject_organization"], f["self_signed"], f["serial_number"]),
+                         ("anticipate.example.invalid", "Synthetic Test Org", True, "1234abcd"))
+        self.assertEqual((f["not_before"], f["not_after"], f["signature_algorithm"], f["public_key_algorithm"]),
+                         ("2026-10-01T00:00:00Z", "2027-10-01T00:00:00Z", "ecdsa-with-SHA256", "ecPublicKey"))
+        self.assertEqual((f["sha256_fingerprint"], f["subject_alt_names"]),
+                         (CERT_SHA256, ["anticipate.example.invalid", "alt.example.invalid"]))
+        pem = b"-----BEGIN CERTIFICATE-----\n" + base64.encodebytes(der) + b"-----END CERTIFICATE-----\n"
+        self.assertEqual(fields(pem, "x509")["subject_cn"], "anticipate.example.invalid")
+
+    def test_autoprop_maps_new_properties(self):
+        self.assertEqual(confident("mft.file_name", mft_record()), ("mft", "file_name", "evil.exe"))
+        self.assertEqual(confident("x509.subject_cn", __import__("base64").b64decode(CERT_B64))[2], "anticipate.example.invalid")
+
+    def test_damaged_new_formats_never_raise(self):
+        import random
+        rng = random.Random(26)
+        seeds = [mft_record(), bytes(4096) + usn_record(1, "a", 1), b"MDMP" + bytes(60), b"EVF\x09\x0d\x0a\xff\x00" + bytes(200),
+                 b"\0\0\0\x01Bud1" + bytes(64), __import__("base64").b64decode(CERT_B64),
+                 b"\xff\xfe" + "<Task xmlns='mit/task'><".encode("utf-16-le")]
+        for seed in seeds:
+            for _ in range(200):
+                blob = bytearray(seed)
+                for _ in range(rng.randint(1, 8)):
+                    blob[rng.randrange(len(blob))] = rng.randrange(256)
+                formats(bytes(blob[:rng.randint(1, len(blob))]))  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
