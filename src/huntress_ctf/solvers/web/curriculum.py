@@ -23,6 +23,7 @@ rather than submit a guess.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import http.client
 import threading
@@ -30,7 +31,7 @@ from typing import Any, Iterator
 from urllib.parse import urljoin, urlsplit
 
 from ..base import AnswerCandidate
-from . import BudgetExhausted, HostNotAllowed, ScopedHttp
+from . import Budget, BudgetExhausted, HostNotAllowed, ScopedHttp
 from . import sessions
 
 try:  # handlers.py is third-party within the repo; a broken import must not kill discovery.
@@ -171,16 +172,18 @@ def _scope(http: ScopedHttp) -> Iterator["_ScopedTransport"]:
     """Confine `handlers`' network to `http`'s allowlist, over one pooled connection.
 
     Yields the transport so the caller can read the cookies the target set during the run.
+    Thread-safe: sets thread-local request handler so concurrent target solvers don't clash.
     """
-    with _PATCH_LOCK:
-        transport = _ScopedTransport(http)
-        original = handlers._request
-        handlers._request = transport.request
-        try:
-            yield transport
-        finally:
-            handlers._request = original
-            transport.close()
+    transport = _ScopedTransport(http)
+    old_tls = getattr(handlers._TLS, "request", None) if handlers is not None else None
+    if handlers is not None:
+        handlers._TLS.request = transport.request
+    try:
+        yield transport
+    finally:
+        if handlers is not None:
+            handlers._TLS.request = old_tls
+        transport.close()
 
 
 class CurriculumWebSolver:
@@ -221,60 +224,93 @@ class CurriculumWebSolver:
         artifact_of = {q["id"]: q.get("artifact") for q in questions
                        if isinstance(q, dict) and "id" in q}
         candidates: list[AnswerCandidate] = []
-        # proof by target url: a route may map several answers to one target (every day 1-10
-        # answer shares the single target), and the multi-step network walk is the dominant
-        # on-clock cost, so each distinct target is solved once and its proof reused.
         solved: dict[str, tuple[str, tuple[str, ...]]] = {}
 
-        try:
-            with _scope(context.http) as transport:
-                for i, answer_id in enumerate(context.answer_ids):
-                    turl = targets_map.get(artifact_of.get(answer_id))
-                    if not turl:
-                        turl = target_list[i] if i < len(target_list) else (
-                            target_list[0] if target_list else None)
-                    if not turl or not context.http.allows(turl):
-                        continue
+        # Collect distinct targets to solve
+        targets_to_solve: list[str] = []
+        for i, answer_id in enumerate(context.answer_ids):
+            art = artifact_of.get(answer_id)
+            turl = targets_map.get(art) if art else None
+            if not turl:
+                turl = target_list[i] if i < len(target_list) else (
+                    target_list[0] if target_list else None)
+            if turl and context.http.allows(turl) and turl not in targets_to_solve:
+                targets_to_solve.append(turl)
 
-                    if turl in solved:
-                        proof, chain = solved[turl]
-                    else:
-                        seen_before = len(transport.seen_cookies)
-                        proof = None
-                        chain = ()
-                        if context.http.budget is not None:
-                            context.http.budget.reset()  # A fresh allowance for each target.
-                        try:
-                            result = handlers.detect_and_solve(turl, day_int)
-                        except BudgetExhausted:
-                            # The prober spent this target's request/time budget: stop, no guess.
-                            result = None
-                        except Exception:
-                            # WebHandlerError, HostNotAllowed, transport errors: never guessed.
-                            result = None
-                        if isinstance(result, str) and handlers.PROOF_PATTERN.fullmatch(result):
-                            proof = result
-                            chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
-                        else:
-                            # No handler proof: the server may have stashed it in a signed
-                            # (readable) session cookie set during this target's run. Scan
-                            # only the cookies this target added, so the proof is credited
-                            # to it.
-                            for found in sessions.proofs_in_cookies(
-                                transport.seen_cookies[seen_before:], handlers.PROOF_PATTERN
-                            ):
-                                if handlers.PROOF_PATTERN.fullmatch(found):
-                                    proof, chain = found, ("web-cookie",)
-                                    break
+        h = handlers
+        assert h is not None
+
+        def _solve_one(turl: str) -> tuple[str, str | None, tuple[str, ...]]:
+            worker_http = context.http
+            if context.http.budget is not None:
+                worker_budget = Budget(
+                    max_requests=context.http.budget.max_requests,
+                    wall_s=context.http.budget.wall_s,
+                )
+                worker_http = ScopedHttp(
+                    context.http.allowed,
+                    timeout=context.http.timeout,
+                    opener=context.http._opener,
+                    max_bytes=context.http.max_bytes,
+                    budget=worker_budget,
+                )
+            with _scope(worker_http) as transport:
+                seen_before = len(transport.seen_cookies)
+                proof = None
+                chain = ()
+                try:
+                    result = h.detect_and_solve(turl, day_int)
+                except BudgetExhausted:
+                    # The prober spent this target's request/time budget: stop, no guess.
+                    result = None
+                except Exception:
+                    # WebHandlerError, HostNotAllowed, transport errors: never guessed.
+                    result = None
+                if isinstance(result, str) and h.PROOF_PATTERN.fullmatch(result):
+                    proof = result
+                    chain = ("web-curriculum", f"day={day_int}" if day_int is not None else "detect")
+                else:
+                    # No handler proof: the server may have stashed it in a signed
+                    # (readable) session cookie set during this target's run. Scan
+                    # only the cookies this target added, so the proof is credited
+                    # to it.
+                    for found in sessions.proofs_in_cookies(
+                        transport.seen_cookies[seen_before:], h.PROOF_PATTERN
+                    ):
+                        if h.PROOF_PATTERN.fullmatch(found):
+                            proof, chain = found, ("web-cookie",)
+                            break
+                return turl, proof, chain
+
+        try:
+            if len(targets_to_solve) > 1:
+                workers = min(len(targets_to_solve), 8)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    for turl, proof, chain in executor.map(_solve_one, targets_to_solve):
                         if proof is not None:
                             solved[turl] = (proof, chain)
-                    if proof is None:
-                        continue  # Only a real proof string is real evidence (solver rules).
-                    evidence = f"proof read from assigned target {turl}"
-                    candidates.append(
-                        AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
-                                        evidence=evidence, chain=chain)
-                    )
+            else:
+                for turl in targets_to_solve:
+                    turl, proof, chain = _solve_one(turl)
+                    if proof is not None:
+                        solved[turl] = (proof, chain)
+
+            for i, answer_id in enumerate(context.answer_ids):
+                art = artifact_of.get(answer_id)
+                turl = targets_map.get(art) if art else None
+                if not turl:
+                    turl = target_list[i] if i < len(target_list) else (
+                        target_list[0] if target_list else None)
+                if not turl or turl not in solved:
+                    continue
+                proof, chain = solved[turl]
+                if proof is None:
+                    continue  # Only a real proof string is real evidence (solver rules).
+                evidence = f"proof read from assigned target {turl}"
+                candidates.append(
+                    AnswerCandidate(answer_id=answer_id, answer=proof, solver=self.name,
+                                    evidence=evidence, chain=chain)
+                )
         except (Exception, BudgetExhausted):  # BudgetExhausted is a BaseException; never escape.
             return []
         return candidates

