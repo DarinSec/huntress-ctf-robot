@@ -136,6 +136,15 @@ def eligibility(
         # clears it by itself; ISO timestamps compare in order.
         if str(raced.get("recorded_at") or "") > str(raced.get("turned_down_at") or ""):
             rejected = None
+        # The list now reports the route solved, so its turn-down is stale: a race submits a
+        # real answer, not the one the service refused (day 27: a Time Trial turned down at
+        # 31/32, then completed, never re-raced for Hall of Fame). File-lane solvers run
+        # deterministically in milliseconds, so racing a solved one never spends a ranked
+        # variant on a slow exploit. Web keeps its mark: a race-condition or websocket route
+        # may not fit the clock, and the mark stops the sweep burning a variant on it. The
+        # `marks_only` gate below still holds, so only a proven solver ever races.
+        if record.get("solved") is True and record_lane not in TARGET_LANES:
+            rejected = None
         if rejected and not rerace:
             # One submission per race: a route the service has already turned down would
             # spend a ranked variant on the same answer (day 23 Metadata did it three times).
