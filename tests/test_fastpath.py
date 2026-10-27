@@ -348,6 +348,19 @@ class FastPathTests(unittest.TestCase):
         with self.assertRaises(GameMasterError):
             self.run_fast(FakeClient(StringIO(), result={"result": "MAYBE"}))
 
+    def test_a_teammates_solve_completes_without_a_hint(self):
+        # Day 24: Ilse solved Binary TT and Mastery by hand while the robot solved them; the
+        # submit answered "already_solved" (no attempt fields) and both routes ended "error".
+        solved = {"result": "already_solved", "solved_by": {"name": "Ilse"}, "variant_fresh": True,
+                  "message": "This attempt is already solved. Further submissions are not scored."}
+        client = FakeClient(self.output, result=solved)
+        self.assertEqual(self.run_fast(client, timed=False), COMPLETE)
+        self.assertIsNone(get_hint("c", Path(self.directory.name) / "hints.json"))
+        client = FakeClient(StringIO())
+        client.assignment.update(solved)  # The start says it already: nothing to download or send.
+        self.assertEqual(self.run_fast(client, StringIO(), timed=False), COMPLETE)
+        self.assertNotIn("artifact", client.calls)
+
     def test_uncertain_submit_is_not_retried(self):
         client = FakeClient(self.output, result=GameMasterError("Transport failed"))
         with self.assertRaises(GameMasterError):

@@ -151,6 +151,11 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(GameMasterError):
                 ensure_same_attempt(before, after)
 
+    def test_a_teammates_solve_is_completion(self):
+        state = AttemptState.parse({"result": "already_solved", "solved_by": {"name": "Ilse"},
+                                    "message": "This attempt is already solved. Further submissions are not scored."})
+        self.assertTrue(state.complete)
+
     def test_remaining_zero_is_not_proof_of_completion(self):
         self.assertFalse(AttemptState.parse({"result": "accepted", "remaining": 0}).complete)
         self.assertTrue(AttemptState.parse({"result": "CORRECT", "status": "pending"}).pending)

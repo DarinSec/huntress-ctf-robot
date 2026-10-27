@@ -105,7 +105,9 @@ class AttemptState:
         states = {_text(fields.get(key)) for key in ("result", "status", "state")}
         if "error" in states:
             raise GameMasterError("The Game Master reported an operation error.")
-        completed = bool(states.intersection({"correct", "completed", "complete", "solved"}))
+        # "already_solved": a teammate solved this attempt first ("Further submissions are not
+        # scored"). Day 24's Binary TT and Mastery ended "error" on that submit response.
+        completed = bool(states.intersection({"correct", "completed", "complete", "solved", "already_solved"}))
         if completed and "incorrect" in states:
             raise GameMasterError("The submission response contradicts itself about completion.")
         ids = string_ids(fields["answer_ids"], "answer_ids") if "answer_ids" in fields else None

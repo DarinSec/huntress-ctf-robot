@@ -40,7 +40,7 @@ from .state import AttemptState, current_fields, deliveries, mode_name, remember
 from .watchdog import Outcome, race_deadline, run_solvers
 from .workspace import write_workspace
 
-KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
+KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired", "already_solved"}
 REMAINING_FIELDS = ("ranked_attempts_remaining", "unique_attempts_remaining")
 SUBMIT_RECOVERY_WAITS_S = (3.0, 10.0)  # After a lost untimed submit POST: wait, status, resend.
 # Lanes whose start returns live `targets[]` instead of a file to download.
