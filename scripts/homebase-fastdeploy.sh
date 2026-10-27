@@ -40,7 +40,11 @@ if [ "${SKIP_REPLAY:-0}" != 1 ]; then
     exit 1
   fi
   [ "$mode" = full ] && lanes="whole corpus"
-  echo "replay (${lanes:-no lane}, $(( $(date +%s) - began )) s): $(grep -c ' answered |' replay.log 2>/dev/null || true) entries, no regression"
+  if [ -n "$lanes" ]; then
+    echo "replay ($lanes, $(( $(date +%s) - began )) s): $(grep -c ' answered |' replay.log || true) entries, no regression"
+  else
+    echo "replay: no corpus lane can answer differently"
+  fi
 fi
 if [ "${DRY:-0}" = 1 ]; then
   echo "DRY=1: checks passed in $(( $(date +%s) - began )) s; ~/src is unchanged."
