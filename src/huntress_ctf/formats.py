@@ -8,6 +8,8 @@ formatted as the answer format asks.
 
 Values stay raw (ints, lists, strings). A damaged file yields the fields read before the
 damage plus a "damaged" note; nothing here raises on untrusted bytes or executes them.
+`describe()` is the one entry point: executables and the everyday file types here, then the
+forensic artifact formats of formats_dfir.py (registry, EVTX, disk images, ...).
 """
 
 from __future__ import annotations

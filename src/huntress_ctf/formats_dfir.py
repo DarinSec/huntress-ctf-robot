@@ -1,4 +1,7 @@
-"""Header fields of the forensic formats the course has not asked about yet (Day 24+ candidates).
+"""Header fields of the forensic artifact formats: logs, registry, disk and VM images, archives
+and compression, certificates, OS artifacts (52 labels; formats.py holds the executables and
+everyday file types). Written as Day 24+ candidates; since then Day 24 asked EVTX, Day 25 the
+registry and Day 26 Prefetch, each now with its own parser in solvers/metadata.py.
 
 Each Metadata day so far added one `Determine <format>.<field>` property on a new format
 (JPEG, PNG, PDF, ZIP, PE, .NET, MSI, LNK, OOXML, e-mail, audio, video, ELF, Mach-O, APK,
@@ -6,6 +9,9 @@ JAR, SQLite). The remaining DFIR staples are read here, header fields only, from
 published specifications, so `suggest.confident()` and `autoprop` can map a new property to
 a field on release day. Same shape as formats.py: (label, fields) pairs, one parser per
 format, every parser guarded so damaged bytes give `damaged` instead of an exception.
+Not called on its own by triage, suggest or autoprop: `formats.describe()` returns these after
+its own, so every consumer sees both modules through that one call. No label is read by both
+(`pe_signature` lives here; describe() asks it for a PE).
 """
 
 from __future__ import annotations
