@@ -205,7 +205,7 @@ class HangsOnce:
         if not self.mark.exists():
             self.mark.write_text("seen")
             while True:
-                pass
+                time.sleep(60)  # Hangs without burning a core (see test_watchdog.Hangs).
         return []
 
 

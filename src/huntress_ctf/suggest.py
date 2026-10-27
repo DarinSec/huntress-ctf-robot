@@ -64,7 +64,19 @@ _NAMESPACES = {"macho": "macho", "elf": "elf", "pe": "pe", "dotnet": "pe", "wasm
                "pst": "pst", "ost": "pst", "outlook": "pst", "kernel_dump": "kernel_dump",
                "memory_dump": "kernel_dump", "bugcheck": "kernel_dump", "journal": "journald",
                "journald": "journald", "systemd_journal": "journald", "utmp": "utmp", "wtmp": "utmp",
-               "btmp": "utmp"}
+               "btmp": "utmp",
+               # Registry artifacts below the root (formats_dfir._regf_tree): fields carry the prefix.
+               "amcache": "regf", "userassist": "regf", "ntuser": "regf", "sam": "regf", "usbstor": "regf",
+               # Days 27-31 readers (tests/test_anticipate.py).
+               "thumbcache": "thumbcache", "thumbs": "thumbcache", "hiberfil": "hiberfil", "hibernation": "hiberfil",
+               "wim": "wim", "ext": "ext", "ext2": "ext", "ext3": "ext", "ext4": "ext", "linux_fs": "ext",
+               "superblock": "ext", "fat": "fat", "fat12": "fat", "fat16": "fat", "fat32": "fat", "exfat": "exfat",
+               "vbr": ("fat", "exfat", "ntfs"), "boot_sector": ("fat", "exfat", "ntfs"), "evt": "evt",
+               "indx": "indx", "i30": "indx", "logfile": "ntfs_logfile", "ntfs_logfile": "ntfs_logfile",
+               "mozlz4": "mozlz4", "jsonlz4": "mozlz4", "sessionstore": "mozlz4", "firefox": "mozlz4",
+               "pkcs7": "pkcs7", "p7b": "pkcs7", "p7s": "pkcs7", "cms": "pkcs7", "authenticode": "pe_signature",
+               "signature": ("pe_signature", "pkcs7")}
+_PREFIXED = {"amcache", "userassist", "sam", "usbstor"}
 _NOISE = {"u16", "u32", "u64", "hex", "rva", "set", "list", "text", "name", "value", "bytes", "the", "of"}
 # Plist keys are CamelCase ("CFBundleIdentifier"): split them like snake_case words.
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
@@ -100,6 +112,13 @@ _ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in 
     (r"(md5|sha1|sha256)_(?:hash|digest)", r"\1"),
     (r"^(?:oldest|earliest)_record(?:_number|_id)?", "first_record_id"),
     (r"^(?:newest|latest)_record(?:_number|_id)?", "last_record_id"),
+    # Archive and image listings (CAB members, the files of a WIM image).
+    (r"^(?:file|member)_?names$", "names"),
+    (r"^(?:file|member)_sha256s?$", "member_sha256"),
+    (r"^(?:total_)?uncompressed(?:_size|_bytes)?$", "total_uncompressed"),
+    (r"^(?:file_|member_)?(?:timestamps|modified_dates|mtimes)$", "modified_times"),
+    (r"^(?:dir|folder)(?:ectory)?_count$", "directory_count"),
+    (r"^(?:newest|latest|last_modified|most_recent)(?:_written)?_file(?:_path)?$", "latest_write_path"),
 ))
 
 
@@ -155,7 +174,8 @@ def _one_value(name: str) -> bool:
 def ranked(prop: str, data: bytes) -> list[tuple[int, str, str, Any]]:
     """(score, format label, field, value), best first, for the fields matching `prop`."""
     namespace, _, name = prop.partition(".")
-    names = {name, _aliased(name)}
+    # "amcache.entry_count" is the field amcache_entry_count: these namespaces prefix their fields.
+    names = {name, _aliased(name)} | ({f"{namespace}_{name}"} if namespace in _PREFIXED else set())
     label_kind = _NAMESPACES.get(namespace)
     scored = []
     for label, fields in describe(data):

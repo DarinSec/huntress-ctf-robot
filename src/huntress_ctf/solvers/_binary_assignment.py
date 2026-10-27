@@ -138,6 +138,72 @@ def _bytecode_kind(data: bytes) -> str | None:
     return None
 
 
+# codec -> (whole-run pattern, encoded HCFG magic, run alphabet) for encoded_config.
+_ENCODED_RUNS = {
+    "hex": (re.compile(rb"[0-9a-fA-F]{24,}"), b"48434647", frozenset(b"0123456789abcdefABCDEF")),
+    "base64url": (re.compile(rb"[A-Za-z0-9_-]{24,}={0,2}"), b"SENG",
+                  frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")),
+    "base64": (re.compile(rb"[A-Za-z0-9+/]{100,}={0,2}"), b"SENG",
+               frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")),
+}
+
+_JSON_MEMBER = re.compile(r"\bParse ([\w./-]+\.json)\b", re.I)
+_KEY = r"([A-Za-z_][\w.]*)"
+_JSON_ASKS = (  # (pattern on the text after "Parse <member>.json", what to take)
+    (re.compile(rf"\b(first|last|final) (?:\w+ )?(?:string|value|element|entry|item|integer|number) in its {_KEY} (?:array|list)\b", re.I), "end"),
+    (re.compile(rf"\b(?:number|count) of (?:\w+ )?(?:strings|values|elements|entries|items|integers|objects|frames) in its {_KEY} (?:array|list)\b", re.I), "count"),
+    (re.compile(rf"\bhow many (?:\w+ )?(?:strings|values|elements|entries|items|integers|objects|frames)? ?(?:are )?in its {_KEY} (?:array|list)\b", re.I), "count"),
+    (re.compile(rf"\bits {_KEY} (?:array|list) as (?:a |one )?(?:compact )?JSON\b", re.I), "json"),
+    (re.compile(rf"\b(?:value|string|text|integer|number) (?:of|in) its {_KEY} (?:field|property|key|member)\b", re.I), "scalar"),
+    (re.compile(rf"\bits {_KEY} (?:field|property|key|member)(?: value)?\b", re.I), "scalar"),
+)
+
+
+def json_member_answer(text: str, read) -> tuple[bool, str | None]:
+    """'Parse <member>.json and submit ...' for a JSON member no rule names (Day 26: crash/trace.json).
+
+    Takes the first or last element of a named array, its length, the array as compact JSON,
+    or a named scalar field (dotted paths and list indexes allowed). Unrecognized wording is
+    not handled; a member that is missing or not JSON, or a value of the wrong shape, answers
+    nothing rather than a guess.
+    """
+    named = _JSON_MEMBER.search(text)
+    if named is None:
+        return False, None
+    rest = text[named.end():]
+    for pattern, take in _JSON_ASKS:
+        asked = pattern.search(rest)
+        if asked:
+            break
+    else:
+        return False, None
+    try:
+        value = json.loads(read(named.group(1)))
+    except (ValueError, UnicodeDecodeError, KeyError, zipfile.BadZipFile):
+        return True, None
+    end, key = (asked.group(1).casefold(), asked.group(2)) if take == "end" else (None, asked.group(1))
+    for part in key.split("."):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            return True, None
+    if take == "count":
+        return True, str(len(value)) if isinstance(value, list) else None
+    if take == "json":
+        return True, json.dumps(value, separators=(",", ":")) if isinstance(value, list) else None
+    if take == "end":
+        if not (isinstance(value, list) and value):
+            return True, None
+        value = value[0] if end == "first" else value[-1]
+    if isinstance(value, bool):
+        return True, str(value).lower()
+    if isinstance(value, (str, int)):
+        return True, str(value)
+    return True, None
+
+
 class AssignedArchive:
     def __init__(self, context: SolveContext, files: Files):
         self.context = context
@@ -184,23 +250,24 @@ class AssignedArchive:
         return self.records[key][1]
 
     def encoded_config(self, data: bytes, codec: str, first: bool) -> Config | None:
-        patterns = {"hex": rb"[0-9a-fA-F]{24,}", "base64url": rb"[A-Za-z0-9_-]{24,}={0,2}",
-                    "base64": rb"[A-Za-z0-9+/]{100,}={0,2}"}
+        pattern, magic, alphabet = _ENCODED_RUNS[codec]
         found = []
-        for index, match in enumerate(re.finditer(patterns[codec], data)):
-            if index >= 4096 or len(match.group()) > 1024 * 1024:
+        candidates = 0
+        # A record is only ever read from byte 0 of the carrier (`record(raw, 0)`) and begins
+        # with b"HCFG", so a carrier is a whole run of the codec's alphabet that starts with that
+        # magic encoded: "48434647" in hex, "SENG" in both Base64 alphabets (base64(b"HCF")).
+        # Finding the magic first skips the look-alike runs a binary is full of: walking every
+        # run of the 64 MiB ELF in days 25/26 Mastery cost 1.9-5 s, and day 25 hit the old
+        # 4096-run bound before its record. The bound now counts carriers that start with the magic.
+        at = data.find(magic)
+        while at >= 0:
+            match = pattern.match(data, at) if at == 0 or data[at - 1] not in alphabet else None
+            at = data.find(magic, at + 1)
+            if match is None:
+                continue  # Mid-run, or a run too short to be a carrier.
+            candidates += 1
+            if candidates > 4096 or len(match.group()) > 1024 * 1024:
                 raise ParseError("Encoded HCFG scan exceeds bound")
-            # A record is only ever read from byte 0 of the carrier (`record(raw, 0)`) and
-            # begins with b"HCFG", so a candidate must start with that magic encoded:
-            # "48434647" in hex, or "SENG" in both Base64 alphabets (base64(b"HCF")).
-            # A megabyte of binary is full of runs that look like hex or Base64; rejecting
-            # them on four bytes skips decoding each one. Day 23's Binary Single Solve
-            # spent 369 ms in four of these scans, a quarter of the whole solve.
-            if codec == "hex":
-                if match.group()[:8].lower() != b"48434647":
-                    continue
-            elif match.group()[:4] != b"SENG":  # Base64 is case-sensitive.
-                continue
             try:
                 encoded = match.group()
                 if codec == "hex":
@@ -730,6 +797,22 @@ class AssignedArchive:
                 return True, "JAR"
             if "distinct ZIP compression methods" in q:
                 return True, json.dumps(sorted({i.compress_type for i in jar.infos}), separators=(",", ":"))
+            if "crash/trace.json" in q:
+                # Day 26: a synthetic crash trace shipped in the JAR ({"kind", "frames": [innermost first]}).
+                try:
+                    trace = json.loads(jar.read("crash/trace.json"))
+                except (ValueError, UnicodeDecodeError):
+                    return True, None
+                frames = trace.get("frames") if isinstance(trace, dict) else None
+                if not (isinstance(frames, list) and frames and all(isinstance(f, str) for f in frames)):
+                    return True, None
+                if "first string in its frames array" in q:
+                    return True, frames[0]
+                if "every string in crash/trace.json frames is present in the primary classfile method-name set" in q:
+                    return True, str(set(frames) <= set(jar.main.methods)).lower()
+            handled, value = json_member_answer(q, jar.read)
+            if handled or "crash/trace.json" in q:
+                return True, value
             if "method names in classfile method-table order" in q:
                 return True, json.dumps(jar.main.methods, separators=(",", ":"))
             if "classfile access_flags" in q:

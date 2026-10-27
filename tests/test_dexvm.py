@@ -9,6 +9,7 @@ import json
 import struct
 import unittest
 import zipfile
+import zlib
 from types import SimpleNamespace
 
 from huntress_ctf import dexvm
@@ -323,6 +324,122 @@ class LaterDayPlatformTests(unittest.TestCase):
         vm = dexvm.Machine([dexvm.Dex(build_dex(strings, types, protos, methods, t["LCode;"], [(0, 0x9, 5, 1, code)], fields))])
         self.assertEqual(vm.invoke("LCode;", "code", "(Landroid/content/Context;)Ljava/lang/String;", [vm.context], False),
                          b"abc".hex())
+
+
+class AndroidForecastTests(unittest.TestCase):
+    """Days 27-31, the way tests/test_forecast.py does it for Metadata: the Java utilities a computed
+    answer code is likely to reach next, each giving Java's own result or Unsupported, never a guess."""
+
+    def setUp(self):
+        self.vm = dexvm.Machine([], package="com.example.app")
+
+    def call(self, cls, name, sig, *args):
+        return dexvm._platform(cls, name, sig, list(args), self.vm)
+
+    def buffer(self, name, sig, *args):
+        return self.call("Ljava/nio/ByteBuffer;", name, sig, *args)
+
+    def test_bytebuffer_like_java_nio(self):
+        big = self.buffer("allocate", "(I)Ljava/nio/ByteBuffer;", 8)
+        self.buffer("putLong", "(J)Ljava/nio/ByteBuffer;", big, 0x0102030405060708)
+        self.assertEqual(self.buffer("array", "()[B", big), [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual((self.buffer("position", "()I", big), self.buffer("remaining", "()I", big)), (8, 0))
+        little = dexvm._PLATFORM_STATICS[("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN")]
+        small = self.buffer("order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;", self.buffer("allocate", "(I)Ljava/nio/ByteBuffer;", 6), little)
+        self.buffer("putInt", "(I)Ljava/nio/ByteBuffer;", small, -2)
+        self.buffer("putShort", "(IS)Ljava/nio/ByteBuffer;", small, 4, 0x1234)
+        self.assertEqual(self.buffer("array", "()[B", small), [-2, -1, -1, -1, 0x34, 0x12])
+        self.buffer("flip", "()Ljava/nio/ByteBuffer;", small)
+        self.assertEqual((self.buffer("getInt", "()I", small), self.buffer("limit", "()I", small)), (-2, 4))
+        array = [-128, 0, 0, 0, 0, 0, 0, 1, -1, -1]
+        wrapped = self.buffer("wrap", "([B)Ljava/nio/ByteBuffer;", array)
+        self.assertEqual(self.buffer("getLong", "()J", wrapped), -(1 << 63) + 1)
+        self.assertEqual((self.buffer("getChar", "(I)C", wrapped, 8), self.buffer("getShort", "(I)S", wrapped, 8)), (0xFFFF, -1))
+        self.buffer("put", "(IB)Ljava/nio/ByteBuffer;", wrapped, 0, 9)
+        self.assertEqual(array[0], 9)  # wrap shares the array, as in Java.
+        part = self.buffer("wrap", "([BII)Ljava/nio/ByteBuffer;", array, 2, 4)
+        self.assertEqual((self.buffer("position", "()I", part), self.buffer("capacity", "()I", part),
+                          self.buffer("getInt", "()I", part)), (2, 10, 0))
+        into = [0, 0]
+        self.buffer("rewind", "()Ljava/nio/ByteBuffer;", part)
+        self.buffer("get", "([B)Ljava/nio/ByteBuffer;", part, into)
+        self.assertEqual(into, [9, 0])
+        for bad in (lambda: self.buffer("getLong", "()J", self.buffer("allocate", "(I)Ljava/nio/ByteBuffer;", 4)),  # underflow
+                    lambda: self.buffer("putInt", "(II)Ljava/nio/ByteBuffer;", small, 4, 1),  # past the limit
+                    lambda: self.call("Ljava/nio/ByteOrder;", "nativeOrder", "()Ljava/nio/ByteOrder;"),  # the device's
+                    lambda: self.buffer("allocateDirect", "(I)Ljava/nio/ByteBuffer;", 8)):
+            with self.assertRaises(dexvm.Unsupported):
+                bad()
+
+    def test_locale_split_arrays_and_adler32(self):
+        us, root = (dexvm._PLATFORM_STATICS[("Ljava/util/Locale;", name)] for name in ("US", "ROOT"))
+        fmt = "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+        self.assertEqual(self.call("Ljava/lang/String;", "format", fmt, us, "ANS-%016X", [0x1234]), "ANS-0000000000001234")
+        self.assertEqual(self.call("Ljava/lang/String;", "format", fmt, None, "%d", [7]), "7")  # null: no localization
+        self.assertEqual(self.call("Ljava/lang/String;", "toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;", "ans-ab", root), "ANS-AB")
+        split = lambda text, regex, *limit: self.call("Ljava/lang/String;", "split", "(Ljava/lang/String;" + "I" * len(limit) + ")[Ljava/lang/String;",
+                                                      text, regex, *limit)
+        self.assertEqual(split("a,b,,c,,", ","), ["a", "b", "", "c"])  # Trailing empty strings go.
+        self.assertEqual(split("a,b,,c,,", ",", -1), ["a", "b", "", "c", "", ""])
+        self.assertEqual(split("a,b,,c", ",", 2), ["a", "b,,c"])
+        self.assertEqual((split("", ","), split(",", ","), split("a.b", "\\."), split("a::b", "::")), ([""], [], ["a", "b"], ["a", "b"]))
+        self.assertEqual(self.call("Ljava/lang/String;", "repeat", "(I)Ljava/lang/String;", "ab", 3), "ababab")
+        array = [3, -1, 2, 0]
+        self.call("Ljava/util/Arrays;", "sort", "([III)V", array, 0, 3)
+        self.assertEqual(array, [-1, 2, 3, 0])
+        self.call("Ljava/util/Arrays;", "fill", "([BIIB)V", array, 1, 3, 7)
+        self.assertEqual(array, [-1, 7, 7, 0])
+        self.assertEqual((self.call("Ljava/util/Arrays;", "toString", "([B)Ljava/lang/String;", [1, -1]),
+                          self.call("Ljava/util/Arrays;", "toString", "([C)Ljava/lang/String;", [65, 66]),
+                          self.call("Ljava/util/Arrays;", "toString", "([I)Ljava/lang/String;", None)), ("[1, -1]", "[A, B]", "null"))
+        adler = dexvm._PLATFORM_NEW["Ljava/util/zip/Adler32;"]()
+        self.call("Ljava/util/zip/Adler32;", "<init>", "()V", adler)
+        self.call("Ljava/util/zip/Adler32;", "update", "([B)V", adler, dexvm._signed_bytes(b"Wiki"))
+        self.call("Ljava/util/zip/Adler32;", "update", "([BII)V", adler, dexvm._signed_bytes(b"xpediax"), 1, 5)
+        self.assertEqual(self.call("Ljava/util/zip/Adler32;", "getValue", "()J", adler), 0x11E60398)  # "Wikipedia"
+        for bad in (lambda: split("a.b", "."), lambda: split("a1b", "\\d"),  # A regex, not a literal.
+                    lambda: self.call("Ljava/util/Locale;", "getDefault", "()Ljava/util/Locale;"),
+                    lambda: self.call("Ljava/lang/String;", "format", fmt, "tr", "%d", [1]),
+                    lambda: self.call("Ljava/util/Arrays;", "sort", "([Ljava/lang/Object;)V", ["b", "a"])):
+            with self.assertRaises(dexvm.Unsupported):
+                bad()
+
+    def test_bytecode_long_to_bytes_checksum_and_locale(self):
+        # static String code(Context c) { ByteBuffer b = ByteBuffer.allocate(8); b.order(ByteOrder.LITTLE_ENDIAN);
+        #   b.putLong(0x0102030405060708L); Adler32 a = new Adler32(); a.update(b.array());
+        #   return Long.toHexString(a.getValue()).toUpperCase(Locale.US); }
+        strings = ["LCode;", "Landroid/content/Context;", "Ljava/lang/String;", "Ljava/nio/ByteBuffer;", "Ljava/nio/ByteOrder;",
+                   "Ljava/util/zip/Adler32;", "Ljava/util/Locale;", "Ljava/lang/Long;", "[B", "I", "J", "V",
+                   "code", "allocate", "order", "putLong", "array", "<init>", "update", "getValue", "toHexString",
+                   "toUpperCase", "LITTLE_ENDIAN", "US"]
+        s = {text: index for index, text in enumerate(strings)}
+        types = list(range(12))
+        t = {strings[index]: index for index in types}
+        protos = [(t["Ljava/lang/String;"], [t["Landroid/content/Context;"]]), (t["Ljava/nio/ByteBuffer;"], [t["I"]]),
+                  (t["Ljava/nio/ByteBuffer;"], [t["Ljava/nio/ByteOrder;"]]), (t["Ljava/nio/ByteBuffer;"], [t["J"]]),
+                  (t["[B"], []), (t["V"], []), (t["V"], [t["[B"]]), (t["J"], []), (t["Ljava/lang/String;"], [t["J"]]),
+                  (t["Ljava/lang/String;"], [t["Ljava/util/Locale;"]])]
+        methods = [(t["LCode;"], 0, s["code"]), (t["Ljava/nio/ByteBuffer;"], 1, s["allocate"]),
+                   (t["Ljava/nio/ByteBuffer;"], 2, s["order"]), (t["Ljava/nio/ByteBuffer;"], 3, s["putLong"]),
+                   (t["Ljava/nio/ByteBuffer;"], 4, s["array"]), (t["Ljava/util/zip/Adler32;"], 5, s["<init>"]),
+                   (t["Ljava/util/zip/Adler32;"], 6, s["update"]), (t["Ljava/util/zip/Adler32;"], 7, s["getValue"]),
+                   (t["Ljava/lang/Long;"], 8, s["toHexString"]), (t["Ljava/lang/String;"], 9, s["toUpperCase"])]
+        fields = [(t["Ljava/nio/ByteOrder;"], t["Ljava/nio/ByteOrder;"], s["LITTLE_ENDIAN"]),
+                  (t["Ljava/util/Locale;"], t["Ljava/util/Locale;"], s["US"])]
+        code = ([0x13 | 0 << 8, 8, 0x71 | 1 << 12, 1, 0x0000, 0x0C | 1 << 8]   # const/16 v0, 8; v1 = allocate(v0)
+                + [0x62 | 2 << 8, 0, 0x6E | 2 << 12, 2, 0x0021]                 # sget-object v2, LITTLE_ENDIAN; v1.order(v2)
+                + [0x18 | 2 << 8, 0x0708, 0x0506, 0x0304, 0x0102]               # const-wide v2, 0x0102030405060708
+                + [0x6E | 3 << 12, 3, 0x0321]                                   # v1.putLong(v2:v3)
+                + [0x6E | 1 << 12, 4, 0x0001, 0x0C | 1 << 8]                    # v1 = v1.array()
+                + [0x22 | 2 << 8, t["Ljava/util/zip/Adler32;"], 0x70 | 1 << 12, 5, 0x0002]  # v2 = new Adler32()
+                + [0x6E | 2 << 12, 6, 0x0012]                                   # v2.update(v1)
+                + [0x6E | 1 << 12, 7, 0x0002, 0x0B | 2 << 8]                    # v2:v3 = v2.getValue()
+                + [0x71 | 2 << 12, 8, 0x0032, 0x0C | 0 << 8]                    # v0 = Long.toHexString(v2:v3)
+                + [0x62 | 1 << 8, 1, 0x6E | 2 << 12, 9, 0x0010, 0x0C | 0 << 8]  # v0 = v0.toUpperCase(Locale.US)
+                + [0x11 | 0 << 8])                                              # return-object v0
+        vm = dexvm.Machine([dexvm.Dex(build_dex(strings, types, protos, methods, t["LCode;"], [(0, 0x9, 5, 1, code)], fields))])
+        self.assertEqual(vm.invoke("LCode;", "code", "(Landroid/content/Context;)Ljava/lang/String;", [vm.context], False),
+                         format(zlib.adler32(bytes([8, 7, 6, 5, 4, 3, 2, 1])), "X"))
 
 
 class DexVmTests(unittest.TestCase):

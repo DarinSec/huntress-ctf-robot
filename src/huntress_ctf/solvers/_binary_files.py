@@ -1,10 +1,12 @@
 """One bounded, integrity-checked member reader for Binary archive references."""
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from io import BytesIO
 from pathlib import PurePosixPath
+import os
 import zipfile
 
-from ..containers import LazyMembers, MAX_MEMBERS, ZIP_ERRORS, _external_unzip, passwords_from
+from ..containers import LazyMembers, MAX_MEMBERS, ZIP_ERRORS, _external_unzip, passwords_from, unzip_tool
 from ._binary_archive import aes_members
 from ._binary_formats import ParseError
 from .base import instruction_text
@@ -12,6 +14,7 @@ from .metadata import Files
 
 MAX_BINARY_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_BINARY_ARCHIVE_BYTES = 256 * 1024 * 1024
+WARM_WORKERS = max(1, min(4, os.cpu_count() or 1))  # External unzip processes at once.
 
 
 class BinaryFiles(Files):
@@ -27,6 +30,31 @@ class BinaryFiles(Files):
         self.indices = {}
         self.content = {}
         self.decrypted = {}
+        self.warmed = {}
+
+    def warm(self, blobs):
+        """Unpack several AES deliveries at once with the external tool (a Mastery's ten evidence.zip:
+        ~4.8 s one after another on 4 cores, ~1.5 s in parallel); read_index then checks and uses
+        them as before. A delivery that fails here is simply unpacked again on first read."""
+        todo = []
+        for blob in dict.fromkeys(blobs):
+            try:
+                infos = self.directory(blob)
+            except (ParseError, *ZIP_ERRORS):
+                continue
+            if id(blob) not in self.decrypted and any(x.compress_type == 99 and not x.is_dir() for x in infos):
+                todo.append((blob, infos))
+        if len(todo) < 2 or unzip_tool() is None:
+            return
+
+        def unpack(item):
+            blob, infos = item
+            return id(blob), _external_unzip(blob, infos, self.passwords, MAX_BINARY_ARCHIVE_BYTES)
+
+        with ThreadPoolExecutor(max_workers=min(len(todo), WARM_WORKERS)) as pool:
+            for key, verified in pool.map(unpack, todo):
+                if verified:
+                    self.warmed[key] = verified
 
     def directory(self, blob):
         key = id(blob)
@@ -78,7 +106,9 @@ class BinaryFiles(Files):
             archive_key = id(blob)
             if archive_key not in self.decrypted:
                 self.decrypted[archive_key] = {}
-                verified = _external_unzip(blob, infos, self.passwords, MAX_BINARY_ARCHIVE_BYTES)
+                warmed = self.warmed.pop(archive_key, None)
+                verified = warmed if warmed is not None else _external_unzip(
+                    blob, infos, self.passwords, MAX_BINARY_ARCHIVE_BYTES)
                 missing = {i for i, x in enumerate(infos) if x.compress_type == 99 and not x.is_dir()} - verified.keys()
                 if missing:
                     verified.update(aes_members(blob, infos, self.passwords, MAX_BINARY_MEMBER_BYTES,

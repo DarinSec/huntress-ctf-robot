@@ -281,6 +281,13 @@ its header) runs `daily` untimed from the release and then races the proven rout
 sweeps again within a minute whenever `~/src` or hints.json changes.
 `scripts/homebase-hof.sh` (cron every two hours 00:30-10:30 UTC) re-races every proven Warmups and
 Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
+From a player's own machine instead, `scripts/local-day.sh` does the same from this checkout (direct
+API, token from the git-ignored `.env`, state in `.huntress/`, Web left out of its default lanes,
+`MIN_DAY`, races only with `RACE=1`; install line in its header). Only one robot may play the team's
+shared attempts. Both sweeps can pass `daily --prove`: a Time Trial or Mastery someone solved by hand
+has no proven solver, so `--timed` would never race it; `--prove` gives it one untimed retry (a regular
+variant, never a ranked one; status first, a reconnect if an untimed attempt is still open, nothing
+while a timed one runs), and the robot's own CORRECT records the hint the race needs.
 
 ## Release day: a new question type
 
@@ -315,6 +322,13 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
 property names per format in the grader's style, each checked to get the right field on the
 first untimed answer, and the likely next Warmups encodings. A new day's property missing
 from it: add the row first, then the alias (`suggest._ALIASES`) or the reader.
+`tests/test_script_forecast.py` does the same for Script: the 14 languages the polyglot
+descriptors' `next_language` names but no day has shipped (awk ... zsh), each a specimen in the
+course's shape (header in the language's comment syntax, block comments too, SPLIT arrays with
+and without brackets) that must answer all 13 polyglot questions. `AndroidForecastTests` in
+`tests/test_dexvm.py` does it for Android: the Java utilities a computed code may reach next
+(ByteBuffer long-to-bytes, `String.format(Locale.US, ...)`, Adler32, literal split, Arrays),
+each Java's own result or `Unsupported`.
 
 `solvers/autoprop.py` tries first, without a human: for a `Determine <property>` that no
 parser knows, a Single Solve answers once with the field `suggest.confident()` finds

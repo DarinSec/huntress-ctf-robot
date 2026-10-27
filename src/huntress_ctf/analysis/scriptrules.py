@@ -14,6 +14,7 @@ import binascii
 import codecs
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -360,15 +361,27 @@ def lyr_decode(spec, payload):
     return data
 
 
-def _layered_header(text):
-    """The LYR record (with its layer spec as `_lyr`), also when spread over a SPLIT string array."""
-    m = LYR.search(text)
-    split = re.search(r"HUNTRESS_ANALYSIS_V1:SPLIT\b(.*?)[\]\)\}]", text, re.S)
-    if split and not m:
-        joined = "".join(re.findall(r"[\"']([A-Za-z0-9+/=._\-]+)[\"']", split.group(1)))
-        m = LYR.search("HUNTRESS_ANALYSIS_V1:" + joined)
-    if not m:
-        return None
+SPLIT = re.compile(r"HUNTRESS_ANALYSIS_V1:SPLIT\b")
+# A run of quoted pieces joined by nothing but spaces, commas, line continuations or + & . operators.
+SPLIT_RUN = re.compile(r"""(?:["'][A-Za-z0-9+/=._\-]+["'][\s,+&.\\]*)+""")
+SPLIT_RUNS_TRIED = 4
+
+
+def _split_pieces(text, piece):
+    """Joined candidates for a payload spread over a SPLIT string array: the strings up to the
+    array's closing bracket (the course's .gs shape), then the first few runs of quoted strings
+    after the header, for languages without bracketed arrays (fish, make)."""
+    header = SPLIT.search(text)
+    if not header:
+        return
+    closed = re.search(r"(.*?)[\]\)\}]", text[header.end():], re.S)
+    if closed:
+        yield "".join(re.findall(piece, closed.group(1)))
+    for run in itertools.islice(SPLIT_RUN.finditer(text, header.end()), SPLIT_RUNS_TRIED):
+        yield "".join(re.findall(piece, run.group()))
+
+
+def _lyr_record(m):
     try:
         rec = scripts.parse_record(lyr_decode(*m.groups()))
     except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, zlib.error, OSError, EOFError):
@@ -378,20 +391,20 @@ def _layered_header(text):
     return rec
 
 
-@functools.lru_cache(maxsize=None)
-def analysis_header(text):
-    """`HUNTRESS_ANALYSIS_V1:<KIND>-<payload>` (B64, HEX, FRAG dot-split hex, HB64, LYR) -> pipe k=v dict."""
-    layered = _layered_header(text)
-    if layered is not None:
-        return layered
-    m = ANALYSIS.search(text)
-    split = re.search(r"HUNTRESS_ANALYSIS_V1:SPLIT\b(.*?)[\]\)\}]", text, re.S)
-    if split:                                                # payload spread over a string array
-        joined = "".join(re.findall(r"[\"']([A-Za-z0-9+/=.\-]+)[\"']", split.group(1)))
-        m = re.match(r"([A-Z0-9]+)-([A-Za-z0-9+/=.]+)$", joined)
-    if not m:
-        return None
-    kind, p = m.groups()
+def _layered_header(text):
+    """The LYR record (with its layer spec as `_lyr`), also when spread over a SPLIT string array."""
+    m = LYR.search(text)
+    if m:
+        return _lyr_record(m)
+    for joined in _split_pieces(text, r"[\"']([A-Za-z0-9+/=._\-]+)[\"']"):
+        m = LYR.search("HUNTRESS_ANALYSIS_V1:" + joined)
+        rec = _lyr_record(m) if m else None
+        if rec is not None:
+            return rec
+    return None
+
+
+def _kind_record(kind, p):
     try:
         if kind == "HEX":
             raw = bytes.fromhex(p)
@@ -409,6 +422,23 @@ def analysis_header(text):
         return scripts.parse_record(raw)
     except (ValueError, binascii.Error, UnicodeDecodeError):
         return None
+
+
+@functools.lru_cache(maxsize=None)
+def analysis_header(text):
+    """`HUNTRESS_ANALYSIS_V1:<KIND>-<payload>` (B64, HEX, FRAG dot-split hex, HB64, LYR) -> pipe k=v dict."""
+    layered = _layered_header(text)
+    if layered is not None:
+        return layered
+    if not SPLIT.search(text):
+        m = ANALYSIS.search(text)
+        return _kind_record(*m.groups()) if m else None
+    for joined in _split_pieces(text, r"[\"']([A-Za-z0-9+/=.\-]+)[\"']"):  # payload spread over a string array
+        m = re.match(r"([A-Z0-9]+)-([A-Za-z0-9+/=.]+)$", joined)
+        rec = _kind_record(*m.groups()) if m else None
+        if rec is not None:
+            return rec
+    return None
 
 
 def record_of(text):

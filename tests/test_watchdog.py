@@ -1,6 +1,6 @@
 """The watchdog (ROBUSTNESS.md workstream 1): a hanging or crashing solver never stops the others.
 
-Synthetic solvers only: one loops forever, one raises, one answers. The acceptance test runs a
+Synthetic solvers only: one hangs forever, one raises, one answers. The acceptance test runs a
 whole timed race through run_fast with the hanging solver registered and checks that the good
 answer is still submitted.
 """
@@ -26,7 +26,7 @@ STOP = threading.Event()  # Lets an abandoned thread-mode hang end when its test
 
 def release_hangs():
     """Test cleanup: end every abandoned hang before the next test clears STOP again (otherwise
-    an old thread that had not yet seen STOP keeps spinning into later tests)."""
+    an old thread that had not yet seen STOP keeps hanging into later tests)."""
     STOP.set()
     for thread in threading.enumerate():
         if thread.name.startswith("solver-"):
@@ -37,8 +37,7 @@ class Hangs:
     name = "hangs"
 
     def solve(self, context):
-        while not STOP.is_set():
-            pass
+        STOP.wait()  # Hangs without burning a core: busy loops starved the parent on a 4-vCPU VM.
         return []
 
 
@@ -50,8 +49,7 @@ class HangsOnRealInput:
     def solve(self, context):
         if context.challenge_id == "warm-up":
             return []
-        while not STOP.is_set():
-            pass
+        STOP.wait()  # Hangs without burning a core: busy loops starved the parent on a 4-vCPU VM.
         return []
 
 

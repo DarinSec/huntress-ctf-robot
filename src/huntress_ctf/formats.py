@@ -849,11 +849,75 @@ def axml(data: bytes) -> list[tuple[str, dict[str, str]]]:
     return elements
 
 
+def _pb_varint(data: bytes, at: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, at
+        shift += 7
+        if shift > 63:
+            raise ValueError("protobuf varint too long")
+
+
+def _pb_fields(data: bytes) -> list[tuple[int, int, Any]]:
+    """(field number, wire type, value) of one protobuf message; length-delimited values as bytes."""
+    fields, at = [], 0
+    while at < len(data):
+        key, at = _pb_varint(data, at)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, at = _pb_varint(data, at)
+        elif wire == 2:
+            size, at = _pb_varint(data, at)
+            if at + size > len(data):
+                raise ValueError("protobuf field past its message")
+            value, at = data[at:at + size], at + size
+        elif wire in (1, 5):
+            value, at = data[at:at + (8 if wire == 1 else 4)], at + (8 if wire == 1 else 4)
+        else:
+            raise ValueError("protobuf wire type")
+        fields.append((number, wire, value))
+    return fields
+
+
+def proto_xml(data: bytes) -> list[tuple[str, dict[str, str]]]:
+    """An App Bundle's aapt2 proto XML (`base/manifest/AndroidManifest.xml` of an .aab) in axml()'s
+    shape: (tag, {attribute: value}) per element in document order. XmlNode: 1 element; XmlElement:
+    3 name, 4 attribute (2 name, 3 value), 5 child node."""
+    elements: list[tuple[str, dict[str, str]]] = []
+
+    def node(blob: bytes, depth: int) -> None:
+        if depth > 64 or len(elements) > 20000:
+            raise ValueError("proto XML too deep or too large")
+        for number, wire, value in _pb_fields(blob):
+            if number == 1 and wire == 2:
+                name, attributes, children = "", {}, []
+                for field, kind, item in _pb_fields(value):
+                    if field == 3 and kind == 2:
+                        name = item.decode("utf-8")
+                    elif field == 4 and kind == 2:
+                        parts = {n: v for n, k, v in _pb_fields(item) if k == 2}
+                        if 2 in parts:
+                            attributes[parts[2].decode("utf-8")] = parts.get(3, b"").decode("utf-8")
+                    elif field == 5 and kind == 2:
+                        children.append(item)
+                elements.append((name, attributes))
+                for child in children:
+                    node(child, depth + 1)
+
+    node(data, 0)
+    return elements
+
+
 def _apk(data: bytes, f: dict) -> None:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         names = archive.namelist()
         manifest = read_member(archive, "AndroidManifest.xml")
-    elements = axml(manifest)
+    # A module of an .aab keeps aapt2's protobuf manifest; an APK has binary XML (RES_XML_TYPE).
+    elements = proto_xml(manifest) if manifest[:1] == b"\x0a" else axml(manifest)
     root = next((attributes for tag, attributes in elements if tag == "manifest"), {})
     sdk = next((attributes for tag, attributes in elements if tag == "uses-sdk"), {})
     application = next((attributes for tag, attributes in elements if tag == "application"), {})
@@ -929,7 +993,10 @@ def describe(data: bytes) -> list[tuple[str, dict]]:
     for label, parse in (("elf", elf), ("pe", pe), ("wasm", wasm), ("java_class", java_class), ("dex", dex)):
         fields = parse(data)
         if fields is not None:
-            return [(label, fields)]
+            from . import formats_dfir
+
+            signature = formats_dfir.pe_signature(data) if label == "pe" else None
+            return [(label, fields)] + ([("pe_signature", signature)] if signature else [])
     from . import formats_dfir  # Formats no day has asked about yet (Day 24+ candidates).
 
     return other_formats(data) + document_formats(data) + formats_dfir.formats(data)

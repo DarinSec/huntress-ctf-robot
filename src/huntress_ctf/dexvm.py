@@ -8,7 +8,7 @@ may sit in the chain.
 The app is never run. This module parses classes*.dex and interprets the bytecode of the
 methods that chain reaches, with exact Java int/long semantics, in pure Python. Calls into
 the platform are allowed only for a short list of pure library methods (StringBuilder,
-String, Long/Integer, Math, Character, CRC32, MessageDigest, Base64), Context's package
+String, Long/Integer, Math, Character, CRC32, Adler32, MessageDigest, Base64, ByteBuffer), Context's package
 name and the APK's own assets/ members (read from the bytes in memory; Day 20 loads a second
 DEX from there with InMemoryDexClassLoader, and its classes are interpreted like the app's);
 anything else (files, network, platform reflection, clocks, threads) stops the run with
@@ -264,9 +264,10 @@ class Context:
     """getPackageName() and getAssets(); Day 23 only stores the argument. Assets are the APK's own
     assets/ members, read from the bytes in memory (Day 20 ships its second DEX there)."""
 
-    def __init__(self, package: str | None, apk: bytes | None = None) -> None:
+    def __init__(self, package: str | None, apk: bytes | None = None, splits: list[bytes] | None = None) -> None:
         self.package = package
         self.apk = apk
+        self.splits = list(splits or [])  # Day 26: the installed config/feature split APKs (splitSourceDirs).
 
     def asset(self, name: str) -> bytes:
         if self.apk is None:
@@ -302,10 +303,34 @@ class Sink:
 
 
 class Buffer:
-    """java.nio.ByteBuffer.wrap(byte[]); only ever handed to a class loader."""
+    """java.nio.ByteBuffer over a byte[] it shares (wrap) or owns (allocate), big-endian until
+    order() says otherwise. A class loader reads its bytes from position to limit."""
 
-    def __init__(self, data: bytes) -> None:
-        self.data = data
+    def __init__(self, array: list[int], position: int = 0, limit: int | None = None) -> None:
+        self.array, self.position = array, position
+        self.limit = len(array) if limit is None else limit
+        self.little = False
+
+    @property
+    def data(self) -> bytes:
+        return _bytes(self.array[self.position:self.limit])
+
+
+class Adler:
+    def __init__(self) -> None:
+        self.value = 1
+
+
+class Locale:
+    """java.util.Locale constants whose case mapping and digits are the root locale's."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+
+class ByteOrder:
+    def __init__(self, little: bool) -> None:
+        self.little = little
 
 
 class Loader:
@@ -453,8 +478,19 @@ class Unresolved:
 
 
 class PathToken:
-    """The app's own APK path (getPackageCodePath, ApplicationInfo.sourceDir). Only ZipFile and File
-    accept it: the real path holds a random install directory, so its text is never an answer."""
+    """The app's own APK path (getPackageCodePath, ApplicationInfo.sourceDir), or one split APK's
+    (ApplicationInfo.splitSourceDirs, day 26). Only ZipFile and File accept it: the real path holds a
+    random install directory, so its text is never an answer."""
+
+    def __init__(self, apk: bytes | None = None) -> None:
+        self.apk = apk  # None: the base APK itself.
+
+
+def _path_bytes(vm: "Machine", token: "PathToken") -> bytes:
+    data = token.apk if token.apk is not None else vm.context.apk
+    if data is None:
+        raise Unsupported("APK path without the APK")
+    return data
 
 
 class FileModel:
@@ -502,10 +538,14 @@ _PLATFORM_NEW = {
     **{kind: (lambda kind=kind: Spec(kind)) for kind in ("Ljavax/crypto/spec/SecretKeySpec;", "Ljavax/crypto/spec/IvParameterSpec;",
                                                           "Ljavax/crypto/spec/GCMParameterSpec;", "Ljavax/crypto/spec/PBEKeySpec;")},
     "Ljava/math/BigInteger;": BigNum, "Ljava/util/zip/ZipFile;": ApkZip, "Ljava/io/File;": FileModel,
-    "Ljava/io/ByteArrayInputStream;": lambda: Stream(b""),
+    "Ljava/io/ByteArrayInputStream;": lambda: Stream(b""), "Ljava/util/zip/Adler32;": Adler,
 }
 _PLATFORM_STATICS = {("Ljava/nio/charset/StandardCharsets;", name): Charset(name.replace("_", "-"))
                      for name in ("UTF_8", "US_ASCII", "ISO_8859_1", "UTF_16", "UTF_16BE", "UTF_16LE")}
+# Locales that case-map like the root locale (tr and az do not, so they stay Unsupported).
+_PLATFORM_STATICS.update({("Ljava/util/Locale;", name): Locale(name) for name in ("ROOT", "US", "ENGLISH", "UK", "CANADA")})
+_PLATFORM_STATICS.update({("Ljava/nio/ByteOrder;", "BIG_ENDIAN"): ByteOrder(False),
+                          ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN"): ByteOrder(True)})
 
 
 def _chars(value: Any) -> str:
@@ -628,6 +668,10 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
                 return "".join(chr(c) for c in value)
             return _chars(value)
         if name == "format":
+            if sig.startswith("(Ljava/util/Locale;"):
+                if args[0] is not None and not isinstance(args[0], Locale):
+                    raise Unsupported("String.format in a device locale")
+                args = args[1:]
             return _format(args[0], args[1] or [])
         if name == "join":
             items = args[1] if isinstance(args[1], list) else []
@@ -809,7 +853,7 @@ def _platform(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> 
         return this.package
     if cls == "Landroid/content/Context;" and name == "getPackageName" and vm.context.package:
         return vm.context.package
-    for handler in (_secondary_dex, _reflection, _android_apis):
+    for handler in (_secondary_dex, _reflection, _android_apis, _java_utils):
         handled = handler(cls, name, sig, args, vm)
         if handled is not _UNHANDLED:
             return handled
@@ -873,7 +917,7 @@ def _secondary_dex(cls: str, name: str, sig: str, args: list[Any], vm: "Machine"
             return len(this.data)
     if cls == "Ljava/nio/ByteBuffer;" and name == "wrap" and isinstance(this, list):
         start, count = (args[1], args[2]) if len(args) > 2 else (0, len(this))
-        return Buffer(_bytes(this[start:start + count]))
+        return Buffer(this, start, start + count)  # Java shares the array: capacity stays its length.
     if cls == "Ljava/lang/Class;" and name == "getClassLoader" and isinstance(this, JClass):
         return Loader()
     if isinstance(this, Loader):
@@ -968,8 +1012,61 @@ def _signers(apk: bytes) -> list[Signature]:
     except (*ZIP_ERRORS, KeyError, IndexError, ValueError) as error:
         raise Unsupported(f"signing certificate: {error}") from None
     if not found:
-        raise Unsupported("no v1 signing certificate")  # A v2/v3-only APK: its signing block is not read.
+        found = [Signature(certificate) for certificate in _block_certificates(apk)]
+    if not found:
+        raise Unsupported("no v1, v2 or v3 signing certificate")
     return found
+
+
+SIGNING_BLOCK_IDS = (0xF05368C0, 0x7109871A)  # v3 first, as Android prefers it; then v2.
+
+
+def _block_certificates(apk: bytes) -> list[bytes]:
+    """Each signer's first certificate from the APK Signing Block (v3, else v2), for a v1-less APK.
+
+    The block sits before the central directory: size, (u64 length, u32 id, value) pairs, size,
+    "APK Sig Block 42". A v2/v3 value: signers; each signer: signed data, whose second field holds
+    the certificates; every sequence and element is u32 length-prefixed."""
+    end = apk.rfind(b"PK\x05\x06", max(0, len(apk) - 65557))
+    if end < 0 or end + 22 > len(apk):
+        return []
+    directory = struct.unpack_from("<I", apk, end + 16)[0]
+    if directory < 24 or directory > len(apk) or apk[directory - 16:directory] != b"APK Sig Block 42":
+        return []
+    size = struct.unpack_from("<Q", apk, directory - 24)[0]
+    start = directory - size - 8
+    if start < 0 or struct.unpack_from("<Q", apk, start)[0] != size:
+        return []
+
+    def sequence(blob: bytes, limit: int = 64) -> list[bytes]:
+        items, at = [], 0  # Only the leading elements: v3 signed data has bare u32 SDK fields later.
+        while at + 4 <= len(blob) and len(items) < limit:
+            length = struct.unpack_from("<I", blob, at)[0]
+            if at + 4 + length > len(blob):
+                raise ValueError("signing block element past its sequence")
+            items.append(blob[at + 4:at + 4 + length])
+            at += 4 + length
+        return items
+
+    pairs, at = {}, start + 8
+    while at + 12 <= directory - 24:
+        length, kind = struct.unpack_from("<QI", apk, at)
+        if length < 4 or at + 8 + length > directory - 24:
+            return []
+        pairs.setdefault(kind, apk[at + 12:at + 8 + length])
+        at += 8 + length
+    for kind in SIGNING_BLOCK_IDS:
+        if kind in pairs:
+            try:
+                found = []
+                for signer in sequence(sequence(pairs[kind], 1)[0]):
+                    certificates = sequence(sequence(sequence(signer, 1)[0], 2)[1])
+                    if certificates:
+                        found.append(certificates[0])
+                return found
+            except (IndexError, ValueError, struct.error):
+                return []
+    return []
 
 
 def _manifest(apk: bytes) -> dict[str, str]:
@@ -1128,7 +1225,9 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
             return PackageManager(this)
         if name == "getApplicationInfo" and this.apk is not None and this.package:
             info = JObject("Landroid/content/pm/ApplicationInfo;")
-            info.fields.update(packageName=this.package, sourceDir=PathToken(), publicSourceDir=PathToken())
+            info.fields.update(packageName=this.package, sourceDir=PathToken(), publicSourceDir=PathToken(),
+                               splitSourceDirs=[PathToken(split) for split in this.splits] or None,
+                               splitPublicSourceDirs=[PathToken(split) for split in this.splits] or None)
             return info
     if isinstance(this, PackageManager):
         if name == "getPackageInfo":
@@ -1178,13 +1277,14 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
         this.path = args[1]
         return None
     if isinstance(this, FileModel) and name in ("length", "exists", "isFile"):
-        return len(vm.context.apk) if name == "length" else True
+        return len(_path_bytes(vm, this.path)) if name == "length" else True
     if isinstance(this, ApkZip):
         if name == "<init>":
             if not isinstance(args[1], PathToken) and not (isinstance(args[1], FileModel) and args[1].path is not None):
                 raise Unsupported("ZipFile outside the APK")
+            token = args[1] if isinstance(args[1], PathToken) else args[1].path
             try:
-                this.archive = zipfile.ZipFile(BytesIO(vm.context.apk))
+                this.archive = zipfile.ZipFile(BytesIO(_path_bytes(vm, token)))
             except ZIP_ERRORS as error:
                 raise Unsupported(f"ZipFile: {error}") from None
             return None
@@ -1231,6 +1331,136 @@ def _android_apis(cls: str, name: str, sig: str, args: list[Any], vm: "Machine")
         return Certificate(blob)
     if isinstance(this, Certificate) and name == "getEncoded":
         return _signed_bytes(this.data)
+    return _UNHANDLED
+
+
+# Java utilities a code method is likely to reach next (Darin's Android forecast, 26 Oct): a long
+# turned into bytes with ByteBuffer before a digest, String.format(Locale.US, ...) as Android lint
+# asks for, Adler32 beside CRC32, a literal split, Arrays.fill/sort/toString. A regex split, a
+# device locale, collections and streams stay Unsupported.
+
+_BUFFER_SIZES = {"get": 1, "put": 1, "getShort": 2, "putShort": 2, "getChar": 2, "putChar": 2,
+                 "getInt": 4, "putInt": 4, "getLong": 8, "putLong": 8}
+_REGEX_META = set(".$|()[]{}^?*+\\")
+
+
+def _buffer(this: Buffer, name: str, args: list[Any]) -> Any:
+    if name in ("get", "put") and len(args) > 1 and isinstance(args[1], list):  # bulk, relative
+        array = args[1]
+        start, count = (args[2], args[3]) if len(args) > 3 else (0, len(array))
+        if count < 0 or this.position + count > this.limit or start < 0 or start + count > len(array):
+            raise Unsupported(f"ByteBuffer.{name} past the limit")
+        source, target = (this.array, array) if name == "get" else (array, this.array)
+        at, other = (this.position, start) if name == "get" else (start, this.position)
+        target[other:other + count] = source[at:at + count]
+        this.position += count
+        return this
+    if name in _BUFFER_SIZES:
+        size, writes = _BUFFER_SIZES[name], name.startswith("put")
+        absolute = len(args) == (3 if writes else 2)
+        if len(args) > (3 if writes else 2) or not all(isinstance(value, int) for value in args[1:]):
+            raise Unsupported(f"ByteBuffer.{name}")
+        at = args[1] if absolute else this.position
+        if at < 0 or at + size > this.limit:
+            raise Unsupported(f"ByteBuffer.{name} past the limit")
+        order = "little" if this.little else "big"
+        if not absolute:
+            this.position += size
+        if writes:
+            this.array[at:at + size] = _signed_bytes((args[-1] & ((1 << 8 * size) - 1)).to_bytes(size, order))
+            return this
+        return int.from_bytes(_bytes(this.array[at:at + size]), order, signed=name != "getChar")
+    if name == "order":
+        if len(args) == 1:
+            return _PLATFORM_STATICS[("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN" if this.little else "BIG_ENDIAN")]
+        if not isinstance(args[1], ByteOrder):
+            raise Unsupported("ByteBuffer.order(null)")
+        this.little = args[1].little
+        return this
+    if name in ("position", "limit") and len(args) == 2:
+        if not 0 <= args[1] <= (this.limit if name == "position" else len(this.array)):
+            raise Unsupported(f"ByteBuffer.{name}({args[1]})")
+        setattr(this, name, args[1])
+        this.position = min(this.position, this.limit)
+        return this
+    simple = {"array": lambda: this.array, "arrayOffset": lambda: 0, "position": lambda: this.position,
+              "limit": lambda: this.limit, "capacity": lambda: len(this.array),
+              "remaining": lambda: this.limit - this.position, "hasRemaining": lambda: this.position < this.limit}
+    if name in simple and len(args) == 1:
+        return simple[name]()
+    if name in ("flip", "rewind", "clear"):
+        if name == "flip":
+            this.limit = this.position
+        elif name == "clear":
+            this.limit = len(this.array)
+        this.position = 0
+        return this
+    raise Unsupported(f"ByteBuffer.{name}")
+
+
+def _literal_split(text: str, regex: str, limit: int) -> list[str]:
+    """String.split for a regex that matches only itself (Java's own fast path, and plain words)."""
+    if len(regex) == 2 and regex[0] == "\\" and not regex[1].isalnum():
+        regex = regex[1]
+    elif not regex or _REGEX_META & set(regex):
+        raise Unsupported(f"String.split by a regex {regex!r}")
+    if regex not in text:
+        return [text]
+    parts = text.split(regex, limit - 1) if limit > 0 else text.split(regex)
+    while limit == 0 and parts and not parts[-1]:
+        parts.pop()
+    return parts
+
+
+def _java_utils(cls: str, name: str, sig: str, args: list[Any], vm: "Machine") -> Any:
+    this = args[0] if args else None
+    if cls == "Ljava/nio/ByteBuffer;" and name == "allocate" and isinstance(this, int):
+        if this < 0:
+            raise Unsupported("ByteBuffer.allocate of a negative size")
+        return Buffer([0] * this)
+    if isinstance(this, Buffer):
+        return _buffer(this, name, args)
+    if isinstance(this, Adler):
+        if name == "<init>":
+            return None
+        if name == "update":
+            data = bytes([args[1] & 0xFF]) if sig.startswith("(I)") else _bytes(args[1])
+            if sig.startswith("([BII)"):
+                data = _bytes(args[1][args[2]:args[2] + args[3]])
+            this.value = zlib.adler32(data, this.value)
+            return None
+        if name == "getValue":
+            return this.value
+        if name == "reset":
+            this.value = 1
+            return None
+    if cls == "Ljava/lang/String;" and isinstance(this, str):
+        if name in ("toUpperCase", "toLowerCase") and sig.startswith("(Ljava/util/Locale;)"):
+            if not isinstance(args[1], Locale):
+                raise Unsupported(f"String.{name} in a device locale")
+            return this.upper() if name == "toUpperCase" else this.lower()
+        if name == "split" and isinstance(args[1], str):
+            return _literal_split(this, args[1], args[2] if len(args) > 2 else 0)
+        if name == "repeat" and isinstance(args[1], int) and args[1] >= 0:
+            return this * args[1]
+    if cls == "Ljava/util/Arrays;" and isinstance(this, list):
+        if name == "fill":
+            start, end = (args[1], args[2]) if len(args) > 3 else (0, len(this))
+            if not 0 <= start <= end <= len(this):
+                raise Unsupported("Arrays.fill out of range")
+            this[start:end] = [args[-1]] * (end - start)
+            return None
+        if name == "sort" and sig[1:3] in ("[B", "[S", "[C", "[I", "[J") and len(args) in (1, 3):
+            start, end = (args[1], args[2]) if len(args) == 3 else (0, len(this))
+            if not 0 <= start <= end <= len(this):
+                raise Unsupported("Arrays.sort out of range")
+            this[start:end] = sorted(this[start:end])
+            return None
+        if name == "toString" and sig[1:3] in ("[B", "[S", "[C", "[I", "[J"):
+            items = (chr(value) for value in this) if sig[1:3] == "[C" else map(str, this)
+            return "[" + ", ".join(items) + "]"
+    if cls == "Ljava/util/Arrays;" and name == "toString" and this is None:
+        return "null"
     return _UNHANDLED
 
 
@@ -1497,12 +1727,12 @@ _ARRAY_KINDS = "ijozbcs"  # aget, -wide, -object, -boolean, -byte, -char, -short
 
 class Machine:
     def __init__(self, dexes: list[Dex], natives: dict[str, bytes] | None = None, package: str | None = None,
-                 apk: bytes | None = None) -> None:
+                 apk: bytes | None = None, splits: list[bytes] | None = None) -> None:
         self.classes: dict[str, ClassDef] = {}
         self.dexes: list[Dex] = []
         self.load(dexes)
         self.natives = natives or {}
-        self.context = Context(package, apk)
+        self.context = Context(package, apk, splits)
         self.statics: dict[tuple[str, str], Any] = {}
         self.initialized: set[str] = set()
         self.steps = 0
@@ -1929,8 +2159,10 @@ def _binary(kind: int, left: Any, right: Any, reverse: bool = False) -> Any:
 
 # --- Entry point ----------------------------------------------------------------------------------
 
-def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
-    """The app's computed answer code (Release.code and similar), or None when it cannot be derived."""
+def answer_code(apk_bytes: bytes, package: str | None = None, splits: list[bytes] | None = None) -> str | None:
+    """The app's computed answer code (Release.code and similar), or None when it cannot be derived.
+
+    splits are the bundle's other APKs of the same package (day 26 .apks), seen as splitSourceDirs."""
     try:
         with zipfile.ZipFile(BytesIO(apk_bytes)) as apk:
             names = apk.namelist()
@@ -1938,6 +2170,18 @@ def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
             libraries = [read_member(apk, name) for name in names if name.startswith("lib/x86_64/") and name.endswith(".so")]
     except (*ZIP_ERRORS, KeyError, struct.error, IndexError, UnicodeDecodeError, Unsupported):
         return None
+    # Splits load into the app's class loader: a feature split's code, a config split's
+    # lib/x86_64 (the base keeps any class both define). A damaged split is left out.
+    for split in splits or ():
+        try:
+            with zipfile.ZipFile(BytesIO(split)) as other:
+                more = other.namelist()
+                found = [Dex(read_member(other, name)) for name in sorted(more) if re.fullmatch(r"classes\d*\.dex", name)]
+                native = [read_member(other, name) for name in more if name.startswith("lib/x86_64/") and name.endswith(".so")]
+        except (*ZIP_ERRORS, KeyError, struct.error, IndexError, UnicodeDecodeError, Unsupported):
+            continue
+        dexes += found
+        libraries += native
     if not dexes:
         return None
     natives: dict[str, bytes] = {}
@@ -1954,7 +2198,7 @@ def answer_code(apk_bytes: bytes, package: str | None = None) -> str | None:
                         if body:
                             natives[symbol] = body
                             break
-    machine = Machine(dexes, natives, package, apk_bytes)
+    machine = Machine(dexes, natives, package, apk_bytes, splits)
     candidates = []
     for definition in machine.classes.values():
         for method in definition.methods.values():
