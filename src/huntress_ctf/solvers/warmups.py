@@ -12,8 +12,11 @@ Joining the decoded lines gives "... submit this exact answer to the Game Master
 Edge spaces matter ("nswer " + "to"), so lines are decoded without stripping.
 
 CURRICULUM was read from the Day 1-19 single solves: a line's chain is the chain that
-decoded its day's whole blob. A later day is learned without code: once the robot scores
-that day's single solve, the proven hint's chain is used for its Mastery lines.
+decoded its day's whole blob. Days 20-27 come from the Day 27 Mastery's 133 blobs: a fresh
+Homebase has no hints.json to learn them from, and guessing failed every blob there (Day 25's
+U+ line also reads as unicode/base64 noise). A later day is learned without code: once the
+robot scores that day's single solve, the proven hint's chain is used for its Mastery lines.
+Until then its line is guessed, and several readings are settled by the warmup sentence.
 """
 
 from __future__ import annotations
@@ -30,7 +33,13 @@ CURRICULUM: dict[int, tuple[str, ...]] = {
     6: ("octal",), 7: ("url",), 8: ("html",), 9: ("json",), 10: ("base32",),
     11: ("base64",), 12: ("reverse",), 13: ("atbash",), 14: ("caesar7",), 15: ("rot47",),
     16: ("morse", "hex"), 17: ("bacon", "hex"), 18: ("railfence3",), 19: ("hex",),
+    20: ("hex",), 21: ("base64", "zlib"), 22: ("base64", "zlib"), 23: ("ascii85",),
+    24: ("runlength",), 25: ("unicode",), 26: ("brainfuck",), 27: ("brainfuck",),
 }
+# The sentence every warmup states; it picks the one reading when guessed lines have several.
+SENTENCE = re.compile(r"Nice work decoding this warmup! To solve, submit this exact answer to the "
+                      r"Game Master: [a-z0-9]+(?:-[a-z0-9]+)*")
+MAX_READINGS = 256  # Combinations of guessed lines tried against SENTENCE.
 _LINE = re.compile(r"(\d{1,3})\t(.*)")
 _SINGLE_ID = re.compile(r"warmups-day-(\d{1,2})(?:/time_trial)?")
 _STRICT = tuple(name for name, _ in LAYERS)
@@ -51,20 +60,29 @@ def curriculum() -> dict[int, tuple[str, ...]]:
     return chains
 
 
-def _guess_fragment(payload: str) -> str | None:
-    """A line from an unknown day: the one printable decoding by strict chains of <= 2 steps.
+def _guesses(payload: str) -> set[str]:
+    """A line from an unknown day: its printable decodings by strict chains of <= 2 steps.
 
     Text ciphers (ROT, Atbash, reversal) fit any text, so they are never guessed here.
     """
-    found = {
+    return {
         piece for chain in (*((name,) for name in _STRICT), *product(_PAIRED, repeat=2))
         if (piece := decode_fragment(payload, chain)) is not None
     }
+
+
+def _guess_fragment(payload: str) -> str | None:
+    """The one printable decoding of a line from an unknown day, else None."""
+    found = _guesses(payload)
     return found.pop() if len(found) == 1 else None
 
 
 def split_message(text: str, chains: dict[int, tuple[str, ...]]) -> str | None:
-    """The sentence a numbered-lines blob encodes, or None if any line does not decode."""
+    """The sentence a numbered-lines blob encodes, or None if any line does not decode.
+
+    A guessed line with several readings is settled by SENTENCE: exactly one combination of
+    the readings must make the whole blob read as the warmup sentence.
+    """
     pieces = []
     for line in text.splitlines():
         if not line.strip():
@@ -74,13 +92,26 @@ def split_message(text: str, chains: dict[int, tuple[str, ...]]) -> str | None:
             return None
         index, payload = int(match[1]), match[2]
         chain = chains.get(index)
-        piece = decode_fragment(payload, chain) if chain else _guess_fragment(payload)
-        if piece is None:
+        if chain:
+            piece = decode_fragment(payload, chain)
+            readings = (piece,) if piece is not None else ()
+        else:
+            readings = tuple(sorted(_guesses(payload)))
+        if not readings:
             return None
-        pieces.append((index, piece))
+        pieces.append((index, readings))
     if not pieces:
         return None
-    return "".join(piece for _, piece in sorted(pieces, key=lambda item: item[0]))
+    ordered = [readings for _, readings in sorted(pieces, key=lambda item: item[0])]
+    combinations = 1
+    for readings in ordered:
+        combinations *= len(readings)
+    if combinations == 1:
+        return "".join(readings[0] for readings in ordered)
+    if combinations > MAX_READINGS:
+        return None
+    fits = {message for message in map("".join, product(*ordered)) if SENTENCE.fullmatch(message.strip())}
+    return fits.pop() if len(fits) == 1 else None
 
 
 class WarmupBlobSolver:

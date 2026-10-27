@@ -6,6 +6,7 @@ Every fixture is synthetic: the message, slug, and encodings are built here.
 import base64
 from contextlib import redirect_stdout
 from copy import deepcopy
+import gzip
 import hashlib
 import html
 from io import BytesIO, StringIO
@@ -16,6 +17,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import quote
 import zipfile
+import zlib
 
 from huntress_ctf.autopilot import COMPLETE
 from huntress_ctf.containers import Member
@@ -23,7 +25,7 @@ from huntress_ctf.decoders import MORSE, decode_fragment, peel
 from huntress_ctf.fastpath import run_fast
 from huntress_ctf.solvers import SolveContext
 from huntress_ctf.solvers.base import fits_format
-from huntress_ctf.solvers.warmups import CURRICULUM, WarmupBlobSolver, split_message
+from huntress_ctf.solvers.warmups import CURRICULUM, WarmupBlobSolver, _guesses, split_message
 from huntress_ctf.client import GameMasterError
 from huntress_ctf.state import deliveries
 
@@ -81,12 +83,32 @@ ENCODE = {
 }
 
 
+def _brainfuck(text):
+    return "".join(">" + "+" * ord(char) + "." for char in text)
+
+
+_BF_TO_OOK = {">": "Ook. Ook?", "+": "Ook. Ook.", ".": "Ook! Ook."}
+
+# Days 20-27 as the Day 27 Mastery's lines showed them (line 24 run-length, 25 code points).
+LATER_ENCODE = {
+    20: lambda t: ("﻿" + t).encode("utf-16-be").hex(),
+    21: lambda t: base64.b64encode(gzip.compress(t.encode())).decode(),
+    22: lambda t: base64.b64encode(zlib.compress(t.encode())).decode(),
+    23: lambda t: base64.a85encode(t.encode(), adobe=True).decode(),
+    24: lambda t: "".join(f"1:{char}," for char in t),
+    25: lambda t: " ".join(f"U+{ord(char):04X}" for char in t),
+    26: _brainfuck,
+    27: lambda t: " ".join(_BF_TO_OOK[op] for op in _brainfuck(t)),
+}
+
+
 def split_blob(slug, days=19):
     """The message cut into `days` numbered lines, line N encoded as Day N teaches."""
+    encode = {**ENCODE, **LATER_ENCODE}
     message = MESSAGE.format(slug)
     size = -(-len(message) // days)
     chunks = [message[i * size:(i + 1) * size] for i in range(days)]
-    return "\n".join(f"{n:02d}\t{ENCODE[n](chunk)}" for n, chunk in enumerate(chunks, 1) if chunk).encode()
+    return "\n".join(f"{n:02d}\t{encode[n](chunk)}" for n, chunk in enumerate(chunks, 1) if chunk).encode()
 
 
 def context(artifact, questions, members=(), challenge_id="warmups-day-19/mastery"):
@@ -119,10 +141,27 @@ class CourseTests(unittest.TestCase):
         text = split_blob("tidy-piano-butter-18").decode()
         self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("tidy-piano-butter-18"))
 
+    def test_split_message_joins_all_twenty_seven_days(self):
+        # A fresh Homebase has no hints.json: days 20-27 must come from CURRICULUM itself.
+        text = split_blob("cozy-basket-butter-13", days=27).decode()
+        self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("cozy-basket-butter-13"))
+
     def test_unknown_later_day_is_guessed_only_when_unambiguous(self):
-        text = "01\t" + base64.b64encode(b"Nice work, answer: ").decode() + "\n20\t" + "pale-moon-reef-31".encode().hex()
+        text = "01\t" + base64.b64encode(b"Nice work, answer: ").decode() + "\n40\t" + "pale-moon-reef-31".encode().hex()
         self.assertEqual(split_message(text, CURRICULUM), "Nice work, answer: pale-moon-reef-31")
-        self.assertIsNone(split_message("01\tTmljZQ==\n21\tjbex", CURRICULUM))  # ROT-like text: not guessed
+        self.assertIsNone(split_message("01\tTmljZQ==\n41\tjbex", CURRICULUM))  # ROT-like text: not guessed
+
+    def test_guessed_line_with_two_readings_is_settled_by_the_sentence(self):
+        # Day 27 Mastery: "U+0065 U+0074 U+002D U+0062" is "et-b" but also unicode/base64 noise.
+        payload = "U+0065 U+0074 U+002D U+0062"
+        self.assertGreater(len(_guesses(payload)), 1)
+        head, tail = MESSAGE.format("cozy-bask"), "utter-13"
+        chains = {1: ("base64",), 3: ("base64",)}
+        line = lambda n, text: f"{n:02d}\t" + base64.b64encode(text.encode()).decode()
+        text = "\n".join((line(1, head), f"02\t{payload}", line(3, tail)))
+        self.assertEqual(split_message(text, chains), MESSAGE.format("cozy-basket-butter-13"))
+        broken = "\n".join((line(1, "Hello "), f"02\t{payload}", line(3, tail)))
+        self.assertIsNone(split_message(broken, chains))  # No reading makes the sentence.
 
     def test_format_check(self):
         self.assertTrue(fits_format("tidy-piano-butter-18", SLUG_FORMAT))
@@ -148,13 +187,13 @@ class SolverTests(unittest.TestCase):
         self.assertEqual(WarmupBlobSolver().solve(other), [])
 
     def test_learned_day_comes_from_a_proven_hint(self):
-        hints = {"warmups-day-20": {"solvers": ["layered-decode"], "chain": ["hex", "reverse"]}}
+        hints = {"warmups-day-40": {"solvers": ["layered-decode"], "chain": ["hex", "reverse"]}}
         fragment = "Nice work, answer: pale-moon-reef-31"[::-1].encode().hex()
         with patch("huntress_ctf.hints.load_hints", return_value=hints):
             from huntress_ctf.solvers.warmups import curriculum
             chains = curriculum()
-        self.assertEqual(chains[20], ("hex", "reverse"))
-        self.assertEqual(split_message(f"20\t{fragment}", chains), "Nice work, answer: pale-moon-reef-31")
+        self.assertEqual(chains[40], ("hex", "reverse"))
+        self.assertEqual(split_message(f"40\t{fragment}", chains), "Nice work, answer: pale-moon-reef-31")
 
 
 class DeliveryTests(unittest.TestCase):
