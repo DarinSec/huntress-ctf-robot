@@ -68,14 +68,37 @@ def regf():
     return bytes(base) + bytes(hbin)
 
 
-def prefetch(version=30):
+def prefetch(version=30, metrics_at=0x130):
+    """Version 30 comes in two file-information sizes: metrics at 0x130 keep the run count at
+    0xD0, metrics at 0x128 (Day 26's real file) at 0xC8."""
     data = bytearray(0x200)
-    struct.pack_into("<I4sI", data, 0, version, b"SCCA", len(data))
+    struct.pack_into("<I4sII", data, 0, version, b"SCCA", 0x11, len(data))
     data[0x10:0x10 + 22] = "CMD.EXE".encode("utf-16-le") + bytes(8)
-    struct.pack_into("<I", data, 0x4C, 0x0A1B2C3D)
+    struct.pack_into("<II", data, 0x4C, 0x0A1B2C3D, 0)
+    struct.pack_into("<I", data, 0x54, metrics_at)
     struct.pack_into("<Q", data, 0x80, filetime())
-    struct.pack_into("<I", data, 0xD0, 9)
+    struct.pack_into("<I", data, 0xC8 if metrics_at == 0x128 else 0xD0, 9)
     return bytes(data)
+
+
+def xpress_literals(data, matches=()):
+    """An [MS-XCA] LZ77+Huffman stream where all 512 symbols have 9-bit codes (so symbol s is
+    coded as s); `matches` maps an output position to (length, offset) with length 3..17."""
+    bits, at = [], 0
+    while at < len(data):
+        if at in matches:
+            length, offset = matches[at]
+            offset_bits = offset.bit_length() - 1
+            symbol = 256 + 16 * offset_bits + (length - 3)
+            bits += [int(b) for b in format(symbol, "09b")]
+            bits += [int(b) for b in format(offset - (1 << offset_bits), f"0{offset_bits}b")] if offset_bits else []
+            at += length
+        else:
+            bits += [int(b) for b in format(data[at], "09b")]
+            at += 1
+    bits += [0] * (-len(bits) % 16 + 32)
+    words = [int("".join(map(str, bits[i:i + 16])), 2) for i in range(0, len(bits), 16)]
+    return bytes([0x99] * 256) + b"".join(struct.pack("<H", word) for word in words)
 
 
 def tiff():
@@ -155,8 +178,20 @@ class DfirFormatTests(unittest.TestCase):
         f = fields(prefetch(), "prefetch")
         self.assertEqual((f["executable_name"], f["prefetch_hash_hex"], f["run_count"]), ("CMD.EXE", "0A1B2C3D", 9))
         self.assertEqual(f["last_run_utc"], "2026-10-01T00:00:00Z")
-        compressed = fields(b"MAM\x04" + struct.pack("<I", 4096) + bytes(32), "prefetch")
-        self.assertEqual((compressed["compressed"], compressed["uncompressed_size"]), (True, 4096))
+        self.assertEqual((f["file_size"], fields(prefetch(metrics_at=0x128), "prefetch")["run_count"]), (0x200, 9))
+        plain = prefetch()
+        packed = xpress_literals(plain, {0x30: (17, 0x30), 0x100: (12, 0x40)})
+        rebuilt = bytearray(plain)
+        for at, (length, offset) in {0x30: (17, 0x30), 0x100: (12, 0x40)}.items():
+            for i in range(length):
+                rebuilt[at + i] = rebuilt[at + i - offset]
+        f = fields(b"MAM\x04" + struct.pack("<I", len(plain)) + packed, "prefetch")
+        self.assertEqual((f["compressed"], f["executable_name"], f["run_count"]), (True, "CMD.EXE", 9))
+        from huntress_ctf.formats_dfir import xpress_huffman
+        self.assertEqual(xpress_huffman(packed, len(plain)), bytes(rebuilt))
+        damaged = dict(formats(b"MAM\x04" + struct.pack("<I", 4096) + bytes(300)))["prefetch"]
+        self.assertEqual((damaged["compressed"], damaged["uncompressed_size"]), (True, 4096))
+        self.assertIn("damaged", damaged)  # Code lengths of all zeros are no code: nothing guessed.
 
     def test_property_lists_from_plistlib(self):
         value = {"Label": "com.example.agent", "ProgramArguments": ["/usr/bin/true", "-x"], "RunAtLoad": True}
