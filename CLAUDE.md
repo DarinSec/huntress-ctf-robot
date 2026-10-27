@@ -288,6 +288,10 @@ shared attempts. Both sweeps can pass `daily --prove`: a Time Trial or Mastery s
 has no proven solver, so `--timed` would never race it; `--prove` gives it one untimed retry (a regular
 variant, never a ranked one; status first, a reconnect if an untimed attempt is still open, nothing
 while a timed one runs), and the robot's own CORRECT records the hint the race needs.
+An untimed run that meets a timed attempt (`start` only reconnects: a race, or someone's
+run_for_time start) plays it by the race's rules, so its outcome is no verdict: `daily` waits
+until that attempt's deadline (at most 15 min) and plays one plain untimed retry (a regular
+variant), judged as usual. Day 27's Metadata Time Trial was turned down at 31/32 that way.
 
 ## Release day: a new question type
 

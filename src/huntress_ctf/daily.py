@@ -9,6 +9,7 @@ time, so they never share bandwidth, and each route races once unless `rerace` i
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from io import StringIO
 import json
 from pathlib import Path
@@ -46,6 +47,22 @@ _MODE_ORDER = {"time_trial": 1, "mastery": 2}
 # A skip that means "this route is blocked", not "there is nothing to do here": the
 # later modes of the family ask the same question kinds it was turned down for.
 TURNED_DOWN_REASON = "turned down as "
+
+# An untimed run that met a timed attempt waits for it to end before a regular retry. The
+# longest clock seen is a Mastery's (day 25: 595 s; Time Trials 50-80 s).
+TIMED_ATTEMPT_WAIT_MAX_S = 900.0
+TIMED_ATTEMPT_MARGIN_S = 3.0  # The service marks the attempt expired just after its deadline.
+
+
+def seconds_until(deadline: Any, now: float) -> float:
+    """Seconds from `now` (epoch) until an ISO deadline has passed, capped; 0 when unreadable."""
+    try:
+        end = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(0.0, min(end.timestamp() + TIMED_ATTEMPT_MARGIN_S - now, TIMED_ATTEMPT_WAIT_MAX_S))
 
 
 def _records(response: Any) -> list[dict[str, Any]]:
@@ -237,6 +254,7 @@ def run_daily(
     rerace: bool = False, wait_release: float = 0.0, workers: int = WORKERS,
     sleep: Callable[[float], None] = time.sleep, days: list[int] | None = None,
     reserve: int = 0, lanes: tuple[str, ...] = (), prove: bool = False,
+    now: Callable[[], float] = time.time,
 ) -> int:
     """`repeat` (timed) races each challenge that many times: Hall of Fame keeps the best.
 
@@ -249,6 +267,8 @@ def run_daily(
     of their Time Trial would block their timed race until it ends.
     `prove` (untimed) gives each solved but unproven Time Trial and Mastery one untimed run
     (`needs_proof`), so the timed pass after it can race a route a human solved first.
+    An untimed run that met a timed attempt (`start` only reconnects) is not the route's
+    verdict: the route waits for that attempt to end and then plays a regular variant.
     """
     began_all = clock()
     if days:
@@ -313,7 +333,27 @@ def run_daily(
                         print(note)
                 if code != COMPLETE:
                     break
-            if code == INCORRECT and not timed:
+            met = None if timed else reports[-1].get("timed_attempt")
+            after = running = None
+            if met and code not in (COMPLETE, PENDING) and record.get("run_for_time_supported") is True:
+                after = met.get("attempt_id") or "without an ID"
+                # Day 27: someone's timed Metadata Time Trial was played by the race's rules
+                # (confirmed mappings only: 31/32), and the route was turned down for the day.
+                # Wait for that attempt to end, then a plain retry: no clock, never a ranked variant.
+                wait = seconds_until(met.get("deadline"), now())
+                print(f"\n===== {challenge_id} (timed attempt {after}: "
+                      f"waiting {wait:.0f} s for it to end, then an untimed retry) =====")
+                sleep(wait)
+                report = {}
+                reports.append(report)
+                code = run_fast(
+                    target, challenge_id, challenge=record, artifact_dir=artifact_dir,
+                    work_dir=work_dir, hints_path=hints_path, capture_dir=capture_dir, clock=clock,
+                    pipeline=pipeline, report=report, prove=True,
+                )
+                if report.get("timed_attempt") and code not in (COMPLETE, PENDING):
+                    running = report["timed_attempt"].get("deadline")
+            if code == INCORRECT and not timed and running is None:
                 # One wrong answer of a new type rejects every right one: send them again kind
                 # by kind on the same open attempt, so the right kinds are accepted and the
                 # report names the new one (day 22 Binary: found in under a minute).
@@ -322,10 +362,16 @@ def run_daily(
             entry = {"challenge": challenge_id, "outcome": OUTCOMES.get(code, str(code))}
             if proving:
                 entry["proof"] = True
-            # So tonight's and tomorrow's races skip what the service turned down.
-            note = record_outcome(challenge_id, entry["outcome"], timed, hints_path)
-            if note:
-                print(note)
+            if after:
+                entry["after_timed_attempt"] = after
+            if running is not None:
+                # Still running past the wait: no verdict either, and day.sh sweeps again.
+                entry.update(outcome="error", reason=f"a timed attempt is still running (deadline {running})")
+            else:
+                # So tonight's and tomorrow's races skip what the service turned down.
+                note = record_outcome(challenge_id, entry["outcome"], timed, hints_path)
+                if note:
+                    print(note)
         except GameMasterError as exc:
             entry = {"challenge": challenge_id, "outcome": "error", "reason": str(exc)}
         found = [problem for report in reports for problem in report.get("solver_problems", ())]

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from huntress_ctf import solvers
 from huntress_ctf.autopilot import COMPLETE, INCORRECT, UNRESOLVED
 from huntress_ctf.client import GameMasterError
-from huntress_ctf.daily import eligibility, families, needs_proof, run_daily, wait_for_release
+from huntress_ctf.daily import eligibility, families, needs_proof, run_daily, seconds_until, wait_for_release
 from huntress_ctf.hints import get_hint, load_hints, record_hint, record_outcome
 from huntress_ctf.solvers import AnswerCandidate
 
@@ -125,6 +125,66 @@ class DailyTests(unittest.TestCase):
         with patch("huntress_ctf.daily.run_fast", return_value=COMPLETE) as fast:
             daily(prove=True, timed=True)
         self.assertNotIn("prove", fast.call_args_list[0].kwargs if fast.call_args_list else {})
+
+    def test_a_timed_attempt_met_untimed_is_waited_out_then_retried(self):
+        # Day 27 13:04:53: someone started Metadata's Time Trial timed; the untimed sweep 8 s
+        # later reconnected to it, answered 31/32 by the race's rules and turned the route down.
+        lane = "metadata-forensics"
+        family = [
+            {"id": "m-day-27", "lane": lane, "mode": "single_solve", "solved": True},
+            {"id": "m-day-27/time_trial", "lane": lane, "mode": "time_trial", "run_for_time_supported": True},
+            {"id": "m-day-27/mastery", "lane": lane, "mode": "mastery", "run_for_time_supported": True},
+        ]
+
+        class FamilyClient(ListOnlyClient):
+            def list_challenges(self, day=None, lane=None):
+                return {"challenges": family}
+
+        deadline = "2026-10-27T13:05:43Z"
+        started = 1793106300.0  # 13:05:00 UTC, 43 s before the deadline.
+        hints = self.root / "hints.json"
+
+        def daily(fake):
+            waits = []
+            with patch("huntress_ctf.daily.run_fast", side_effect=fake) as fast, \
+                    redirect_stdout(StringIO()) as output:
+                run_daily(FamilyClient(), artifact_dir=self.root, work_dir=self.root / "work",
+                          hints_path=hints, sleep=waits.append, now=lambda: started)
+            return fast.call_args_list, waits, output.getvalue().split("===== Summary =====")[1]
+
+        def met_then(code_after, still_running=False):
+            def fake(target, challenge_id, **kwargs):
+                if challenge_id == "m-day-27/time_trial" and (not kwargs.get("prove") or still_running):
+                    kwargs["report"]["timed_attempt"] = {"attempt_id": "someones", "deadline": deadline}
+                    return UNRESOLVED
+                return code_after
+            return fake
+
+        calls, waits, summary = daily(met_then(COMPLETE))
+        self.assertEqual([(c.args[1], bool(c.kwargs.get("prove"))) for c in calls],
+                         [("m-day-27/time_trial", False), ("m-day-27/time_trial", True), ("m-day-27/mastery", False)])
+        self.assertFalse(any(c.kwargs.get("timed") for c in calls))  # Never run_for_time.
+        self.assertEqual(waits, [46.0])  # Until the deadline, plus the margin.
+        self.assertIn('"after_timed_attempt": "someones"', summary)
+        self.assertNotIn("turned_down", load_hints(hints).get("m-day-27/time_trial", {}))
+        # Still running after the wait: an error (day.sh sweeps again), never turned down,
+        # and the Mastery waits for its Time Trial.
+        calls, _, summary = daily(met_then(UNRESOLVED, still_running=True))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("a timed attempt is still running", summary)
+        self.assertIn('"outcome": "error"', summary)
+        self.assertNotIn("turned_down", load_hints(hints).get("m-day-27/time_trial", {}))
+        # The regular variant's own verdict counts as usual.
+        daily(met_then(UNRESOLVED))
+        self.assertEqual(load_hints(hints)["m-day-27/time_trial"]["turned_down"], "unresolved")
+
+    def test_seconds_until_a_deadline(self):
+        noon = 1793102400.0  # 2026-10-27T12:00:00Z
+        self.assertEqual(seconds_until("2026-10-27T12:00:50Z", noon), 53.0)
+        self.assertEqual(seconds_until("2026-10-27T12:00:50.500+00:00", noon), 53.5)
+        self.assertEqual(seconds_until("2026-10-27T11:00:00Z", noon), 0.0)  # Ended already.
+        self.assertEqual(seconds_until("2026-10-28T12:00:00Z", noon), 900.0)  # Capped.
+        self.assertEqual(seconds_until("soon", noon), 0.0)
 
     def test_which_routes_need_a_proof(self):
         route = {"id": "b-day-26-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery",

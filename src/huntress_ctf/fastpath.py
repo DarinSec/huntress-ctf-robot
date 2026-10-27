@@ -122,10 +122,11 @@ def plan_route(before: Any, challenge: dict[str, Any], reserve: int = 0) -> tupl
 
 
 def plan_proof(before: Any) -> tuple[str, str | None]:
-    """An untimed proof run on a route someone already solved: 'retry', 'start', 'pending' or 'stop'.
+    """An untimed proof run on a route someone already solved, or the regular run after a timed
+    attempt an untimed sweep met (`daily`): 'retry', 'start', 'pending' or 'stop'.
 
-    The scored attempt has ended, so a plain `retry` (no run_for_time) opens a fresh regular
-    variant; a ranked variant is never spent. An untimed attempt still open (an earlier proof
+    The scored or timed attempt has ended, so a plain `retry` (no run_for_time) opens a fresh
+    regular variant; a ranked variant is never spent. An untimed attempt still open (an earlier proof
     the robot could not finish) is reconnected with `start`, so each sweep after a deploy
     retries it without spending another variant. A running timed attempt is left alone.
     """
@@ -138,6 +139,24 @@ def plan_proof(before: Any) -> tuple[str, str | None]:
     if active and state.deadline:
         return "stop", "A timed attempt is running on this route; a proof waits until it ends."
     return "start", None
+
+
+def _note_timed_attempt(report: dict[str, Any] | None, response: Any) -> None:
+    """An untimed run that met a timed attempt (a race, or someone's run_for_time start).
+
+    `start` only reconnects, so an untimed run plays that attempt by the race's rules (only
+    confirmed mappings) or, as a proof, leaves it alone. Day 27: 31/32 on someone's Metadata
+    Time Trial, and the route was turned down for the day. `daily` reads this mark, waits for
+    the attempt to end and plays a regular variant instead.
+    """
+    if report is None or response is None:
+        return
+    try:
+        state = AttemptState.parse(response)
+    except GameMasterError:
+        return
+    if state.deadline:
+        report["timed_attempt"] = {"attempt_id": state.attempt_id, "deadline": state.deadline}
 
 
 def warm_up(solvers: tuple[Solver, ...], left_out: list[Outcome] | None = None) -> tuple[Solver, ...]:
@@ -665,7 +684,7 @@ def _report(
         print("Status before start:")
         print_result(_without_repeats(before, printed), secrets)
     if not run.timed and run.route == "retry":
-        print("Route: retry (untimed proof: a fresh regular variant after the scored attempt; no ranked variant)")
+        print("Route: retry (untimed proof: a fresh regular variant after the attempt ended; no ranked variant)")
     elif not run.timed:
         print("Route: start (untimed request; reconnects to the current attempt)")
     else:
@@ -847,6 +866,8 @@ def run_fast(
             run.route, reason = "stop", f"status failed ({exc})"
         if run.route in ("pending", "stop"):
             print(f"No proof run was started: {reason}")
+            if run.route == "stop":
+                _note_timed_attempt(report, before)
             return PENDING if run.route == "pending" else UNRESOLVED
     if timed:
         # Before the clock. This request also leaves the connection warm for start.
@@ -906,6 +927,8 @@ def run_fast(
         responses["attempt"], responses["result"] = run.attempt, run.result
         if report is not None and run.problems:
             report["solver_problems"] = list(run.problems)  # Before _report, which may fail.
+        if not timed:
+            _note_timed_attempt(report, run.attempt)
         _report(client, challenge_id, challenge, before, run, hint, artifact_dir, work_dir, responses, secrets,
                 corpus_root=(hints_path.parent / "corpus") if hints_path else None)
         if report is not None:

@@ -386,6 +386,28 @@ class FastPathTests(unittest.TestCase):
                 self.assertEqual([call for call in client.calls
                                   if isinstance(call, tuple) and call[0] in ("start", "retry")], attempts)
 
+    def test_an_untimed_run_names_the_timed_attempt_it_met(self):
+        # Day 27: an untimed start reconnected to someone's timed Time Trial. `daily` needs to
+        # know, so the race's rules are not the route's verdict.
+        client = FakeClient(self.output, result={"result": "accepted", "remaining": 1})
+        report = {}
+        self.assertEqual(self.run_fast(client, timed=False, report=report), UNRESOLVED)
+        self.assertEqual(report["timed_attempt"], {"attempt_id": "one", "deadline": "2026-10-18T12:00:00Z"})
+        client = FakeClient(self.output)
+        client.status_response = {"answer_ids": ["a"], "attempt_id": "one", "state": "active",
+                                  "deadline": "2026-10-27T13:10:00Z"}
+        report = {}
+        self.assertEqual(self.run_fast(client, timed=False, prove=True, report=report), UNRESOLVED)
+        self.assertEqual(report["timed_attempt"]["deadline"], "2026-10-27T13:10:00Z")  # A proof waits too.
+        for timed in (True, False):
+            with self.subTest(timed=timed):
+                client = FakeClient(self.output)
+                if not timed:
+                    del client.assignment["deadline"]
+                report = {}
+                self.assertEqual(self.run_fast(client, timed=timed, report=report), COMPLETE)
+                self.assertNotIn("timed_attempt", report)  # A race's own clock, or no clock.
+
     def test_reserve_keeps_the_last_variants(self):
         for remaining, raced in ((9, True), (8, False), (None, False)):
             with self.subTest(remaining=remaining):
