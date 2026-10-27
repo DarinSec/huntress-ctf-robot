@@ -349,6 +349,10 @@ New York time). A new type (Metadata gets one most days, Warmups now and then) i
 slowest flag: Metadata Mastery came
 last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CTF VPN):
 
+0. Before the release, on the Mac: `python3 scripts/release_alerts.py` (any time before; it waits).
+   A macOS notification once per route the robot leaves unresolved, incorrect, errored or
+   turned down, per crashed solver, per route still unsolved 3 min after the release, and when
+   all are solved (with the last flag's minute). It reads `release_report.py --json --list`.
 1. `scripts/homebase.sh report`: every route's outcome, under each the kind the service
    rejected, the single answers the split pinned it to and the kinds nothing answered,
    and for each unresolved Warmups or Metadata route its questions with the field

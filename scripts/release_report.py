@@ -1,8 +1,10 @@
-"""The release at a glance, run on the Homebase: python3 -I release_report.py [day]
+"""The release at a glance, run on the Homebase: python3 -I release_report.py [--json [--list]] [day]
 
 Each route's outcome from the day's latest untimed and timed logs, then, for every
 unresolved Warmups or Metadata route, the questions from its triage.md with the field
 suggestions: a new question type is in sight in one call (scripts/homebase.sh report).
+`--json` prints the same verdicts for scripts/release_alerts.py, and `--list` adds each listed
+route's solved state from the Game Master (read-only; never a flag).
 """
 
 from __future__ import annotations
@@ -13,10 +15,12 @@ import json
 import os
 import re
 import sys
+from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 OWN_LANES = ("warmups", "metadata-forensics")
 HOME = os.path.expanduser("~")
+PROXY = os.environ.get("HUNTRESS_GM_URL", "http://10.0.0.219/huntress-ctf-proxy")
 
 
 def latest(day: int, kind: str) -> tuple[str | None, dict | None, str]:
@@ -106,8 +110,43 @@ def slowest_line(summary: dict) -> str | None:
         f"{item['solver']} {item['ms']:.0f} ms ({item['challenge']})" for item in slowest)
 
 
+def status(day: int, listed: bool = False) -> dict:
+    """The verdicts of the day's latest sweeps, and with `listed` who solved each route and when.
+
+    For scripts/release_alerts.py on the player's computer. The list record carries a solved
+    route's flag; only the id, lane, mode and solved_by are kept.
+    """
+    result: dict = {"day": day}
+    for kind in ("untimed", "timed"):
+        path, summary, text = latest(day, kind)
+        entry: dict = {"log": os.path.basename(path) if path else None, "running": bool(path) and summary is None}
+        if summary is not None:
+            blocked = blockers(text)
+            entry["routes"] = [
+                {"challenge": item.get("challenge"), "outcome": item.get("outcome"), "reason": item.get("reason"),
+                 "blockers": blocked.get(str(item.get("challenge")), [])}
+                for item in summary.get("challenges", ()) if isinstance(item, dict)]
+            entry["safe_mode"] = safe_mode_lines(summary)
+        result[kind] = entry
+    if listed:
+        try:
+            with urlopen(f"{PROXY}?op=list&day={day}&all=1", timeout=60) as response:
+                data = json.load(response)
+            result["listed"] = [
+                {"id": record.get("id"), "lane": record.get("lane"), "mode": record.get("mode"),
+                 "solved": record.get("solved") is True, "solved_by": record.get("solved_by")}
+                for record in data.get("challenges", []) if isinstance(record, dict)]
+        except (OSError, ValueError, AttributeError) as exc:
+            result["list_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return result
+
+
 def main() -> None:
-    day = int(sys.argv[1]) if len(sys.argv) > 1 else datetime.now(ZoneInfo("America/New_York")).day
+    args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    day = int(args[0]) if args else datetime.now(ZoneInfo("America/New_York")).day
+    if "--json" in sys.argv:
+        print(json.dumps(status(day, "--list" in sys.argv)))
+        return
     for kind in ("untimed", "timed"):
         path, summary, text = latest(day, kind)
         if path is None:

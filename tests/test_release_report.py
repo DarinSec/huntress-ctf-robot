@@ -82,5 +82,28 @@ class BlockerTests(unittest.TestCase):
         self.assertNotIn("binary-day-23-x", REPORT["blockers"](cut))
 
 
+class StatusTests(unittest.TestCase):
+    """`--json` for scripts/release_alerts.py: the latest sweep's verdicts, read from its log."""
+
+    def test_verdicts_and_blockers_of_the_latest_sweep(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            summary = {"challenges": [{"challenge": "binary-day-23-x", "outcome": "incorrect"}],
+                       "safe_mode": {"held_back": [{"challenge": "binary-day-23-x/mastery", "reason": "a mode before it"}]}}
+            Path(home, "day23-1300-untimed.log").write_text(LOG + "\n===== Summary =====\n" + json.dumps(summary))
+            names = REPORT["status"].__globals__  # run_path returned a copy of them.
+            saved, names["HOME"] = names["HOME"], home
+            try:
+                status = REPORT["status"](23)
+            finally:
+                names["HOME"] = saved
+        route = status["untimed"]["routes"][0]
+        self.assertEqual((route["outcome"], status["untimed"]["running"]), ("incorrect", False))
+        self.assertIn("kind rejected: d#_analysis_machine", route["blockers"])
+        self.assertEqual(status["untimed"]["safe_mode"], ["binary-day-23-x/mastery held back: a mode before it"])
+        self.assertEqual(status["timed"], {"log": None, "running": False})
+
+
 if __name__ == "__main__":
     unittest.main()
