@@ -32,6 +32,10 @@ class GameMasterError(RuntimeError):
     """An operation failed or its response cannot safely drive the next step."""
 
 
+class UncertainPost(GameMasterError):
+    """A POST failed in transit: it may or may not have reached the server (check status)."""
+
+
 def _identifier(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise GameMasterError("Challenge and answer IDs must be nonempty strings.")
@@ -271,18 +275,19 @@ class GameMasterClient:
             try:
                 status, response_headers, content = self._send(method, target, body, headers, limit, timeout)
                 break
-            except (OSError, HTTPException):
+            except (OSError, HTTPException) as exc:
                 self._drop()
                 # Only an idempotent GET on a possibly stale kept-alive connection is
-                # repeated, once. An uncertain POST must never be retried automatically.
+                # repeated, once. An uncertain POST is never repeated here: the fast path
+                # checks status first (fastpath._submit).
                 if method == "GET" and reused and not retried:
                     retried = True
                     continue
                 if method == "GET":
                     raise GameMasterError("Game Master transport failed (unreachable, timed out, or reset).") from None
-                raise GameMasterError(
-                    "Game Master transport failed. A POST may have reached the server; "
-                    "check status before repeating it."
+                raise UncertainPost(
+                    f"Game Master transport failed ({type(exc).__name__}). A POST may have reached the "
+                    "server; check status before repeating it."
                 ) from None
         return self._finish(status, response_headers, content, limit, expect_json)
 
@@ -356,7 +361,7 @@ class GameMasterClient:
         if self._connection is not None and time.monotonic() - self._last_used > IDLE_RECONNECT_SECONDS:
             self._drop()
         connection = self._open()
-        uncertain = GameMasterError(
+        uncertain = UncertainPost(
             "Game Master transport failed during a pipelined request. A POST may have "
             "reached the server; check status before repeating it."
         )

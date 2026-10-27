@@ -28,7 +28,7 @@ from .autopilot import (
     select_candidates, terminal_result,
 )
 from .capture import save_capture
-from .client import GameMasterClient, GameMasterError
+from .client import GameMasterClient, GameMasterError, UncertainPost
 from .containers import Member, passwords_from, prepare_tools, unwrap
 from .decoders import clear_cache
 from .display import print_result
@@ -42,6 +42,7 @@ from .workspace import write_workspace
 
 KNOWN_OUTCOMES = {"correct", "accepted", "incorrect", "expired"}
 REMAINING_FIELDS = ("ranked_attempts_remaining", "unique_attempts_remaining")
+SUBMIT_RECOVERY_WAITS_S = (3.0, 10.0)  # After a lost untimed submit POST: wait, status, resend.
 # Lanes whose start returns live `targets[]` instead of a file to download.
 TARGET_LANES = {"web-exploitation"}
 
@@ -501,9 +502,47 @@ def _race(
     run.marks["solved"] = clock()
     if run.submitted:
         run.wall["submit sent"] = time.time()
-        run.result = (run.submitter or client).submit_many(challenge_id, run.submitted)
+        run.result = _submit(client, run, challenge_id)
         run.marks["submit received"] = clock()
         run.wall["submit received"] = time.time()
+
+
+def _submit(client: GameMasterClient, run: Run, challenge_id: str) -> Any:
+    """Send run.submitted; after a POST lost in transit, recover on an untimed attempt.
+
+    The client never repeats an uncertain POST. Here status shows whether it landed, on an
+    untimed attempt only (no deadline: no clock, no ranked variant) and only while it is the
+    same attempt: still open, the answers not yet accepted go again; solved, that is the result,
+    but nothing is recorded as proven (a teammate may have solved it; --prove proves it later).
+    Day 27: three of fifteen release-time POSTs failed and waited ~5 min for the next sweep.
+    """
+    try:
+        return (run.submitter or client).submit_many(challenge_id, run.submitted)
+    except UncertainPost as exc:
+        started = run.started
+        if run.timed or started is None or started.deadline or not started.attempt_id:
+            raise
+        failure = exc
+    for wait in SUBMIT_RECOVERY_WAITS_S:
+        time.sleep(wait)
+        try:
+            response = client.status(challenge_id)
+            state = AttemptState.parse(response)
+        except GameMasterError:
+            continue
+        if state.attempt_id != started.attempt_id or state.deadline:
+            raise failure  # Another attempt now: these answers belong to the old one.
+        if state.complete:
+            run.notes.append("The submit POST was lost in transit; status shows the attempt solved.")
+            run.submitted = {}
+            return response
+        resend = {key: value for key, value in run.submitted.items() if key not in state.accepted_ids}
+        run.notes.append("The submit POST was lost in transit; status shows it open, so it was sent again.")
+        try:
+            return client.submit_many(challenge_id, resend or run.submitted)
+        except UncertainPost as exc:
+            failure = exc
+    raise failure
 
 
 def _solve_targets(

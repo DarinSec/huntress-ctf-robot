@@ -68,21 +68,22 @@ started_code=$(code)
 echo "== Day $day: untimed sweep (lanes $lanes), $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 --prove > "$log-untimed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-untimed.log"
+# A transport or server error (an overloaded release), or a sweep that died before its summary,
+# gets another sweep next minute, at most 10 times, before any race (an errored Single Solve
+# blocks its lane's later modes); unresolved and incorrect do not.
+retries="$state/day$day.retries"
+if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary =====' "$log-untimed.log"; } \
+    && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
+  echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
+  echo "== Day $day: errors in the sweep; trying again next minute, races after, $(date)"
+  exit 0
+fi
 if [ "${RACE:-0}" = "1" ]; then
   echo "== Day $day: timed races, $(date)"
   robot daily --day "$day" --lanes "$lanes" --timed --gate-ms "${GATE_MS:-1500}" --gate-wait 20 > "$log-timed.log" 2>&1
   sed -n '/===== Summary =====/,$p' "$log-timed.log"
 else
   echo "== Day $day: no timed races (RACE=1 turns them on), $(date)"
-fi
-# A transport or server error (an overloaded release), or a sweep that died before its summary,
-# gets another sweep next minute, at most 10 times; unresolved and incorrect do not.
-retries="$state/day$day.retries"
-if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary =====' "$log-untimed.log"; } \
-    && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
-  echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
-  echo "== Day $day: errors in the sweep; trying again next minute, $(date)"
-  exit 0
 fi
 version "$started_code" > "$swept"
 echo "== Day $day swept, $(date)"

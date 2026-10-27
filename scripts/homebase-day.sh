@@ -74,21 +74,23 @@ started_code=$(code)  # After the release wait: deploys while waiting are this s
 echo "== Day $day: untimed sweep, $(date)"
 robot daily --day "$day" --lanes "$lanes" --wait-release 1800 > "$log-untimed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-untimed.log"
+# A transport or server error in our lanes (an overloaded release), or a sweep that died
+# before its summary (a failed list), gets another sweep next minute, at most 10 times,
+# before any race: an errored Single Solve blocks its lane's later modes, and day 27's
+# races ran first for 2 min while three lanes waited. Unresolved and incorrect do not, so
+# a guess is never repeated.
+retries="$state/day$day.retries"
+if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary =====' "$log-untimed.log"; } \
+    && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
+  echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
+  echo "== Day $day: errors in the sweep; trying again next minute, races after, $(date)"
+  exit 0
+fi
 echo "== Day $day: timed races, $(date)"
 # A short gate: these races only set a first Hall of Fame time (flags came from the
 # untimed sweep, and hof.sh improves times at night), and while they run they hold
 # day.lock and the robot lock that a parser deployed minutes after the release needs.
 robot daily --day "$day" --lanes "$lanes" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-timed.log"
-# A transport or server error in our lanes (an overloaded release), or a sweep that died
-# before its summary (a failed list), gets another sweep next minute, at most 10 times;
-# unresolved and incorrect do not, so a guess is never repeated.
-retries="$state/day$day.retries"
-if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary =====' "$log-untimed.log"; } \
-    && [ "$(cat "$retries" 2>/dev/null || echo 0)" -lt 10 ]; then
-  echo $(( $(cat "$retries" 2>/dev/null || echo 0) + 1 )) > "$retries"
-  echo "== Day $day: errors in the sweep; trying again next minute, $(date)"
-  exit 0
-fi
 version "$started_code" > "$swept"  # After the races, which add to hints.json themselves.
 echo "== Day $day swept, $(date)"
