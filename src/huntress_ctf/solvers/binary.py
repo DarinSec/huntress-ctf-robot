@@ -537,6 +537,38 @@ def _unknown_property(prop: str, data: bytes, timed: bool) -> tuple[str | None, 
         evidence = f"{prop} has no binary rule; {label} field {key} matches it clearly (suggest.py)."
     return answer, evidence, ("autoprop", f"{prop}={label}:{key}")
 
+def _by_delivery(context: SolveContext, files: BinaryFiles, assigned: AssignedArchive, caches):
+    """The questions, a Mastery's one delivery at a time while the next ones unpack in the background.
+
+    Day 27's eleven AES sets were ~90 MB each unpacked; all held at once took 1.46 GB and the
+    1.9 GB Homebase killed the solver (exit -9). Between deliveries every cache of the finished
+    one is dropped, so at most `files.window()` sets are unpacked at once. One delivery: as before.
+    """
+    items = question_items(context)
+    if len(files.deliveries) <= 1:
+        yield from items
+        return
+    order = {name: number for number, name in enumerate(files.deliveries)}
+    groups: dict[str | None, list[Question]] = {}
+    for question in items:
+        root = (question.artifact or "").split(" -> ", 1)[0]
+        groups.setdefault(root if root in order else None, []).append(question)
+    keys = sorted(groups, key=lambda key: -1 if key is None else order[key])
+    blobs = [files.deliveries[key] for key in keys if key is not None]
+    window = files.window(blobs)
+    position = 0
+    for number, key in enumerate(keys):
+        ahead = blobs[position:position + window]
+        if number:
+            files.release(ahead)
+            assigned.release()
+            for cache in caches:
+                cache.clear()
+        files.prefetch(ahead)
+        yield from groups[key]
+        position += key is not None
+
+
 class BinarySolver:
     name = "binary-static-facts"
     lanes = frozenset({"binary", "binary-reverse-engineering"})
@@ -547,9 +579,7 @@ class BinarySolver:
             return []
         files, resolved, analyses, result = BinaryFiles(context), {}, {}, []
         assigned = AssignedArchive(context, files)
-        if len(files.deliveries) > 1:
-            files.warm(list(files.deliveries.values()))  # A Mastery's AES deliveries, unpacked in parallel.
-        for question in question_items(context):
+        for question in _by_delivery(context, files, assigned, (resolved, analyses)):
             try:
                 family = assigned.family(question)
                 data = assigned.resolve(question)

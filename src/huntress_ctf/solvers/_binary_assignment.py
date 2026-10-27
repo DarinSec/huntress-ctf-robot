@@ -237,6 +237,14 @@ class AssignedArchive:
             fields = {}
         self.timed = bool(fields.get("run_for_time") or fields.get("deadline"))
 
+    def release(self) -> None:
+        """Forget every member-keyed cache (a Mastery moving to its next delivery, see binary.py).
+
+        Keyed by id(): once the members are freed an id may be reused, so all of them go together."""
+        for cache in (self.archives, self.ordered_members, self.images, self.configs, self.jars,
+                      self.wasms, self.overlays, self.digests, self.records):
+            cache.clear()
+
     def digest(self, data: bytes, algorithm="sha256") -> str:
         key = (id(data), algorithm)
         if key not in self.digests:

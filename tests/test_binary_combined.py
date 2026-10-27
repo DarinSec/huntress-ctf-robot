@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import struct
 import unittest
@@ -16,6 +17,8 @@ from huntress_ctf.autopilot import build_context
 from huntress_ctf.solvers._binary_answers import valid_answer
 from huntress_ctf.solvers._binary_archive import aes_member, aes_members
 from huntress_ctf.solvers._binary_assignment import AssignedArchive, config_at
+from huntress_ctf.solvers._binary_files import BinaryFiles
+from huntress_ctf.solvers.base import SolveContext
 from huntress_ctf.solvers._binary_formats import ELF, ParseError
 from huntress_ctf.solvers._binary_wasm import Wasm
 from huntress_ctf.solvers.binary import BinarySolver
@@ -340,6 +343,33 @@ class AesFallbackTests(unittest.TestCase):
         ctx = replace(ctx, challenge={**ctx.challenge, 'instructions': 'The archive password is fixture-password.'})
         with patch('huntress_ctf.solvers._binary_files._external_unzip', return_value={}):
             self.assertEqual([v.answer for v in BinarySolver().solve(ctx)], ['x86_64'])
+
+    def test_mastery_unpacks_one_delivery_window_at_a_time(self):
+        # Day 27: eleven ~90 MB AES sets held at once got the solver killed on the 1.9 GB Homebase.
+        blobs = [aes_fixture(data) for data in (pe_fixture(32), pe_fixture(64), elf_fixture())]
+        questions = [dict(id=f"set{n}.arch", question="Determine binary.architecture.",
+                          artifact=f"delivery {n}: evidence.zip -> unit--sample.bin") for n in (1, 2, 3)]
+        attempt = {"questions": questions, "artifacts": [{"filename": "evidence.zip"}] * 3}
+        members = tuple(Member(f"delivery {n}: evidence.zip", blob) for n, blob in enumerate(blobs, 1))
+        ctx = SolveContext("binary-day-synthetic", {"lane": "binary", "instructions": "The archive password is fixture-password."},
+                           attempt, blobs[0], Path("synthetic.bin"), tuple(q["id"] for q in questions), members)
+        held, read_index = [], BinaryFiles.read_index
+
+        def spy(files, blob, index):
+            data = read_index(files, blob, index)
+            held.append(len(files.decrypted))
+            return data
+
+        with patch('huntress_ctf.solvers._binary_files._external_unzip', side_effect=lambda *args: {}):
+            with patch.dict(os.environ, {"HUNTRESS_BINARY_WINDOW": "1"}), patch.object(BinaryFiles, "read_index", spy):
+                lean = {v.answer_id: v.answer for v in BinarySolver().solve(ctx)}
+            with patch.dict(os.environ, {"HUNTRESS_BINARY_WINDOW": "8"}):
+                wide = {v.answer_id: v.answer for v in BinarySolver().solve(ctx)}
+        self.assertEqual(lean, wide)
+        self.assertEqual((lean["set1.arch"], lean["set2.arch"]), ("x86", "x86_64"))
+        self.assertIn("set3.arch", lean)
+        self.assertEqual(max(held), 1)
+
     def test_both_methods_versions_and_strengths(self):
         data = bytes(range(256)) * 700
         for method in (0, 8):

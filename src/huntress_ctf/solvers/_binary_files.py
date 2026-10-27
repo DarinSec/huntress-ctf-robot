@@ -15,6 +15,46 @@ from .metadata import Files
 MAX_BINARY_MEMBER_BYTES = 128 * 1024 * 1024
 MAX_BINARY_ARCHIVE_BYTES = 256 * 1024 * 1024
 WARM_WORKERS = max(1, min(4, os.cpu_count() or 1))  # External unzip processes at once.
+# How many unpacked deliveries a Mastery holds at once; 0 or unset = from MemAvailable. Day 27's
+# eleven AES sets were ~90 MB each unpacked: all at once they took 1.46 GB, and the 1.9 GB
+# Homebase killed the solver (exit -9). `HUNTRESS_BINARY_WINDOW=1` is the leanest.
+WINDOW_ENV = "HUNTRESS_BINARY_WINDOW"
+
+
+def _available_bytes():
+    """MemAvailable from /proc/meminfo, or None off Linux."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def window_for(sizes):
+    """Unpacked deliveries that fit at once: a quarter of free memory, 1 to WARM_WORKERS + 1."""
+    try:
+        forced = int(os.environ.get(WINDOW_ENV) or 0)
+    except ValueError:
+        forced = 0
+    if forced > 0:
+        return forced
+    largest, available = max(sizes, default=0), _available_bytes()
+    if not largest or available is None:
+        return 2
+    return max(1, min(WARM_WORKERS + 1, available // 4 // largest))
+
+
+def _unpack(blob, infos, passwords):
+    """Every AES member of one archive: the external tool first, the Python reader for the rest."""
+    verified = dict(_external_unzip(blob, infos, passwords, MAX_BINARY_ARCHIVE_BYTES))  # Ours to fill in.
+    missing = {i for i, x in enumerate(infos) if x.compress_type == 99 and not x.is_dir()} - verified.keys()
+    if missing:
+        verified.update(aes_members(blob, infos, passwords, MAX_BINARY_MEMBER_BYTES,
+                                    MAX_BINARY_ARCHIVE_BYTES, missing))
+    return verified
 
 
 class BinaryFiles(Files):
@@ -31,6 +71,53 @@ class BinaryFiles(Files):
         self.content = {}
         self.decrypted = {}
         self.warmed = {}
+        self.pending = {}  # id(archive) -> Future of _unpack, started by prefetch()
+        self._pool = None
+
+    def window(self, blobs):
+        """How many of these deliveries may be unpacked at once (window_for their unpacked sizes)."""
+        sizes = []
+        for blob in blobs:
+            try:
+                sizes.append(sum(x.file_size for x in self.directory(blob)))
+            except (ParseError, *ZIP_ERRORS):
+                continue
+        return window_for(sizes)
+
+    def prefetch(self, blobs):
+        """Unpack these AES deliveries in background threads while the current one is solved."""
+        for blob in dict.fromkeys(blobs):
+            key = id(blob)
+            if key in self.decrypted or key in self.pending or key in self.warmed:
+                continue
+            try:
+                infos = self.directory(blob)
+            except (ParseError, *ZIP_ERRORS):
+                continue
+            if any(x.compress_type == 99 and not x.is_dir() for x in infos):
+                if self._pool is None:
+                    self._pool = ThreadPoolExecutor(max_workers=WARM_WORKERS)
+                self.pending[key] = self._pool.submit(_unpack, blob, infos, self.passwords)
+
+    def release(self, keep):
+        """Drop every unpacked member and identity cache except those of the `keep` deliveries.
+
+        In place: AssignedArchive shares `content`. Delivery ids stay valid (the context holds
+        those bytes); a dropped nested blob's id may be reused, so nothing keyed by it survives."""
+        kept = {id(blob) for blob in keep} | {id(blob) for blob in self.deliveries.values()}
+        alive = {id(blob) for blob in keep}
+        for cache in (self.decrypted, self.warmed):
+            for key in [k for k in cache if k not in alive]:
+                del cache[key]
+        for key in [k for k in self.pending if k not in alive]:
+            self.pending.pop(key).cancel()  # One already running is dropped when it ends.
+        for key in [k for k in self.content if k[0] not in alive]:
+            del self.content[key]
+        for cache in (self.infos, self.indices, self._directories):
+            for key in [k for k in cache if k not in kept]:
+                del cache[key]
+        for key in [k for k in self._members if k[0] not in kept]:
+            del self._members[key]
 
     def warm(self, blobs):
         """Unpack several AES deliveries at once with the external tool (a Mastery's ten evidence.zip:
@@ -107,12 +194,17 @@ class BinaryFiles(Files):
             if archive_key not in self.decrypted:
                 self.decrypted[archive_key] = {}
                 warmed = self.warmed.pop(archive_key, None)
-                verified = warmed if warmed is not None else _external_unzip(
-                    blob, infos, self.passwords, MAX_BINARY_ARCHIVE_BYTES)
-                missing = {i for i, x in enumerate(infos) if x.compress_type == 99 and not x.is_dir()} - verified.keys()
-                if missing:
-                    verified.update(aes_members(blob, infos, self.passwords, MAX_BINARY_MEMBER_BYTES,
-                                                MAX_BINARY_ARCHIVE_BYTES, missing))
+                pending = self.pending.pop(archive_key, None)
+                if pending is not None:
+                    verified = pending.result()
+                elif warmed is not None:
+                    missing = {i for i, x in enumerate(infos) if x.compress_type == 99 and not x.is_dir()} - warmed.keys()
+                    verified = warmed
+                    if missing:
+                        verified.update(aes_members(blob, infos, self.passwords, MAX_BINARY_MEMBER_BYTES,
+                                                    MAX_BINARY_ARCHIVE_BYTES, missing))
+                else:
+                    verified = _unpack(blob, infos, self.passwords)
                 self.decrypted[archive_key] = verified
             data = self.decrypted[archive_key].get(index)
         else:
