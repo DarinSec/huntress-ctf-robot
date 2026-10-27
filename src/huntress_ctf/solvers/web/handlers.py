@@ -1154,22 +1154,30 @@ def solve_websocket_stream(target_url: str) -> str:
         s = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
         ss = ctx.wrap_socket(s, server_hostname=host) if ctx else s
         ws_key = base64.b64encode(os.urandom(16)).decode("utf-8")
+        host_header = host if (port in (80, 443)) else f"{host}:{port}"
+        origin_header = f"{parsed.scheme}://{host}" if (port in (80, 443)) else f"{parsed.scheme}://{host}:{port}"
         req = (
             f"GET {p} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
+            f"Host: {host_header}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {ws_key}\r\n"
             f"Sec-WebSocket-Version: 13\r\n"
-            f"Origin: https://{host}\r\n"
+            f"Origin: {origin_header}\r\n"
             f"User-Agent: {DEFAULT_UA}\r\n\r\n"
         ).encode("utf-8")
         try:
             ss.sendall(req)
             resp = ss.recv(4096)
             if b"101" in resp.split(b"\r\n")[0]:
-                data = ss.recv(4096)
-                proof = _extract_proof(data.decode("utf-8", "replace"))
+                proof = _extract_proof(resp.decode("utf-8", "replace"))
+                if not proof:
+                    ss.settimeout(2.0)
+                    try:
+                        data = ss.recv(4096)
+                        proof = _extract_proof(data.decode("utf-8", "replace"))
+                    except Exception:
+                        pass
                 if proof:
                     return proof
         finally:
@@ -1468,6 +1476,17 @@ def solve_autonomous_web(target_url: str) -> str:
     if inv_route:
         try:
             return solve_api_authorization(target_url)
+        except Exception:
+            pass
+
+    # WebSocket Upgrade auto-detection on 426
+    if feat_route:
+        try:
+            st, b, _ = _request(f"{base}{feat_route}")
+            if st == 426 or "websocket" in b.lower() or "upgrade" in b.lower():
+                proof = solve_websocket_stream(target_url)
+                if proof:
+                    return proof
         except Exception:
             pass
 
