@@ -278,7 +278,11 @@ python -I scripts\solve_offline.py work\<id> --src src --show "<regex>"  # offli
 
 On the Homebase that plays, `scripts/homebase-day.sh` (cron every minute; install steps in
 its header) runs `daily` untimed from the release and then races the proven routes; it
-sweeps again within a minute whenever `~/src` or hints.json changes.
+sweeps again within a minute whenever `~/src` or hints.json changes. The release races wait
+until the day is fully handled (no route still unresolved/incorrect/errored, none skipped for
+a missing earlier mode or solver): on release day the flags matter, not a first Hall of Fame
+time, and a race holds day.lock and the robot lock for 1.5-5 min that a `fastdeploy` parser or
+a hand-solve needs (`RACE_WHEN_OPEN=1` overrides; hof.sh sets the HoF times at night anyway).
 `scripts/homebase-hof.sh` (cron every two hours 00:30-10:30 UTC) re-races every proven Warmups and
 Metadata route of earlier days for Hall of Fame times, keeping 8 fresh variants per route.
 From a player's own machine instead, `scripts/local-day.sh` does the same from this checkout (direct

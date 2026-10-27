@@ -86,10 +86,22 @@ if { grep -q '"outcome": "error"' "$log-untimed.log" || ! grep -q '===== Summary
   echo "== Day $day: errors in the sweep; trying again next minute, races after, $(date)"
   exit 0
 fi
+# Hall of Fame is not the priority on release day: getting every flag is. The races only
+# set a *first* Hall of Fame time (flags come from the untimed sweep, and hof.sh improves
+# the times at night), but they hold day.lock and the robot lock for 1.5-5 min (day 25:
+# 171+52+140 s) -- exactly while a parser from `fastdeploy` or a teammate's hand-solve needs
+# them, and while the next untimed sweep would pick up a newly solvable type. So they wait
+# until the day is fully handled: no route still unresolved/incorrect/errored, and none
+# skipped because an earlier mode or a solver is still missing. A later sweep (state changed:
+# a hand-solve, a deploy) finds everything done and races then. RACE_WHEN_OPEN=1 overrides it.
+open_routes=$(grep -E '"outcome": "(unresolved|incorrect|error|conflict)"|is not solved yet|no proven solver yet' "$log-untimed.log" | head -1)
+if [ -n "$open_routes" ] && [ "${RACE_WHEN_OPEN:-0}" != 1 ]; then
+  echo "== Day $day: routes still open; Hall of Fame races wait until the day is solved (hof.sh races at night), $(date)"
+  version "$started_code" > "$swept"  # Re-swept when a hand-solve or a deploy changes the state.
+  echo "== Day $day swept (no races yet), $(date)"
+  exit 0
+fi
 echo "== Day $day: timed races, $(date)"
-# A short gate: these races only set a first Hall of Fame time (flags came from the
-# untimed sweep, and hof.sh improves times at night), and while they run they hold
-# day.lock and the robot lock that a parser deployed minutes after the release needs.
 robot daily --day "$day" --lanes "$lanes" --timed --gate-ms 600 --gate-wait 20 > "$log-timed.log" 2>&1
 sed -n '/===== Summary =====/,$p' "$log-timed.log"
 version "$started_code" > "$swept"  # After the races, which add to hints.json themselves.
