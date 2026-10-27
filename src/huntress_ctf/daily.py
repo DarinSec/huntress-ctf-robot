@@ -54,6 +54,19 @@ TIMED_ATTEMPT_WAIT_MAX_S = 900.0
 TIMED_ATTEMPT_MARGIN_S = 3.0  # The service marks the attempt expired just after its deadline.
 
 
+def _lost_solver(report: dict[str, Any]) -> str | None:
+    """A solver the race lost to its machine, not to its answers: killed by a signal (the OOM killer).
+
+    How much memory is free depends on what the other families unpack at that moment, so another
+    sweep can finish it. A watchdog timeout is left alone: a hang repeats (`safe_mode`).
+    """
+    for problem in report.get("solver_problems") or ():
+        detail = str(problem.get("detail") or "")
+        if problem.get("stage") == "race" and problem.get("status") == "crashed" and "exited with code -" in detail:
+            return f"solver {problem.get('solver')} {problem.get('status')} after {problem.get('seconds')} s ({detail})"
+    return None
+
+
 def seconds_until(deadline: Any, now: float) -> float:
     """Seconds from `now` (epoch) until an ISO deadline has passed, capped; 0 when unreadable."""
     try:
@@ -364,9 +377,15 @@ def run_daily(
                 entry["proof"] = True
             if after:
                 entry["after_timed_attempt"] = after
+            lost = None if timed or code != UNRESOLVED else _lost_solver(reports[-1])
             if running is not None:
                 # Still running past the wait: no verdict either, and day.sh sweeps again.
                 entry.update(outcome="error", reason=f"a timed attempt is still running (deadline {running})")
+            elif lost:
+                # Day 27: Binary Mastery's solver was killed (-9, out of memory) 12.9 s in, and the
+                # route was turned down for the day. A killed or hung solver is no verdict of the
+                # service: an error, so day.sh sweeps again within a minute (at most 10 times).
+                entry.update(outcome="error", reason=f"{lost}; not the service's verdict, so it is tried again")
             else:
                 # So tonight's and tomorrow's races skip what the service turned down.
                 note = record_outcome(challenge_id, entry["outcome"], timed, hints_path)

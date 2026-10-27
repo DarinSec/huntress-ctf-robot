@@ -178,6 +178,35 @@ class DailyTests(unittest.TestCase):
         daily(met_then(UNRESOLVED))
         self.assertEqual(load_hints(hints)["m-day-27/time_trial"]["turned_down"], "unresolved")
 
+    def test_a_solver_killed_by_its_machine_is_tried_again_not_turned_down(self):
+        # Day 27: Binary Mastery's solver was killed (-9, out of memory on a 1.9 GB Homebase)
+        # 12.9 s in; the route was turned down and the robot stopped trying it for the day.
+        route = {"id": "b-day-27-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery",
+                 "run_for_time_supported": True}
+
+        class OneRoute(ListOnlyClient):
+            def list_challenges(self, day=None, lane=None):
+                return {"challenges": [route]}
+
+        hints = self.root / "hints.json"
+        for status, detail, outcome in (
+            ("crashed", "the solver process exited with code -9", "error"),
+            ("timeout", "killed", "unresolved"),  # A hang repeats: the watchdog's verdict stands.
+            ("crashed", "ValueError: bad offset", "unresolved"),  # A bug on these bytes: a verdict.
+        ):
+            with self.subTest(detail=detail):
+                hints.unlink(missing_ok=True)
+
+                def fake(target, challenge_id, **kwargs):
+                    kwargs["report"]["solver_problems"] = [{"stage": "race", "solver": "binary-static-facts",
+                                                            "status": status, "seconds": 12.9, "detail": detail}]
+                    return UNRESOLVED
+                with patch("huntress_ctf.daily.run_fast", side_effect=fake), redirect_stdout(StringIO()) as output:
+                    run_daily(OneRoute(), artifact_dir=self.root, work_dir=self.root / "work", hints_path=hints)
+                summary = output.getvalue().split("===== Summary =====")[1]
+                self.assertIn(f'"outcome": "{outcome}"', summary)
+                self.assertEqual("turned_down" in load_hints(hints).get(route["id"], {}), outcome == "unresolved")
+
     def test_seconds_until_a_deadline(self):
         noon = 1793102400.0  # 2026-10-27T12:00:00Z
         self.assertEqual(seconds_until("2026-10-27T12:00:50Z", noon), 53.0)
