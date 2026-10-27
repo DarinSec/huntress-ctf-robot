@@ -263,6 +263,21 @@ class PropertyTests(unittest.TestCase):
         self.assertIsNone(m.pcap_packet_count(shb + idb + epb[:-4]))
         self.assertIsNone(m.pcap_packet_count(b"not a capture at all ..........."))
         self.assertIn("pcap.packet_count", m.PROPERTIES)
+        # Day 28 forecast: header fields with mappings of their own, so a timed race answers them.
+        fields = {name: m.PROPERTIES[name] for name in (
+            "pcap.version", "pcap.link_type", "pcap.linktype", "pcap.snapshot_length", "pcap.snaplen")}
+        for capture, expected in (
+            (three, ("2.4", "101", "65535")),
+            (pcap(">", [(40, 40)], linktype=1), ("2.4", "1", "65535")),
+            (pcap("<", [], linktype=0x10000001), ("2.4", "1", "65535")),  # FCS bits are not the link type
+            (shb + idb + epb * 5, ("1.0", "1", "65535")),
+        ):
+            got = tuple(fields[name](capture) for name in ("pcap.version", "pcap.link_type", "pcap.snapshot_length"))
+            self.assertEqual(got, expected)
+            self.assertEqual(fields["pcap.linktype"](capture), expected[1])
+            self.assertEqual(fields["pcap.snaplen"](capture), expected[2])
+        self.assertIsNone(fields["pcap.link_type"](b"not a capture at all ..........."))
+        self.assertIsNone(fields["pcap.link_type"](shb))  # No interface block: no link type.
 
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET

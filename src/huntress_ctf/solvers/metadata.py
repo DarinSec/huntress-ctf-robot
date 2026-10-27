@@ -700,6 +700,39 @@ def pcap_packet_count(data: bytes) -> str | None:
     return None
 
 
+def _pcap_header(data: bytes) -> tuple[str, int, int] | None:
+    """(version, link type, snapshot length) of a classic pcap, or of a pcapng's first interface.
+
+    Day 28 forecast: Day 27 asked only pcap.packet_count, and its prompt promised more of the
+    capture ("count traffic, reject malformed captures"); the forecast's other names (link_type,
+    snapshot_length) were autoprop guesses, which a timed race never makes. Header fields only.
+    """
+    if data[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d") and len(data) >= 24:
+        order = "<" if data[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
+        major, minor, _, _, snaplen, network = struct.unpack_from(order + "HHiIII", data, 4)
+        return f"{major}.{minor}", network & 0xFFFF, snaplen  # The upper bits carry FCS flags.
+    if data.startswith(b"\x0a\x0d\x0d\x0a") and len(data) >= 28:
+        order = "<" if data[8:12] == b"\x4d\x3c\x2b\x1a" else ">"
+        major, minor = struct.unpack_from(order + "HH", data, 12)
+        at = 0
+        while at + 20 <= len(data):
+            kind, length = struct.unpack_from(order + "II", data, at)
+            if length < 12 or at + length > len(data):
+                return None
+            if kind == 1:
+                linktype, _, snaplen = struct.unpack_from(order + "HHI", data, at + 8)
+                return f"{major}.{minor}", linktype, snaplen
+            at += length
+    return None
+
+
+def _pcap_field(index: int) -> Callable[[bytes], str | None]:
+    def read(data: bytes) -> str | None:
+        header = _pcap_header(data)
+        return None if header is None else str(header[index])
+    return read
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -726,6 +759,11 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "evtx.record_count": evtx_record_count,
     "prefetch.executable_name": prefetch_executable_name,
     "pcap.packet_count": pcap_packet_count,
+    "pcap.version": _pcap_field(0),
+    "pcap.link_type": _pcap_field(1),
+    "pcap.linktype": _pcap_field(1),
+    "pcap.snapshot_length": _pcap_field(2),
+    "pcap.snaplen": _pcap_field(2),
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
