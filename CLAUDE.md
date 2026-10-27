@@ -365,9 +365,13 @@ last on days 15, 16 and 20. From the Mac (`scripts/homebase.sh`, SSH over the CT
 3. Add the parser to `PROPERTIES` in `solvers/metadata.py`, usually one line on top of
    `formats.py` (e.g. `formats.macho_fields(data)["uuid"]`, `formats.elf(data)`), or a layer in
    `decoders.py`, with a synthetic test; run the tests.
-4. `scripts/homebase.sh deploy` (tests on the VM, then swaps `~/src`), then
-   `scripts/homebase.sh sweep`: Single Solve, Time Trial and Mastery score untimed, then
-   race once.
+4. `scripts/homebase.sh fastdeploy` (release day): only the tests and corpus lanes the change
+   can reach, then the swap and a sweep at once: 74 s for a Metadata parser (28 Oct, measured)
+   where `deploy` takes ~8.5 min, 7 of them replaying the whole corpus (Binary alone ~5 min, so a
+   Binary change still takes that long). A change to the robot itself gets the full checks. Run
+   `scripts/homebase.sh replay` after the day for the lanes it did not replay. Otherwise
+   `scripts/homebase.sh deploy`, then `sweep`. Single Solve, Time Trial and Mastery score
+   untimed, then race once.
 5. `scripts/homebase.sh times`: minutes after the release per route; the last flag of the
    day is the team's finish.
 

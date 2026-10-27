@@ -10,6 +10,13 @@
 #                                    minute cron sweeps the day with the new code. A lost
 #                                    answer, a solver over 2x slower (ALLOW_SLOWER=1 deploys
 #                                    anyway) or one that broke stops it (SKIP_REPLAY=1 skips)
+#   scripts/homebase.sh fastdeploy [lane ...]  release day: only the tests and corpus lanes the
+#                                    change can reach (scripts/fastdeploy.py; a change to the robot
+#                                    itself gets everything), then the swap and a sweep at once.
+#                                    ~1 min for a Metadata parser instead of ~8.5. DRY=1 stops before
+#                                    the swap; naming lanes replays only those
+#   scripts/homebase.sh replay [text]  the corpus against ~/src now (or only entries whose path
+#                                    contains the text), as the new baseline: after a fastdeploy day
 #   scripts/homebase.sh sweep        run ~/day.sh now instead of waiting for cron
 #   scripts/homebase.sh log          the latest day and Hall of Fame summaries
 #   scripts/homebase.sh pull <id>    copy work/<id>/ to artifacts/work/ (git-ignored), show triage.md
@@ -79,6 +86,23 @@ case "${1:-}" in
         HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=~/src python3 ~/replay.py > /dev/null 2>&1 || true  # New baseline.
         echo \"Deployed \$d (previous code in ~/src.previous).\""
     ;;
+  fastdeploy)
+    shift
+    for lane in "$@"; do [[ $lane =~ ^[a-z-]+$ ]] || { echo "Not a lane name: $lane" >&2; exit 2; }; done
+    stamp=$(date +%Y%m%d-%H%M%S)
+    (cd "$root" && find src tests -name __pycache__ -prune -o -type f -print \
+      | tar -cf - -T - scripts/homebase-day.sh scripts/homebase-hof.sh scripts/replay.py \
+          scripts/fastdeploy.py scripts/homebase-fastdeploy.sh) \
+      | remote "set -e; d=~/deploy-$stamp; mkdir \$d; tar -xf - -C \$d; cd \$d
+        DRY='${DRY:-0}' ALLOW_SLOWER='${ALLOW_SLOWER:-0}' SKIP_REPLAY='${SKIP_REPLAY:-0}' bash scripts/homebase-fastdeploy.sh $*"
+    ;;
+  replay)
+    only="${2:-}"
+    [[ $only =~ ^[A-Za-z0-9_-]*$ ]] || { echo "Not an entry name: $only" >&2; exit 2; }
+    remote "cd ~ && HUNTRESS_STATE_DIR=~/.huntress PYTHONPATH=~/src python3 ~/replay.py ${only:+--only $only} > ~/replay-last.log 2>&1; status=\$?
+      grep -B1 -A3 -E 'REGRESSION|SLOWER|BROKE' ~/replay-last.log | head -40; tail -1 ~/replay-last.log
+      echo \"\$(grep -c ' answered |' ~/replay-last.log) entries replayed (exit \$status; ~/replay-last.log)\""
+    ;;
   sweep)
     remote 'out=$(~/day.sh 2>&1); echo "${out:-Nothing new since the last sweep (or a sweep is already running).}"'
     ;;
@@ -107,7 +131,7 @@ case "${1:-}" in
     remote "python3 -I - ${2:-}" < "$root/scripts/release_report.py"
     ;;
   *)
-    sed -n '2,21p' "$0"
+    sed -n '2,/^# HB_HOST/p' "$0"
     exit 2
     ;;
 esac
