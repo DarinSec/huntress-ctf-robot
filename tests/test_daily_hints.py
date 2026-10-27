@@ -201,11 +201,39 @@ class DailyTests(unittest.TestCase):
                     kwargs["report"]["solver_problems"] = [{"stage": "race", "solver": "binary-static-facts",
                                                             "status": status, "seconds": 12.9, "detail": detail}]
                     return UNRESOLVED
+                waits = []
                 with patch("huntress_ctf.daily.run_fast", side_effect=fake), redirect_stdout(StringIO()) as output:
-                    run_daily(OneRoute(), artifact_dir=self.root, work_dir=self.root / "work", hints_path=hints)
+                    run_daily(OneRoute(), artifact_dir=self.root, work_dir=self.root / "work", hints_path=hints,
+                              sleep=waits.append)
                 summary = output.getvalue().split("===== Summary =====")[1]
                 self.assertIn(f'"outcome": "{outcome}"', summary)
                 self.assertEqual("turned_down" in load_hints(hints).get(route["id"], {}), outcome == "unresolved")
+                self.assertEqual(waits, [5.0, 15.0] if outcome == "error" else [])  # Twice more in the sweep.
+
+    def test_an_errored_route_runs_again_within_the_sweep(self):
+        # Day 27: three submits lost in transit at 13:00 waited ~5 min for day.sh's next sweep.
+        route = {"id": "s-day-27-x", "lane": "script-analysis", "mode": "single_solve", "run_for_time_supported": True}
+
+        class OneRoute(ListOnlyClient):
+            def list_challenges(self, day=None, lane=None):
+                return {"challenges": [route]}
+
+        for timed, outcomes, expected, waited in (
+            (False, [GameMasterError("Game Master transport failed (TimeoutError)"), COMPLETE], "complete", [5.0]),
+            (False, [GameMasterError("down")] * 3, "error", [5.0, 15.0]),
+            (True, [GameMasterError("down")], "error", []),  # A race never runs twice this way.
+        ):
+            with self.subTest(timed=timed, outcomes=len(outcomes)):
+                if timed:
+                    record_hint(route["id"], [AnswerCandidate("a", "x", "s", "e")], self.root / "hints.json")
+                waits = []
+                with patch("huntress_ctf.daily.run_fast", side_effect=outcomes) as fast, \
+                        redirect_stdout(StringIO()) as output:
+                    run_daily(OneRoute(), artifact_dir=self.root, work_dir=self.root / "work",
+                              hints_path=self.root / "hints.json", sleep=waits.append, timed=timed)
+                summary = output.getvalue().split("===== Summary =====")[1]
+                self.assertIn(f'"outcome": "{expected}"', summary)
+                self.assertEqual((waits, fast.call_count), (waited, len(outcomes)))
 
     def test_seconds_until_a_deadline(self):
         noon = 1793102400.0  # 2026-10-27T12:00:00Z

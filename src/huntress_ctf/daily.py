@@ -52,6 +52,9 @@ TURNED_DOWN_REASON = "turned down as "
 # longest clock seen is a Mastery's (day 25: 595 s; Time Trials 50-80 s).
 TIMED_ATTEMPT_WAIT_MAX_S = 900.0
 TIMED_ATTEMPT_MARGIN_S = 3.0  # The service marks the attempt expired just after its deadline.
+# An untimed route that errored (transport, an overloaded release, a killed solver) runs again
+# within the sweep after these waits, instead of a minute later from day.sh.
+ERROR_RETRY_WAITS_S = (5.0, 15.0)
 
 
 def _lost_solver(report: dict[str, Any]) -> str | None:
@@ -406,13 +409,26 @@ def run_daily(
         entry["wall_seconds"] = round(clock() - began, 3)
         return entry
 
+    def run_route(target: GameMasterClient, record: dict[str, Any]) -> dict[str, Any]:
+        """run_one, and an untimed route that errored again after a short wait (day 27: three lost
+        POSTs waited ~5 min for day.sh's next sweep). A start only reconnects and a submit checks
+        status first, so trying again is safe; day.sh's next minute stays the backstop."""
+        entry = run_one(target, record)
+        for number, wait in enumerate(() if timed else ERROR_RETRY_WAITS_S, 1):
+            if entry["outcome"] != "error" or entry.get("after_timed_attempt"):
+                break
+            print(f"\n===== {_id(record)} (error: {str(entry.get('reason', ''))[:160]}; again in {wait:.0f} s) =====")
+            sleep(wait)
+            entry = {**run_one(target, record), "error_retries": number}
+        return entry
+
     if timed or workers <= 1 or not hasattr(client, "clone"):
         entries: dict[int, dict[str, Any]] = {}
         for group in families(records):
-            _run_group(client, group, run_one, entries)
+            _run_group(client, group, run_route, entries)
         summary = [entries[id(record)] for record in records]
     else:
-        summary = _run_families(client, records, run_one, workers)
+        summary = _run_families(client, records, run_route, workers)
     result: dict[str, Any] = {
         "mode": "timed" if timed else "untimed", "challenges": summary,
         "wall_seconds": round(clock() - began_all, 3),
