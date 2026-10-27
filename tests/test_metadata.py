@@ -234,6 +234,36 @@ class PropertyTests(unittest.TestCase):
         self.assertEqual(m.registry_hive_root_name(hive(b"HuntressAssemblyLine")), "HuntressAssemblyLine")
         self.assertIsNone(m.registry_hive_root_name(b"not a registry hive at all ...."))
 
+    def test_pcap_packet_count(self):
+        # Day 27: classic pcap in both byte orders, a snaplen-truncated record, and pcapng.
+        def pcap(order, records, linktype=101):
+            magic = b"\xd4\xc3\xb2\xa1" if order == "<" else b"\xa1\xb2\xc3\xd4"
+            out = magic + struct.pack(order + "HHiIII", 2, 4, 0, 0, 65535, linktype)
+            for captured, original in records:
+                out += struct.pack(order + "IIII", 1793793776, 0, captured, original) + b"\x45" * captured
+            return out
+
+        three = pcap("<", [(16, 16), (21, 21), (10, 64)])  # the third kept 10 of 64 bytes: still a packet
+        self.assertEqual(m.pcap_packet_count(three), "3")
+        self.assertEqual(m.pcap_packet_count(pcap(">", [(40, 40)] * 34)), "34")
+        self.assertEqual(m.pcap_packet_count(pcap("<", [])), "0")
+        # Malformed captures answer nothing: cut short, trailing bytes, captured past original.
+        self.assertIsNone(m.pcap_packet_count(three[:-1]))
+        self.assertIsNone(m.pcap_packet_count(three + b"\0" * 7))
+        self.assertIsNone(m.pcap_packet_count(pcap("<", [(20, 10)])))
+
+        def block(kind, body):
+            length = 12 + len(body)
+            return struct.pack("<II", kind, length) + body + struct.pack("<I", length)
+
+        shb = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+        idb = block(1, struct.pack("<HHI", 1, 0, 65535))
+        epb = block(6, struct.pack("<IIIII", 0, 0, 0, 4, 4) + b"\x45" * 4)
+        self.assertEqual(m.pcap_packet_count(shb + idb + epb * 5), "5")
+        self.assertIsNone(m.pcap_packet_count(shb + idb + epb[:-4]))
+        self.assertIsNone(m.pcap_packet_count(b"not a capture at all ..........."))
+        self.assertIn("pcap.packet_count", m.PROPERTIES)
+
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET
 
