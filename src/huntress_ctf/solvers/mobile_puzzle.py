@@ -105,6 +105,8 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
             found.add(bytes(byte ^ key[i % len(key)] for i, byte in enumerate(raw)).decode("latin-1"))
     elif codec == "base58":
         found.add(_base58(data))
+    elif codec == "packet":
+        found |= _packets(data)
     else:
         found |= _search(data) | _split(puzzle)
     return {value.strip() for value in found}
@@ -159,6 +161,46 @@ def _raw_bytes(text: str) -> list[bytes]:
     except ValueError:
         pass
     return out
+
+
+def _frames(raw: bytes) -> list[bytes] | None:
+    """Payloads of back-to-back frames: magic (2 bytes), length byte, payload, XOR check byte.
+
+    The check byte is the XOR of every byte before it in its frame; one bad check or a
+    frame that runs past the end rejects the whole stream (None).
+    """
+    payloads, i = [], 0
+    while i < len(raw):
+        if raw[i:i + 2] != raw[:2] or i + 3 > len(raw):
+            return None
+        end = i + 3 + raw[i + 2]
+        if end >= len(raw):
+            return None
+        check = 0
+        for byte in raw[i:end]:
+            check ^= byte
+        if check != raw[end]:
+            return None
+        payloads.append(raw[i + 3:end])
+        i = end + 1
+    return payloads or None
+
+
+def _packets(data: str) -> set[str]:
+    """Day 28 "packet": hex of one framed message, "HA" + 0x14 + "ANS-0000000000000028" + 0x11.
+
+    A code is a verified frame's payload, or all payloads joined in order; a stream
+    that does not parse as frames falls back to the codes in its bytes.
+    """
+    found: set[str] = set()
+    for raw in _raw_bytes(data):
+        payloads = _frames(raw)
+        if payloads:
+            found.update(payload.decode("latin-1") for payload in payloads)
+            found.add(b"".join(payloads).decode("latin-1"))
+        else:
+            found.update(match.decode() for match in _IN_TEXT.findall(raw))
+    return found
 
 
 def _steps(text: str) -> set[str]:
