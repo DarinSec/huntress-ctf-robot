@@ -726,6 +726,51 @@ def _pcap_header(data: bytes) -> tuple[str, int, int] | None:
     return None
 
 
+def _gpt_header(data: bytes, lba: int) -> tuple[int, int, int] | None:
+    """(entry array LBA, entry count, entry size) of the GPT header at `lba` if its CRC holds."""
+    at = lba * 512
+    if lba < 1 or data[at:at + 8] != b"EFI PART" or len(data) < at + 92:
+        return None
+    size = struct.unpack_from("<I", data, at + 12)[0]
+    if not 92 <= size <= 512:
+        return None
+    header = bytearray(data[at:at + size])
+    stored = struct.unpack_from("<I", header, 16)[0]
+    header[16:20] = b"\0\0\0\0"
+    if zlib.crc32(bytes(header)) != stored:
+        return None
+    entries, count, entry_size = struct.unpack_from("<QII", data, at + 72)
+    if entry_size < 128 or len(data) < entries * 512 + count * entry_size:
+        return None
+    return entries, count, entry_size
+
+
+def disk_partition_start_lba_sequence(data: bytes) -> str | None:
+    """Start LBA of every partition in table order, as a compact JSON array (Day 28 disk images).
+
+    GPT (a protective 0xEE MBR): the used entries of the primary table, or of the backup header in
+    the last sector when the primary one fails its CRC; the 0xEE entry itself is no partition (the
+    autoprop guess `first_partition_start_lba` answered it, wrong). Plain MBR: the non-empty primary
+    slots in order. An extended chain or no valid table answers nothing (512-byte sectors only)."""
+    if len(data) < 1024 or data[510:512] != b"\x55\xaa":
+        return None
+    slots = [data[446 + 16 * i: 462 + 16 * i] for i in range(4)]
+    if any(slot[4] == 0xEE for slot in slots):
+        header = _gpt_header(data, 1) or _gpt_header(data, len(data) // 512 - 1)
+        if header is None:
+            return None
+        entries, count, entry_size = header
+        starts = []
+        for i in range(count):
+            at = entries * 512 + i * entry_size
+            if data[at:at + 16] != b"\0" * 16:
+                starts.append(struct.unpack_from("<Q", data, at + 32)[0])
+        return json.dumps(starts, separators=(",", ":"))
+    if any(slot[4] in (0x05, 0x0F, 0x85) for slot in slots):
+        return None
+    return json.dumps([struct.unpack_from("<I", slot, 8)[0] for slot in slots if slot[4]], separators=(",", ":"))
+
+
 def _pcap_field(index: int) -> Callable[[bytes], str | None]:
     def read(data: bytes) -> str | None:
         header = _pcap_header(data)
@@ -764,6 +809,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pcap.linktype": _pcap_field(1),
     "pcap.snapshot_length": _pcap_field(2),
     "pcap.snaplen": _pcap_field(2),
+    "disk.partition_start_lba_sequence": disk_partition_start_lba_sequence,
 }
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [

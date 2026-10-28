@@ -7,6 +7,7 @@ from pathlib import Path
 import struct
 import unittest
 import zipfile
+import zlib
 
 from huntress_ctf.solvers import SolveContext
 from huntress_ctf.solvers import metadata as m
@@ -278,6 +279,43 @@ class PropertyTests(unittest.TestCase):
             self.assertEqual(fields["pcap.snaplen"](capture), expected[2])
         self.assertIsNone(fields["pcap.link_type"](b"not a capture at all ..........."))
         self.assertIsNone(fields["pcap.link_type"](shb))  # No interface block: no link type.
+
+    def test_disk_partition_start_lba_sequence(self):
+        # Day 28: a GPT image behind a protective MBR, its backup header, and plain MBR.
+        def gpt(starts, sectors=256):
+            disk = bytearray(sectors * 512)
+            disk[446:462] = struct.pack("<B3sB3sII", 0, b"", 0xEE, b"", 1, sectors - 1)
+            disk[510:512] = b"\x55\xaa"
+            entries = bytearray(128 * 128)
+            for i, start in enumerate(starts):
+                entries[i * 128:i * 128 + 16] = b"\x11" * 16
+                entries[i * 128 + 32:i * 128 + 48] = struct.pack("<QQ", start, start + 9)
+            disk[1024:1024 + len(entries)] = entries
+            for lba, other in ((1, sectors - 1), (sectors - 1, 1)):
+                header = bytearray(struct.pack("<8sIIII", b"EFI PART", 0x10000, 92, 0, 0))
+                header += struct.pack("<QQQQ", lba, other, 34, sectors - 34) + b"\0" * 16
+                header += struct.pack("<QIII", 2, 128, 128, zlib.crc32(bytes(entries)))
+                header[16:20] = struct.pack("<I", zlib.crc32(bytes(header)))
+                disk[lba * 512:lba * 512 + 92] = header
+            return disk
+
+        read = m.PROPERTIES["disk.partition_start_lba_sequence"]
+        self.assertEqual(read(bytes(gpt([34]))), "[34]")  # not the protective entry's LBA 1
+        self.assertEqual(read(bytes(gpt([115, 204, 240]))), "[115,204,240]")
+        self.assertEqual(read(bytes(gpt([240, 115]))), "[240,115]")  # table order, not sorted
+        damaged = gpt([34, 90])
+        damaged[512 + 30] ^= 0xFF  # primary header fails its CRC: the backup header answers
+        self.assertEqual(read(bytes(damaged)), "[34,90]")
+        damaged[255 * 512 + 30] ^= 0xFF
+        self.assertIsNone(read(bytes(damaged)))  # neither header holds
+        mbr = bytearray(2048)
+        mbr[446:462] = struct.pack("<B3sB3sII", 0x80, b"", 0x07, b"", 2048, 100)
+        mbr[462:478] = struct.pack("<B3sB3sII", 0, b"", 0x83, b"", 4096, 100)
+        mbr[510:512] = b"\x55\xaa"
+        self.assertEqual(read(bytes(mbr)), "[2048,4096]")
+        mbr[478 + 4] = 0x05  # an extended chain: answers nothing rather than guess its shape
+        self.assertIsNone(read(bytes(mbr)))
+        self.assertIsNone(read(b"\0" * 2048))
 
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET
