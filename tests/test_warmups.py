@@ -99,6 +99,7 @@ LATER_ENCODE = {
     25: lambda t: " ".join(f"U+{ord(char):04X}" for char in t),
     26: _brainfuck,
     27: lambda t: " ".join(_BF_TO_OOK[op] for op in _brainfuck(t)),
+    28: lambda t: t.encode().hex()[::-1],  # "Back in Sixteen": hex, walking backwards.
 }
 
 
@@ -146,6 +147,10 @@ class CourseTests(unittest.TestCase):
         text = split_blob("cozy-basket-butter-13", days=27).decode()
         self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("cozy-basket-butter-13"))
 
+    def test_split_message_joins_all_twenty_eight_days(self):
+        text = split_blob("proud-compass-ember-84", days=28).decode()
+        self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("proud-compass-ember-84"))
+
     def test_unknown_later_day_is_guessed_only_when_unambiguous(self):
         text = "01\t" + base64.b64encode(b"Nice work, answer: ").decode() + "\n40\t" + "pale-moon-reef-31".encode().hex()
         self.assertEqual(split_message(text, CURRICULUM), "Nice work, answer: pale-moon-reef-31")
@@ -185,6 +190,15 @@ class SolverTests(unittest.TestCase):
         other = SolveContext("script-analysis-day-01", {"lane": "script-analysis"}, {"answer_ids": ["q1"]},
                              blob, Path("x"), ("q1",))
         self.assertEqual(WarmupBlobSolver().solve(other), [])
+
+    def test_text_cipher_single_blob_uses_its_days_chain(self):
+        # Day 28 Time Trial: peel never guesses reversal, so reversed hex needs CURRICULUM[28].
+        blob = LATER_ENCODE[28](MESSAGE.format("speedy-button-nugget-52")).encode()
+        for challenge_id in ("warmups-day-28", "warmups-day-28/time_trial"):
+            with self.subTest(challenge_id=challenge_id):
+                answers = WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id=challenge_id))
+                self.assertEqual([a.answer for a in answers], ["speedy-button-nugget-52"])
+        self.assertEqual(WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id="warmups-day-03")), [])
 
     def test_learned_day_comes_from_a_proven_hint(self):
         hints = {"warmups-day-40": {"solvers": ["layered-decode"], "chain": ["hex", "reverse"]}}
