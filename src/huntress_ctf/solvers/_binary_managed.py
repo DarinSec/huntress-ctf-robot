@@ -21,6 +21,16 @@ def clr_version(image: PE) -> str:
     return image.take(root + 16, length).rstrip(b"\0").decode("utf-8")
 
 
+def cli_runtime(image: PE) -> str:
+    """CLI header MajorRuntimeVersion.MinorRuntimeVersion (u16 at +4, +6), e.g. "2.5"."""
+    address, size = image.directory(14)
+    if not address or size < 16:
+        raise ParseError("No supported CLR header")
+    header = image.rva(address, 16)
+    major, minor = image.unpack("HH", header + 4)
+    return f"{major}.{minor}"
+
+
 class JavaClass(Reader):
     def __init__(self, data: bytes):
         super().__init__(data, ">")
@@ -30,7 +40,7 @@ class JavaClass(Reader):
         if not count:
             raise ParseError("Invalid classfile constant pool")
         self.utf8 = []
-        constants = {}
+        constants, class_names = {}, {}
         offset, index = 10, 1
         widths = {3: 4, 4: 4, 5: 8, 6: 8, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4,
                   12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
@@ -47,6 +57,8 @@ class JavaClass(Reader):
                 offset += length
             elif tag in widths:
                 self.take(offset, widths[tag])
+                if tag == 7:
+                    class_names[index], = self.unpack("H", offset)
                 offset += widths[tag]
                 if tag in (5, 6):
                     index += 1
@@ -55,7 +67,9 @@ class JavaClass(Reader):
             else:
                 raise ParseError("Unknown classfile constant tag")
             index += 1
-        self.access_flags, _, _, interfaces = self.unpack("HHHH", offset)
+        self.access_flags, this_class, _, interfaces = self.unpack("HHHH", offset)
+        # Day 28: "resolve its this_class constant-pool name" (CONSTANT_Class -> UTF-8, internal form).
+        self.this_class = constants.get(class_names.get(this_class))
         offset += 8
         self.take(offset, interfaces * 2)
         offset += interfaces * 2

@@ -22,7 +22,7 @@ from ..state import GameMasterError, current_fields, deliveries
 from ._binary_formats import ELF, MachO, Neko, PE, ParseError, parse_images
 from ._binary_answers import strict_json
 from ._binary_files import BinaryFiles, MAX_BINARY_MEMBER_BYTES
-from ._binary_managed import Jar, clr_version
+from ._binary_managed import Jar, cli_runtime, clr_version
 from ._binary_native import array_decoder_reference
 from ._binary_payloads import Overlay, read_overlay
 from ._binary_wasm import Wasm
@@ -202,6 +202,36 @@ def json_member_answer(text: str, read) -> tuple[bool, str | None]:
     if isinstance(value, (str, int)):
         return True, str(value)
     return True, None
+
+
+def sorted_lf_sha256(values) -> str:
+    """'sort strings by ascending code-unit order, join with one LF byte and no trailing LF, then
+    SHA-256 those UTF-8 bytes' (UTF-16 code units, as JavaScript sorts)."""
+    ordered = sorted(values, key=lambda value: value.encode("utf-16-be", "surrogatepass"))
+    return hashlib.sha256("\n".join(ordered).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def symbol_names(image: ELF) -> list[str]:
+    """Nonempty names "across the parsed symbol tables used by the ELF parser": .symtab when the
+    binary has one, else .dynsym. Day 28 accepted 771 for d13's /Crystal|...|GC_/ count (.symtab
+    alone) and rejected 1255 (.symtab plus .dynsym); d05, d11 and d18 agree either way."""
+    symbols = image.static_symbols if any(s.kind == 2 for s in image.sections) else image.all_symbols
+    return [s.name for s in symbols if s.name]
+
+
+def contains_clauses(text: str) -> list[tuple[str, str]] | None:
+    """'NimString or NimMain', 'FPC or any nonempty ELF symbol name contains FPC_' (day 28) as
+    [(where, needle)]: "bytes" or "symbol"; a bare token after a symbol clause stays a symbol one.
+    None for a clause no rule reads."""
+    clauses, where = [], "bytes"
+    for part in text.split(" or "):
+        symbol = re.fullmatch(r"any nonempty (?:ELF )?symbol name contains (\S+)", part)
+        if symbol:
+            where, part = "symbol", symbol[1]
+        elif not re.fullmatch(r"[A-Za-z0-9_.$:@-]+", part):
+            return None
+        clauses.append((where, part))
+    return clauses or None
 
 
 class AssignedArchive:
@@ -432,17 +462,8 @@ class AssignedArchive:
         group = namespace(question)
         return self.groups.get((group, question.artifact), []) if group is not None else []
 
-    def resolve(self, question: Question) -> bytes | None:
-        family = self.family(question)
-        if not family or not question.artifact:
-            return None
-        group_key = (namespace(question), question.artifact)
-        family_text = self.family_texts[group_key]
-        prefixes = self.prefixes[group_key]
-        if len(prefixes) != 1:
-            return None
-        prefix = next(iter(prefixes))
-        reference = question.artifact
+    def load(self, reference: str) -> tuple[bytes, list[zipfile.ZipInfo]] | None:
+        """The archive (or direct member) a question's artifact reference names, with its directory."""
         if reference not in self.archives:
             parts = reference.split(" -> ")
             root = parts[0]
@@ -469,6 +490,45 @@ class AssignedArchive:
             else:
                 infos = self.files.directory(blob)
             self.archives[reference] = blob, infos
+        return self.archives[reference]
+
+    def structural(self, question: Question) -> tuple[bool, str | None]:
+        """Questions about the archive's member list, not one member's bytes (day 28 d01 block):
+        "Count the d01-- members in the ZIP central directory" and "Compute each d01-- member's
+        lowercase SHA-256 in ZIP central-directory order, join those digests with ASCII colon
+        characters ..., then SHA-256 the resulting UTF-8 bytes"."""
+        q = question.text
+        count = re.search(r"Count the ([A-Za-z0-9_.-]+--) members in the ZIP central directory", q)
+        joined = re.search(r"Compute each ([A-Za-z0-9_.-]+--) member's lowercase SHA-256 in ZIP central-directory "
+                           r"order, join those digests with ASCII colon characters and no trailing newline, "
+                           r"then SHA-256 the resulting UTF-8 bytes", q)
+        if not (count or joined):
+            return False, None
+        if not question.artifact or self.load(question.artifact) is None:
+            return True, None
+        reference = question.artifact
+        blob, infos = self.archives[reference]
+        prefix = (count or joined)[1]
+        chosen = [(index, info) for index, info in enumerate(infos)
+                  if not info.is_dir() and PurePosixPath(info.filename).name.startswith(prefix)]
+        if count:
+            return True, str(len(chosen))
+        digests = [self.digest(self.member(reference, blob, index, info)) for index, info in chosen]
+        return True, hashlib.sha256(":".join(digests).encode("utf-8")).hexdigest() if digests else None
+
+    def resolve(self, question: Question) -> bytes | None:
+        family = self.family(question)
+        if not family or not question.artifact:
+            return None
+        group_key = (namespace(question), question.artifact)
+        family_text = self.family_texts[group_key]
+        prefixes = self.prefixes[group_key]
+        if len(prefixes) != 1:
+            return None
+        prefix = next(iter(prefixes))
+        reference = question.artifact
+        if self.load(reference) is None:
+            return None
         blob, infos = self.archives[reference]
         ordered_key = (reference if reference in self.direct_references else id(blob), prefix)
         if ordered_key not in self.ordered_members:
@@ -504,7 +564,15 @@ class AssignedArchive:
                 # vulnerable/corrected so far, so a new day's pair needs no new code.
                 named = re.search(r"Use the (?:unique )?[A-Za-z0-9_.-]+-- ([A-Za-z0-9_.-]+) member", q)
                 role = re.match(r"(?:set\d+\.)?d\d+_analysis_([a-z0-9]+)_", question.answer_id)
-                if named:
+                pair = re.search(r"Decode ([A-Za-z0-9_.-]+) and ([A-Za-z0-9_.-]+) and require their config objects", q)
+                if pair:
+                    # Day 28: "Decode family-a.elf and family-b.elf and require ... byte-for-byte
+                    # equal ...; do not use false-friend.elf": exactly the two named members.
+                    hits = [[hit for hit in chosen if PurePosixPath(hit[1].filename).name.endswith(name)]
+                            for name in pair.groups()]
+                    ok = all(len(found) == 1 for found in hits) and hits[0] != hits[1]
+                    chosen, picked = ([found[0] for found in hits] if ok else []), []
+                elif named:
                     picked = [(i, x) for i, x in chosen if PurePosixPath(x.filename).name.endswith(named[1])]
                 elif role:
                     picked = [(i, x) for i, x in chosen if PurePosixPath(x.filename).stem.endswith("-" + role[1])]
@@ -623,6 +691,8 @@ class AssignedArchive:
             scope_key = "hex_first" if "first" in q.casefold() else "hex_unique"
         elif "Test every non-overlapping Latin-1 run" in q:
             scope_key = "base64"
+        elif "literal HCFG" in q and re.search(r"[Ss]can backward from the end", q):
+            scope_key = "last_literal"  # Day 28: the first valid record from the end is the last one.
         elif "literal HCFG" in q and ("Scan" in q or "scan" in q):
             scope_key = "first_literal" if "first record" in q else "unique_literal"
         else:
@@ -717,6 +787,18 @@ class AssignedArchive:
         elif scope_key.startswith(("hex_", "base64url_")):
             codec = scope_key.split("_")[0]
             node = self.encoded_config(data, codec, scope_key.endswith("_first"))
+        elif scope_key == "last_literal":
+            node, end = None, len(data)
+            for _ in range(4096):
+                offset = data.rfind(b"HCFG", 0, end)
+                if offset < 0:
+                    break
+                node = self.record(data, offset)
+                if node:
+                    break
+                end = offset + 3  # An earlier magic may overlap this one by at most three bytes.
+            else:
+                raise ParseError("HCFG scan exceeded candidate bound")
         else:
             node, start, found = None, 0, []
             if scope_key != "base64":
@@ -766,6 +848,13 @@ class AssignedArchive:
             return True, str(len(data) - self.overlay(question, data).offset)
         if "In the final RS20 resource overlay" in q and "size field" in q:
             return True, str(self.overlay(question, data).resource_size)
+        packing = re.search(r"packing_key_(\d+)_hex$", question.answer_id)
+        if packing and "final PK19 overlay" in q and "packing key" in q:
+            # Day 28 asks day 19's "k1 at +5, k2 at +6" by the answer ID alone.
+            if packing[1] not in ("1", "2"):
+                return True, None
+            offset = self.overlay(question, data).offset
+            return True, f"0x{data[offset + 4 + int(packing[1])]:02x}"
         asks_field = _config_field(question, None) is not None
         if "HCFG" in q and (asks_field or any(word in q for word in ("top-level", "header bytes", "header byte", "HCFG byte 4", "winning encoded carrier", "Apply these mutually exclusive rules"))):
             config = self.config(question, data)
@@ -798,6 +887,23 @@ class AssignedArchive:
             return True, None
         if "HCFG" in q:
             return True, None
+        text = re.search(r"true exactly when the final bytes interpreted as Latin-1 or UTF-16LE contain the case-sensitive text (\S+)", q)
+        if text:
+            needle = text[1].removesuffix(".")
+            return True, str(needle.encode("latin-1") in data or needle.encode("utf-16-le") in data).lower()
+        either = re.search(r"true exactly when the final bytes contain (?!the case-sensitive)(.+?)\.?\s*$", q)
+        if either:
+            clauses = contains_clauses(either[1])
+            if clauses is None:
+                return True, None
+            if any(where == "bytes" and needle.encode("latin-1") in data for where, needle in clauses):
+                return True, "true"
+            wanted = [needle for where, needle in clauses if where == "symbol"]
+            if not wanted:
+                return True, "false"
+            image = self.image(data) if data.startswith(b"\x7fELF") else None
+            names = symbol_names(image) if isinstance(image, ELF) else []
+            return True, str(any(needle in name for needle in wanted for name in names)).lower()
         if data.startswith(b"PK"):
             jar = self.jar(data)
             if "archive container" in low:
@@ -829,6 +935,13 @@ class AssignedArchive:
                 return True, str(len(jar.main.methods))
             if "JAR central directory contains kotlin/coroutines/Continuation.class" in q:
                 return True, str(any(i.filename == "kotlin/coroutines/Continuation.class" for i in jar.infos)).lower()
+            entries = re.search(r"Count JAR central-directory entries whose names end (\.[A-Za-z0-9_$]+)", q)
+            if entries:
+                return True, str(sum(1 for i in jar.infos if i.filename.endswith(entries[1])))
+            if "resolve its this_class constant-pool name" in q:
+                return True, jar.main.this_class
+            if "primary classfile's unique method names, sort strings by ascending code-unit order" in q and "SHA-256" in q:
+                return True, sorted_lf_sha256(set(jar.main.methods))
             return False, None
         if data.startswith(b"\0asm"):
             return False, None  # Generic question-directed Wasm metadata below.
@@ -839,6 +952,8 @@ class AssignedArchive:
             return True, str(any("hcfg" in s.name for s in image.sections)).lower()
         if "true exactly when the parsed ELF section names contain .hcfg" in q:
             return True, str(isinstance(image, ELF) and any(s.name == ".hcfg" for s in image.sections)).lower()
+        if isinstance(image, PE) and "Read the CLI header major and minor runtime bytes" in q:
+            return True, cli_runtime(image)
         if isinstance(image, PE) and ("managed-runtime format classification" in q or "CLR metadata-root version string" in q):
             version = clr_version(image)
             return True, "PE_CLI" if "managed-runtime format classification" in q else version
@@ -857,6 +972,37 @@ class AssignedArchive:
                 return True, hex(image.entry)
             if "true exactly when the ELF section-header name table contains .symtab" in q:
                 return True, str(any(s.name == ".symtab" for s in image.sections)).lower()
+            if "Count ELF symbol-table entries whose resolved name is nonempty, across the parsed symbol tables" in q:
+                return True, str(len(symbol_names(image)))
+            pattern = re.search(r"(count names that match|Count the nonempty ELF symbol names matching|"
+                                r"Collect every nonempty ELF symbol name matching) /(.+?)/(?=[\s,.;]|$)", q)
+            if pattern:
+                # Day 28: a JavaScript-style /.../ over the parsed table (symbol_names()).
+                if len(pattern[2]) > 200:
+                    return True, None
+                try:
+                    expression = re.compile(pattern[2], re.ASCII)
+                except re.error:
+                    return True, None
+                names = [name for name in symbol_names(image) if expression.search(name)]
+                if pattern[1].startswith("Collect"):
+                    if "sort strings by ascending code-unit order, join with one LF byte and no trailing LF, then SHA-256" not in q:
+                        return True, None
+                    return True, sorted_lf_sha256(names)
+                return True, str(len(names))
+            opcodes = re.search(r"In the ELF (\.[A-Za-z0-9_.]+?) bytes, count every 0x([0-9a-f]{2})\.\.0x([0-9a-f]{2}) byte "
+                                r"and every two-byte sequence 0x([0-9a-f]{2}) followed by 0x([0-9a-f]{2})\.\.0x([0-9a-f]{2})", q, re.I)
+            if opcodes:
+                # Day 28 d17: Jcc rel8 (0x70..0x7f) and Jcc rel32 (0x0f 0x80..0x8f) bytes; every
+                # position is tested once, so both kinds are counted independently.
+                sections = [s for s in image.sections if s.name == opcodes[1] and s.kind != 8]
+                if len(sections) != 1:
+                    return True, None
+                raw = image.take(sections[0].offset, sections[0].size)
+                low, high, lead, second_low, second_high = (int(value, 16) for value in opcodes.groups()[1:])
+                single = sum(raw.count(bytes([value])) for value in range(low, high + 1))
+                pairs = len(re.findall(b"(?=%s[\\x%02x-\\x%02x])" % (re.escape(bytes([lead])), second_low, second_high), raw))
+                return True, str(single + pairs)
             if "Read the .huntress section bytes as UTF-8 and remove trailing NUL bytes only" in q:
                 sections = [s for s in image.sections if s.name == ".huntress"]
                 if len(sections) != 1:
