@@ -726,8 +726,8 @@ def _pcap_header(data: bytes) -> tuple[str, int, int] | None:
     return None
 
 
-def _gpt_header(data: bytes, lba: int) -> tuple[int, int, int] | None:
-    """(entry array LBA, entry count, entry size) of the GPT header at `lba` if its CRC holds."""
+def _gpt_header(data: bytes, lba: int) -> tuple[int, int, int, bytes] | None:
+    """(entry array LBA, entry count, entry size, disk GUID bytes) of the GPT header at `lba` if its CRC holds."""
     at = lba * 512
     if lba < 1 or data[at:at + 8] != b"EFI PART" or len(data) < at + 92:
         return None
@@ -742,16 +742,18 @@ def _gpt_header(data: bytes, lba: int) -> tuple[int, int, int] | None:
     entries, count, entry_size = struct.unpack_from("<QII", data, at + 72)
     if entry_size < 128 or len(data) < entries * 512 + count * entry_size:
         return None
-    return entries, count, entry_size
+    return entries, count, entry_size, bytes(data[at + 56:at + 72])
 
 
-def disk_partition_start_lba_sequence(data: bytes) -> str | None:
-    """Start LBA of every partition in table order, as a compact JSON array (Day 28 disk images).
+def _disk(data: bytes) -> tuple[str, str | None, list[dict]] | None:
+    """(scheme, disk GUID, partitions in table order) of a raw disk image (Day 28), or None.
 
     GPT (a protective 0xEE MBR): the used entries of the primary table, or of the backup header in
     the last sector when the primary one fails its CRC; the 0xEE entry itself is no partition (the
     autoprop guess `first_partition_start_lba` answered it, wrong). Plain MBR: the non-empty primary
-    slots in order. An extended chain or no valid table answers nothing (512-byte sectors only)."""
+    slots in order. An extended chain or no valid table answers nothing (512-byte sectors only).
+    Each partition: start/end LBA (inclusive), sectors, type (GPT type GUID or MBR "0x%02x"),
+    and for GPT its unique GUID and UTF-16LE name."""
     if len(data) < 1024 or data[510:512] != b"\x55\xaa":
         return None
     slots = [data[446 + 16 * i: 462 + 16 * i] for i in range(4)]
@@ -759,16 +761,107 @@ def disk_partition_start_lba_sequence(data: bytes) -> str | None:
         header = _gpt_header(data, 1) or _gpt_header(data, len(data) // 512 - 1)
         if header is None:
             return None
-        entries, count, entry_size = header
-        starts = []
+        entries, count, entry_size, disk_guid = header
+        partitions = []
         for i in range(count):
             at = entries * 512 + i * entry_size
-            if data[at:at + 16] != b"\0" * 16:
-                starts.append(struct.unpack_from("<Q", data, at + 32)[0])
-        return json.dumps(starts, separators=(",", ":"))
+            if data[at:at + 16] == b"\0" * 16:
+                continue
+            first, last = struct.unpack_from("<QQ", data, at + 32)
+            name = data[at + 56:at + 128].decode("utf-16-le", "replace").split("\0", 1)[0]
+            partitions.append({"start": first, "end": last, "sectors": last - first + 1,
+                               "type": str(uuid.UUID(bytes_le=data[at:at + 16])),
+                               "guid": str(uuid.UUID(bytes_le=data[at + 16:at + 32])), "name": name})
+        return "gpt", str(uuid.UUID(bytes_le=disk_guid)), partitions
     if any(slot[4] in (0x05, 0x0F, 0x85) for slot in slots):
         return None
-    return json.dumps([struct.unpack_from("<I", slot, 8)[0] for slot in slots if slot[4]], separators=(",", ":"))
+    partitions = []
+    for slot in slots:
+        if slot[4]:
+            first, sectors = struct.unpack_from("<II", slot, 8)
+            partitions.append({"start": first, "end": first + sectors - 1, "sectors": sectors,
+                               "type": f"0x{slot[4]:02x}", "guid": None, "name": None})
+    return "mbr", None, partitions
+
+
+def disk_partition_start_lba_sequence(data: bytes) -> str | None:
+    """Start LBA of every partition in table order, as a compact JSON array (Day 28: [34] accepted)."""
+    disk = _disk(data)
+    return None if disk is None else json.dumps([p["start"] for p in disk[2]], separators=(",", ":"))
+
+
+# disk.<field> spellings a later day may use, per partition field (Day 28 asked start_lba_sequence).
+_DISK_FIELDS = {
+    "start": ("start_lba", "first_lba", "starting_lba", "start_sector", "first_sector"),
+    "end": ("end_lba", "last_lba", "ending_lba", "end_sector", "last_sector"),
+    "sectors": ("sector_count", "size_sectors", "length_sectors", "sectors", "size_lba", "length_lba", "lba_count"),
+    "bytes": ("size_bytes", "length_bytes", "byte_size", "byte_length"),
+    "type": ("type_guid", "type_guids", "type", "type_code", "type_hex", "type_byte", "system_id"),
+    "guid": ("guid", "unique_guid", "unique_partition_guid", "partition_guid"),
+    "name": ("name", "names", "label", "labels"),
+}
+_DISK_KEY = {spelling: key for key, spellings in _DISK_FIELDS.items() for spelling in spellings}
+
+
+def disk_property(name: str) -> Callable[[bytes], str | None] | None:
+    """A reader for a `disk.<field>` property no exact parser names, on _disk()'s GPT-first view.
+
+    Autoprop mapped Day 28's disk.partition_start_lba_sequence to the protective MBR entry (LBA 1,
+    refused); its siblings (end LBAs, names, partition GUIDs, the table type) would be mapped the
+    same way, so every disk.* field reads the GPT table when one is there. `_sequence`/`_list` is
+    table order, `_set` sorted and unique; a GUID-only field on an MBR disk answers nothing."""
+    if not name.startswith("disk."):
+        return None
+    field, shape = name[5:], "scalar"
+    for suffix, kind in (("_sequence", "sequence"), ("_list", "sequence"), ("_set", "set")):
+        if field.endswith(suffix):
+            field, shape = field[:-len(suffix)], kind
+            break
+    field = re.sub(r"^partitions?_", "", field)
+
+    def value(partition: dict, key: str, scheme: str):
+        if key == "bytes":
+            return partition["sectors"] * 512
+        if key == "type" and scheme == "gpt" and "guid" not in field:
+            return None  # A bare "type" on GPT could be the GUID or a name: not guessed.
+        return partition[key]
+
+    if shape == "scalar":
+        ends = re.fullmatch(r"(first|last)_partition_(.+)", field)
+        if field in ("count", "number_of_partitions"):
+            return lambda data: None if (d := _disk(data)) is None else str(len(d[2]))
+        if field in ("table_type", "scheme", "table_scheme", "style", "table", "label_type", "partitioning_scheme"):
+            return lambda data: None if (d := _disk(data)) is None else d[0]
+        if field in ("guid", "disk_guid", "identifier_guid"):
+            return lambda data: None if (d := _disk(data)) is None else d[1]
+        if field in ("sector_size_bytes", "sector_size", "logical_sector_size_bytes", "lba_size_bytes"):
+            return lambda data: None if _disk(data) is None else "512"  # _disk() reads 512-byte LBAs only.
+        if not ends or ends[2] not in _DISK_KEY:
+            return None
+        which, key = (0 if ends[1] == "first" else -1), _DISK_KEY[ends[2]]
+
+        def one(data: bytes) -> str | None:
+            disk = _disk(data)
+            if disk is None or not disk[2]:
+                return None
+            got = value(disk[2][which], key, disk[0])
+            return None if got is None else str(got)
+        return one
+    key = _DISK_KEY.get(field)
+    if key is None:
+        return None
+
+    def many(data: bytes) -> str | None:
+        disk = _disk(data)
+        if disk is None:
+            return None
+        values = [value(partition, key, disk[0]) for partition in disk[2]]
+        if any(item is None for item in values):
+            return None
+        if shape == "set":
+            values = sorted(set(values))
+        return json.dumps(values, separators=(",", ":"), ensure_ascii=False)
+    return many
 
 
 def _pcap_field(index: int) -> Callable[[bytes], str | None]:
@@ -811,6 +904,12 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pcap.snaplen": _pcap_field(2),
     "disk.partition_start_lba_sequence": disk_partition_start_lba_sequence,
 }
+
+
+def property_parser(name: str) -> Callable[[bytes], str | None] | None:
+    """The parser for a `Determine <property>`: an exact PROPERTIES entry, else a disk.* field.
+    autoprop and the workspace use this too, so a family reader keeps autoprop's guess out."""
+    return PROPERTIES.get(name) or disk_property(name)
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
     (re.compile(r"exact size in bytes", re.I), lambda data: str(len(data))),
@@ -900,7 +999,7 @@ class MetadataSolver:
         container, data = files.resolve(question.artifact)
         prop = _PROPERTY.search(text)
         if prop:
-            parse = PROPERTIES.get(prop[1])
+            parse = property_parser(prop[1])
             if parse is None or data is None:
                 return None, ""
             return parse(data), f"Parsed {prop[1]} from the bytes of {question.artifact}."

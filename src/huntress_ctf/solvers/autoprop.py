@@ -2,7 +2,7 @@
 
 A new property was the team's slowest flag (days 15, 16, 20), and it is often another
 header field of an executable format, which formats.py already reads. For a property
-that no parser in metadata.PROPERTIES knows:
+that no parser knows (metadata.property_parser: PROPERTIES, or a disk.* field):
 
 - Single Solve (untimed, one question): when suggest.confident() finds one field that is
   clearly the property, answer it once. The candidate's chain records the mapping
@@ -19,7 +19,8 @@ that no parser in metadata.PROPERTIES knows:
   locked until a human took them. An untimed wrong guess costs nothing; silence cost a lane.
 - Timed races (and later days): only mappings a CORRECT single solve confirmed.
 
-Once a parser for the property is added to PROPERTIES, this solver stays out.
+Once a parser for the property is added to PROPERTIES, this solver stays out (Day 28: autoprop
+answered disk.partition_start_lba_sequence from the protective MBR, and it was refused).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from ..formats import describe
 from ..state import GameMasterError, current_fields
 from ..suggest import confident, formatted, ranked
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
-from .metadata import PROPERTIES, Files, _orderings
+from .metadata import Files, _orderings, property_parser
 
 _PROPERTY = re.compile(r"Determine ([a-z0-9_.]+) for ")
 _MAPPING = re.compile(r"([a-z0-9_.]+)=([a-z_]+):([A-Za-z0-9_]+)")
@@ -70,7 +71,7 @@ class AutoPropertySolver:
             return []
         items = [
             (question, match[1]) for question in question_items(context)
-            if question.artifact and (match := _PROPERTY.search(question.text)) and match[1] not in PROPERTIES
+            if question.artifact and (match := _PROPERTY.search(question.text)) and property_parser(match[1]) is None
         ]
         if not items:
             return []

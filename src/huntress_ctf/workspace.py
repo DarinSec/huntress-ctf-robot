@@ -20,7 +20,7 @@ from .display import safe_value
 from .evidence import collect
 from .formats import describe as format_fields
 from .macho import describe, field, slices
-from .solvers.metadata import PROPERTIES
+from .solvers.metadata import property_parser
 from .state import current_fields
 from .suggest import suggest
 
@@ -61,12 +61,12 @@ def _question_section(questions: list[dict[str, Any]], members: tuple[Member, ..
         target = str(first.get("artifact") or "")
         member = target.rsplit("->", 1)[-1].strip().rsplit("/", 1)[-1]
         prop = _PROPERTY.search(text)
-        status = "" if not prop else (" **(parser exists)**" if prop[1] in PROPERTIES else " **(NO PARSER: add it to PROPERTIES)**")
+        status = "" if not prop else (" **(parser exists)**" if property_parser(prop[1]) else " **(NO PARSER: add it to PROPERTIES)**")
         lines.append(f"- {len(items)} x `{first.get('id')}`: {_quoted(text, 400)}{status}")
         lines.append(f"  - format: {_quoted(json.dumps(first.get('answer_format'), ensure_ascii=True), 300)}")
         if target:
             lines.append(f"  - file: {_quoted(target, 200)}" + (f" ({kinds[member]})" if member in kinds else ""))
-        if prop and prop[1] not in PROPERTIES and member in blobs:
+        if prop and property_parser(prop[1]) is None and member in blobs:
             lines += [f"  - suggestion: {line}" for line in suggest(prop[1], blobs[member])] or [
                 "  - suggestion: no field of a known format matches; see the format fields below"]
     if len(groups) > MAX_QUESTION_GROUPS:

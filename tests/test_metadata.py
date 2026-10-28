@@ -22,6 +22,29 @@ def zipped(entries):
     return buffer.getvalue()
 
 
+def gpt_image(starts, sectors=256, names=(), types=(), guids=(), disk_guid=b"\x26" * 16):
+    """A raw GPT disk behind a protective MBR, primary and backup headers; one partition per start (10 sectors)."""
+    disk = bytearray(sectors * 512)
+    disk[446:462] = struct.pack("<B3sB3sII", 0, b"", 0xEE, b"", 1, sectors - 1)
+    disk[510:512] = b"\x55\xaa"
+    entries = bytearray(128 * 128)
+    for i, start in enumerate(starts):
+        at = i * 128
+        entries[at:at + 16] = types[i] if i < len(types) else b"\x11" * 16
+        entries[at + 16:at + 32] = guids[i] if i < len(guids) else bytes([0x40 + i]) * 16
+        entries[at + 32:at + 48] = struct.pack("<QQ", start, start + 9)
+        name = (names[i] if i < len(names) else "").encode("utf-16-le")
+        entries[at + 56:at + 56 + len(name)] = name
+    disk[1024:1024 + len(entries)] = entries
+    for lba, other in ((1, sectors - 1), (sectors - 1, 1)):
+        header = bytearray(struct.pack("<8sIIII", b"EFI PART", 0x10000, 92, 0, 0))
+        header += struct.pack("<QQQQ", lba, other, 34, sectors - 34) + disk_guid
+        header += struct.pack("<QIII", 2, 128, 128, zlib.crc32(bytes(entries)))
+        header[16:20] = struct.pack("<I", zlib.crc32(bytes(header)))
+        disk[lba * 512:lba * 512 + 92] = header
+    return disk
+
+
 def box(kind, payload):
     return struct.pack(">I4s", 8 + len(payload), kind) + payload
 
@@ -282,23 +305,7 @@ class PropertyTests(unittest.TestCase):
 
     def test_disk_partition_start_lba_sequence(self):
         # Day 28: a GPT image behind a protective MBR, its backup header, and plain MBR.
-        def gpt(starts, sectors=256):
-            disk = bytearray(sectors * 512)
-            disk[446:462] = struct.pack("<B3sB3sII", 0, b"", 0xEE, b"", 1, sectors - 1)
-            disk[510:512] = b"\x55\xaa"
-            entries = bytearray(128 * 128)
-            for i, start in enumerate(starts):
-                entries[i * 128:i * 128 + 16] = b"\x11" * 16
-                entries[i * 128 + 32:i * 128 + 48] = struct.pack("<QQ", start, start + 9)
-            disk[1024:1024 + len(entries)] = entries
-            for lba, other in ((1, sectors - 1), (sectors - 1, 1)):
-                header = bytearray(struct.pack("<8sIIII", b"EFI PART", 0x10000, 92, 0, 0))
-                header += struct.pack("<QQQQ", lba, other, 34, sectors - 34) + b"\0" * 16
-                header += struct.pack("<QIII", 2, 128, 128, zlib.crc32(bytes(entries)))
-                header[16:20] = struct.pack("<I", zlib.crc32(bytes(header)))
-                disk[lba * 512:lba * 512 + 92] = header
-            return disk
-
+        gpt = gpt_image
         read = m.PROPERTIES["disk.partition_start_lba_sequence"]
         self.assertEqual(read(bytes(gpt([34]))), "[34]")  # not the protective entry's LBA 1
         self.assertEqual(read(bytes(gpt([115, 204, 240]))), "[115,204,240]")
@@ -316,6 +323,45 @@ class PropertyTests(unittest.TestCase):
         mbr[478 + 4] = 0x05  # an extended chain: answers nothing rather than guess its shape
         self.assertIsNone(read(bytes(mbr)))
         self.assertIsNone(read(b"\0" * 2048))
+
+    def test_disk_field_family_reads_gpt_not_the_protective_mbr(self):
+        # Forecast from Day 28: autoprop answered disk.* from the protective MBR (refused). Each
+        # sibling field reads the same GPT-first table; MBR-only shapes answer nothing on GPT.
+        basic = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")  # Basic data, mixed-endian on disk
+        disk = bytes(gpt_image([240, 115], names=["HUNTRESS EVIDENCE", "SPARE"], types=[basic, basic],
+                               guids=[b"\x01" * 16, b"\x02" * 16]))
+        read = lambda name: m.property_parser(name)(disk)
+        self.assertEqual(read("disk.partition_count"), "2")
+        self.assertEqual(read("disk.partition_table_type"), "gpt")
+        self.assertEqual(read("disk.disk_guid"), "26262626-2626-2626-2626-262626262626")
+        self.assertEqual(read("disk.partition_end_lba_sequence"), "[249,124]")
+        self.assertEqual(read("disk.partition_sector_count_sequence"), "[10,10]")
+        self.assertEqual(read("disk.partition_size_bytes_sequence"), "[5120,5120]")
+        self.assertEqual(read("disk.partition_start_lba_set"), "[115,240]")
+        self.assertEqual(read("disk.partition_name_sequence"), '["HUNTRESS EVIDENCE","SPARE"]')
+        self.assertEqual(read("disk.partition_type_guid_sequence"),
+                         '["ebd0a0a2-b9e5-4433-87c0-68b6b72699c7","ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"]')
+        self.assertEqual(read("disk.partition_guid_sequence"),
+                         '["01010101-0101-0101-0101-010101010101","02020202-0202-0202-0202-020202020202"]')
+        self.assertEqual(read("disk.first_partition_start_lba"), "240")
+        self.assertEqual(read("disk.sector_size_bytes"), "512")  # autoprop took the GPT header size, 92
+        self.assertIsNone(read("disk.partition_type_sequence"))  # bare "type" on GPT: not guessed
+        self.assertIsNone(m.property_parser("disk.partition_colour_sequence"))
+        mbr = bytearray(2048)
+        mbr[446:462] = struct.pack("<B3sB3sII", 0x80, b"", 0x07, b"", 2048, 100)
+        mbr[510:512] = b"\x55\xaa"
+        self.assertEqual(m.property_parser("disk.partition_type_sequence")(bytes(mbr)), '["0x07"]')
+        self.assertEqual(m.property_parser("disk.partition_end_lba_sequence")(bytes(mbr)), "[2147]")
+        self.assertIsNone(m.property_parser("disk.partition_name_sequence")(bytes(mbr)))  # MBR has none
+        # A parsed family keeps autoprop out (two candidates would block the submit).
+        from huntress_ctf.solvers.autoprop import AutoPropertySolver
+        question = {"id": "q", "question": "Determine disk.partition_end_lba_sequence for disk-001.img.",
+                    "artifact": "metadata-day-28-evidence.zip -> disk-001.img"}
+        bundle = zipped([("metadata-day-28-evidence.zip", zipped([("disk-001.img", disk)]))])
+        context = SolveContext("metadata-forensics-day-28-x", {"lane": "metadata-forensics"},
+                               {"answer_ids": ["q"], "questions": [question]}, bundle, Path("x"), ("q",))
+        self.assertEqual(AutoPropertySolver().solve(context), [])
+        self.assertEqual([a.answer for a in MetadataSolver().solve(context)], ["[249,124]"])
 
     def test_msi_stream_names_unpack(self):
         alphabet = m._MSI_ALPHABET
