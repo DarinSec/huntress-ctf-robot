@@ -115,7 +115,9 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   with <>; ffprobe codec names; OOXML external targets sorted; central-directory names
   sorted (Day 23 rejected directory order; days 7-20 directories happened to be sorted),
   compact JSON; Mach-O cpu_type_set sorted; SQLite page_size_bytes from header offset 16
-  (1 = 65536). "none" only when the parsed file lacks the field.
+  (1 = 65536). "none" only when the parsed file lacks the field. Disk images (Day 28): a
+  protective MBR means the GPT table is the answer (`disk.partition_start_lba_sequence` [34],
+  not the 0xEE entry's 1); every `disk.*` field goes through `property_parser()` -> `_disk()`.
   `formats_dfir.py` reads the forensic formats no day has used yet (EVTX, registry hive,
   Prefetch, plist, WebP, TIFF, Matroska/WebM, AVI, VHD/VHDX, CAB, xz/bzip2/zstd/lz4,
   ar/deb, pyc, RTF, CRX, ESE, OLE2 SummaryInformation) so `autoprop` can map a new property.
@@ -166,6 +168,10 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   label `i386` (day 23 rejected 332 for the managed F# assemblies). Where a spelling is
   refused again, the split names the single answer and `_spellings` offers the label, the
   decimal and the hex code on an untimed attempt.
+  Day 28 added kinds inside the old blocks too (324 -> 392; the robot had 366): each block
+  can grow, not only the new day's. ELF symbol counts and /regex/ counts read `.symtab` when
+  the binary has one, else `.dynsym` (`symbol_names()`; d13 accepted 771, refused 1255 for
+  both tables). Member-list questions ("Count the d01-- members ...") are `structural()`.
 - **Web Exploitation: done (robot-owned).** `solvers/web/` (Parsa's curriculum handlers,
   merged and extended): scoped HTTP, keep-alive reuse, solve-once-per-target, signed-cookie
   proof fallback, autonomous prober. Days 1-15 (every vuln class) solve live and are raced
