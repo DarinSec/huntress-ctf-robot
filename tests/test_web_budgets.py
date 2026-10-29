@@ -99,7 +99,11 @@ class BudgetTests(unittest.TestCase):
     def test_reset_begins_a_fresh_allowance(self):
         budget = Budget(max_requests=1, wall_s=100.0)
         remaining = budget.charge()
-        self.assertTrue(0 < remaining <= 100.0)
+        # (now + wall_s) - now can round a hair ABOVE wall_s when the sum crosses a binade
+        # boundary: with a 100 s budget a monotonic clock in [412, 512) rounds up ~21% of the
+        # time (0% outside such a band). A freshly booted Homebase sits in those low bands, so
+        # without this tick the deploy's test gate fails on the VM's uptime, not on a defect.
+        self.assertTrue(0 < remaining <= 100.0 + 1e-9)
         with self.assertRaises(BudgetExhausted):
             budget.charge()
         budget.reset()
