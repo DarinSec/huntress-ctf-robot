@@ -172,6 +172,15 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   can grow, not only the new day's. ELF symbol counts and /regex/ counts read `.symtab` when
   the binary has one, else `.dynsym` (`symbol_names()`; d13 accepted 771, refused 1255 for
   both tables). Member-list questions ("Count the d01-- members ...") are `structural()`.
+- **Static reverse engineering (Day 30, traditional route):** `solvers/static_re.py`
+  (`static-flag`) answers a route's `flag` (answer ID exactly `flag`, or a format that shows
+  `flag{`; Read the Rules' shape has no questions[] at all) only when exactly one flag of the
+  format's shape (default `flag{32 hex}`) is in the bytes: text, UTF-16, ROT13/47, reversed,
+  XOR/ADD/rotate by a byte or by the index, 1-2 decode layers of a string, x86 stack strings
+  (a small frame emulator: immediates, register and SSE stores, gcc's overlapping last qword,
+  RIP-relative .rodata constants), zlib streams (PyInstaller) and `upx -d`. The sample never runs.
+  A route in a lane outside `--lanes` is never listed by `homebase-day.sh`/`local-day.sh`; one in
+  the Binary lane that stays unresolved holds the day's races (`RACE_WHEN_OPEN=1`).
 - **Web Exploitation: done (robot-owned).** `solvers/web/` (Parsa's curriculum handlers,
   merged and extended): scoped HTTP, keep-alive reuse, solve-once-per-target, signed-cookie
   proof fallback, autonomous prober. Days 1-15 (every vuln class) solve live and are raced
