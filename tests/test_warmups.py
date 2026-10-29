@@ -100,6 +100,7 @@ LATER_ENCODE = {
     26: _brainfuck,
     27: lambda t: " ".join(_BF_TO_OOK[op] for op in _brainfuck(t)),
     28: lambda t: t.encode().hex()[::-1],  # "Back in Sixteen": hex, walking backwards.
+    29: lambda t: _shift(base64.b64encode(t.encode()).decode(), 13),  # "Sixty-four invited thirteen over".
 }
 
 
@@ -151,6 +152,17 @@ class CourseTests(unittest.TestCase):
         text = split_blob("proud-compass-ember-84", days=28).decode()
         self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("proud-compass-ember-84"))
 
+    def test_split_message_joins_all_twenty_nine_days(self):
+        # Every Day 30 Mastery blob carries a Day 29 line; a fresh Homebase reads it from CURRICULUM.
+        text = split_blob("jovial-comet-nugget-31", days=29).decode()
+        self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("jovial-comet-nugget-31"))
+
+    def test_unknown_line_tries_a_course_text_cipher_before_a_strict_layer(self):
+        rot47 = ENCODE[15]
+        head, tail = MESSAGE.format("pale-moon")[:40], MESSAGE.format("pale-moon-reef-31")[40:]
+        text = "01\t" + base64.b64encode(head.encode()).decode() + "\n40\t" + rot47(tail.encode().hex())
+        self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("pale-moon-reef-31"))
+
     def test_unknown_later_day_is_guessed_only_when_unambiguous(self):
         text = "01\t" + base64.b64encode(b"Nice work, answer: ").decode() + "\n40\t" + "pale-moon-reef-31".encode().hex()
         self.assertEqual(split_message(text, CURRICULUM), "Nice work, answer: pale-moon-reef-31")
@@ -199,6 +211,19 @@ class SolverTests(unittest.TestCase):
                 answers = WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id=challenge_id))
                 self.assertEqual([a.answer for a in answers], ["speedy-button-nugget-52"])
         self.assertEqual(WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id="warmups-day-03")), [])
+
+    def test_unknown_day_single_blob_tries_a_text_cipher_first(self):
+        # A day after 29 in Day 29's shape (an earlier text cipher over an earlier encoding):
+        # decoded, and its chain kept so the day's Mastery line is no longer guessed.
+        atbash = ENCODE[13]
+        blob = atbash(base64.b32encode(MESSAGE.format("brisk-lantern-moss-64").encode()).decode()).encode()
+        for challenge_id in ("warmups-day-30", "warmups-day-30/time_trial"):
+            with self.subTest(challenge_id=challenge_id):
+                answers = WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id=challenge_id))
+                self.assertEqual([(a.answer, a.chain) for a in answers], [("brisk-lantern-moss-64", ("atbash", "base32"))])
+        day29 = LATER_ENCODE[29](MESSAGE.format("nimble-comet-dune-29")).encode()
+        answers = WarmupBlobSolver().solve(context(day29, [question(1, "blob.txt")], challenge_id="warmups-day-29"))
+        self.assertEqual([(a.answer, a.chain) for a in answers], [("nimble-comet-dune-29", ("rot13", "base64"))])
 
     def test_learned_day_comes_from_a_proven_hint(self):
         hints = {"warmups-day-40": {"solvers": ["layered-decode"], "chain": ["hex", "reverse"]}}
