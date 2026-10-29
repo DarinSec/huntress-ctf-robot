@@ -99,7 +99,9 @@ _ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in 
     (r"^(?:valid_from|not_valid_before)(?:_date|_time)?", "not_before"),
     (r"^(?:sans?|san_dns|subject_alternative)(?:_names)?(?=$|_count|_set|_list)", "subject_alt_names"),
     (r"(?:execution|launch)_count", "run_count"),
+    (r"^times_(?:executed|run)$", "run_count"),
     (r"last_(?:execution|executed|run)(?:_time)?", "last_run"),
+    (r"^path_hash(?:_u32_hex|_hex)?$", "prefetch_hash"),  # The Prefetch hash is derived from the path.
     (r"snapshot_length", "snaplen"),
     (r"link_type", "linktype"),
     (r"standard_information", "si"),
@@ -110,6 +112,16 @@ _ALIASES = tuple((re.compile(pattern), replacement) for pattern, replacement in 
     (r"(?<=[a-z])_filename", "_name"),
     (r"^filename", "file_name"),
     (r"(md5|sha1|sha256)_(?:hash|digest)", r"\1"),
+    (r"^acquisition_(md5|sha1|sha256)$", r"\1"),  # EWF stores the acquisition hash as this field.
+    # Recycle Bin $I: the "original" path/name is often worded as the "deleted" one. Anchored so
+    # it never steals "deletion_time" (handled above) with its shared "deleted" word.
+    (r"^deleted_(?:file_)?path$", "original_path"),
+    (r"^deleted_(?:file_)?name$", "original_name"),
+    # A set/list collection worded in the singular maps to the reader's plural field.
+    (r"^reasons?(?:_set|_list|_flags)?$", "reasons"),
+    (r"^triggers?(?:_set|_list|_types?)?$", "trigger_types"),
+    (r"^host_names?$", "hostnames"),
+    (r"^task_uri$", "uri"),
     (r"^(?:oldest|earliest)_record(?:_number|_id)?", "first_record_id"),
     (r"^(?:newest|latest)_record(?:_number|_id)?", "last_record_id"),
     # Archive and image listings (CAB members, the files of a WIM image).

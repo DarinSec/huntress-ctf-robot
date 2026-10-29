@@ -31,7 +31,7 @@ from huntress_ctf.formats_dfir import formats
 from huntress_ctf.suggest import confident, formatted, ranked
 from tests.test_formats_dfir import (CERT_B64, cfb, destlist, dmg, ds_store, evtx, ewf, fields, filetime, gpt_disk,
                                      lnk, minidump, mft_record, ntfs_boot, prefetch, recycle_bin_i, regf,
-                                     scheduled_task, usn_record)
+                                     scheduled_task, summary_information, tiff, usn_record)
 
 
 # --- New readers: disk images, mail stores, kernel dumps, Linux journal and logins --------------
@@ -113,6 +113,64 @@ def wtmp():
             + utmp_record(7, "root", "198.51.100.23", "pts/1", 1793502000, bytes([198, 51, 100, 23])))
 
 
+# --- Readers that already exist but no Metadata day has asked about: the file-format and
+# archive staples the lane has not yet reached (VHD/VHDX disk images, CAB, .pyc, RTF, CRX,
+# ESE, TIFF, WebP, a legacy OLE2 Office document). These prove the autoprop mapping is
+# already right, so such a day self-solves untimed with no human. ------------------------
+
+def vhd():
+    footer = bytearray(512)
+    footer[:8] = b"conectix"
+    struct.pack_into(">IIQI4sI4sQQIII", footer, 8, 2, 0x10000, 0xFFFFFFFFFFFFFFFF, 0, b"win ", 0xA0000,
+                     b"Wi2k", 1 << 30, 1 << 30, (2080 << 16) | (16 << 8) | 63, 2, 0)
+    return bytes(4096) + bytes(footer)
+
+
+def vhdx():
+    return b"vhdxfile" + "Microsoft Windows 10.0.19045.0".encode("utf-16-le").ljust(512, b"\0")
+
+
+def cab():
+    data = bytearray(b"MSCF" + bytes(32))
+    struct.pack_into("<I4xI", data, 8, 0, 44)
+    struct.pack_into("<BBHHHHH", data, 24, 3, 1, 1, 2, 0, 0x1234, 0)
+    data += bytes(8)
+    for name in (b"setup.inf", b"payload.dll"):
+        data += bytes(16) + name + b"\0"
+    return bytes(data)
+
+
+def pyc():
+    return struct.pack("<H2sIII", 3531, b"\r\n", 0, 1_790_000_000, 1234) + b"\xe3"
+
+
+def rtf():
+    return (rb"{\rtf1\ansi\ansicpg1252\deff0{\*\generator Riched20 10.0.19041;}"
+            rb"{\info{\author Analyst}{\creatim\yr2026\mo10\dy1\hr9\min30}}}")
+
+
+def crx():
+    return b"Cr24" + struct.pack("<II", 3, 100) + bytes(100) + b"PK\x03\x04"
+
+
+def ese():
+    page = bytearray(4096)
+    struct.pack_into("<II", page, 4, 0x89ABCDEF, 0x620)
+    struct.pack_into("<I", page, 52, 3)
+    struct.pack_into("<II", page, 232, 0x14, 32768)
+    return bytes(page)
+
+
+def webp():
+    return (b"RIFF" + struct.pack("<I", 22) + b"WEBPVP8X" + struct.pack("<I", 10) + bytes([0x10, 0, 0, 0])
+            + (319).to_bytes(3, "little") + (239).to_bytes(3, "little"))
+
+
+def office():
+    return cfb([("\x05SummaryInformation", summary_information("Q3 plan", "J. Doe", "Microsoft Office Word")),
+                ("WordDocument", b"\xec\xa5")])
+
+
 class ForecastFormatTests(unittest.TestCase):
     def test_vmdk_sparse_header_and_descriptor(self):
         f = fields(vmdk(), "vmdk")
@@ -174,7 +232,8 @@ class ForecastFormatTests(unittest.TestCase):
 
     def test_damaged_forecast_formats_never_raise(self):
         rng = random.Random(31)
-        for seed in (vmdk(), qcow2(), pst(), pst(version=14), kernel_dump(), journal(), wtmp()):
+        for seed in (vmdk(), qcow2(), pst(), pst(version=14), kernel_dump(), journal(), wtmp(),
+                     vhd(), vhdx(), cab(), pyc(), rtf(), crx(), ese(), webp(), office()):
             for _ in range(200):
                 blob = bytearray(seed)
                 for _ in range(rng.randint(1, 8)):
@@ -231,6 +290,8 @@ def fixtures():
                                 fmt=plistlib.FMT_BINARY),
         "vmdk": vmdk(), "qcow2": qcow2(), "pst": pst(), "kernel_dump": kernel_dump(), "journal": journal(),
         "wtmp": wtmp(), "evtx": evtx(), "regf": regf(), "sqlite": app_database(),
+        "vhd": vhd(), "vhdx": vhdx(), "cab": cab(), "pyc": pyc(), "rtf": rtf(), "crx": crx(), "ese": ese(),
+        "tiff": tiff(), "webp": webp(), "office": office(),
     }
 
 
@@ -300,6 +361,71 @@ PROPERTIES = (
     ("sqlite", "sqlite.schema_table_names", "table_names"), ("sqlite", "sqlite.user_version", "user_version"),
     ("sqlite", "sqlite.text_encoding", "text_encoding"), ("sqlite", "sqlite.journal_mode", "journal_mode"),
     ("sqlite", "sqlite.index_names", "index_names"), ("sqlite", "sqlite.view_names", "view_names"),
+    ("sqlite", "sqlite.trigger_names", "trigger_names"),
+    # More plausible spellings of the same days-26-31 formats: the grader renames the same
+    # field often (plural vs singular, "deleted" vs "original", a prefix), and each must still
+    # land on the right field on the first untimed answer.
+    ("prefetch", "prefetch.times_executed", "run_count"), ("prefetch", "prefetch.hash_u32_hex", "prefetch_hash"),
+    ("mft", "mft.sequence_number", "sequence_number"), ("mft", "mft.hard_link_count", "hard_link_count"),
+    ("mft", "mft.allocated_size_bytes", "allocated_size"), ("mft", "mft.si_accessed_utc", "si_accessed"),
+    ("mft", "mft.file_name_modified_utc", "fn_modified"), ("mft", "mft.has_alternate_data_stream", "has_alternate_data_stream"),
+    ("usn", "usn.reasons", "reasons"), ("usn", "usn.first_usn", "first_usn"), ("usn", "usn.last_usn", "last_usn"),
+    ("usn", "usn.deleted_file_names", "deleted_file_names"), ("usn", "usn.created_file_names", "created_file_names"),
+    ("recycle", "recycle_bin.deleted_path", "original_path"),
+    ("jumplist", "jumplist.host_names", "destlist_hostnames"), ("jumplist", "jumplist.most_recent_path", "destlist_most_recent_path"),
+    ("jumplist", "jumplist.pinned_count", "destlist_pinned_count"),
+    ("minidump", "minidump.module_count", "module_count"), ("minidump", "minidump.stream_count", "stream_count"),
+    ("minidump", "minidump.os_version", "os_version"),
+    ("task", "scheduled_task.action_count", "action_count"), ("task", "scheduled_task.hidden", "hidden"),
+    ("task", "scheduled_task.task_uri", "uri"),
+    ("ewf", "ewf.acquisition_md5", "md5"), ("ewf", "ewf.sha1", "sha1"), ("ewf", "ewf.chunk_count", "chunk_count"),
+    ("ewf", "ewf.bytes_per_sector", "bytes_per_sector"), ("ewf", "ewf.evidence_number", "evidence_number"),
+    ("ewf", "ewf.description", "description"),
+    ("disk", "mbr.partition_count", "partition_count"), ("disk", "gpt.partition_count", "partition_count"),
+    ("disk", "gpt.partition_type_guids", "partition_type_guids"),
+    ("ntfs", "ntfs.bytes_per_sector", "bytes_per_sector"), ("ntfs", "ntfs.sectors_per_cluster", "sectors_per_cluster"),
+    ("ntfs", "ntfs.mft_record_size_bytes", "mft_record_size"), ("ntfs", "ntfs.total_sectors", "total_sectors"),
+    ("x509", "x509.subject", "subject"), ("x509", "x509.issuer", "issuer"),
+    ("x509", "x509.public_key_algorithm", "public_key_algorithm"), ("x509", "x509.subject_organization", "subject_organization"),
+    ("x509", "x509.sha1_thumbprint", "sha1_fingerprint"), ("x509", "x509.not_valid_before_utc", "not_before"),
+    ("x509", "x509.version", "version"),
+    ("pcap", "pcap.version", "version"),
+    ("kernel_dump", "kernel_dump.bitness", "bitness"), ("kernel_dump", "kernel_dump.processor_count", "processor_count"),
+    ("kernel_dump", "kernel_dump.machine_name", "machine_name"), ("kernel_dump", "kernel_dump.dump_type", "dump_type"),
+    ("journal", "journald.seqnum_id", "seqnum_id"), ("journal", "journald.file_id", "file_id"),
+    ("journal", "journald.object_count", "object_count"), ("journal", "journald.state_name", "state_name"),
+    ("journal", "journald.tail_entry_realtime_utc", "tail_entry_realtime_utc"),
+    ("wtmp", "utmp.last_login_host", "last_login_host"), ("wtmp", "utmp.ip_addresses", "ip_addresses"),
+    ("wtmp", "utmp.terminals", "terminals"), ("wtmp", "utmp.record_types", "record_types"),
+    ("evtx", "evtx.next_record_id", "next_record_id"), ("evtx", "evtx.chunks_present", "chunks_present"),
+    ("regf", "registry.root_key_name", "root_key_name"), ("regf", "registry.root_value_count", "root_value_count"),
+    ("regf", "registry.major_version", "major_version"),
+    # Readers that exist but no day has reached: disk images, archives, byte-code, documents.
+    ("vhd", "vhd.disk_type_name", "disk_type_name"), ("vhd", "vhd.disk_type", "disk_type"),
+    ("vhd", "vhd.creator_application", "creator_application"), ("vhd", "vhd.current_size_bytes", "current_size"),
+    ("vhd", "vhd.original_size_bytes", "original_size"), ("vhd", "vhd.disk_geometry", "disk_geometry"),
+    ("vhd", "vhd.unique_id", "unique_id"), ("vhd", "vhd.timestamp_utc", "timestamp_utc"),
+    ("vhd", "vhd.creator_host_os", "creator_host_os"), ("vhdx", "vhdx.creator", "creator"),
+    ("cab", "cab.file_count", "file_count"), ("cab", "cab.folder_count", "folder_count"),
+    ("cab", "cab.names", "names"), ("cab", "cab.file_names", "names"), ("cab", "cab.compression", "compression"),
+    ("cab", "cab.version", "version"), ("cab", "cab.set_id", "set_id"),
+    ("pyc", "pyc.python_version", "python_version"), ("pyc", "pyc.source_size", "source_size"),
+    ("pyc", "pyc.magic_number", "magic_number"), ("pyc", "pyc.source_size_bytes", "source_size"),
+    ("pyc", "pyc.magic_number_u16_hex", "magic_number"),
+    ("rtf", "rtf.author", "author"), ("rtf", "rtf.generator", "generator"), ("rtf", "rtf.ansicpg", "ansicpg"),
+    ("rtf", "rtf.version", "version"),
+    ("crx", "crx.version", "version"), ("crx", "crx.zip_offset", "zip_offset"),
+    ("ese", "ese.page_size", "page_size"), ("ese", "ese.page_size_bytes", "page_size"),
+    ("ese", "ese.database_state_name", "database_state_name"), ("ese", "ese.database_state", "database_state"),
+    ("ese", "ese.format_revision", "format_revision"), ("ese", "ese.file_type", "file_type"),
+    ("tiff", "tiff.dimensions", "dimensions"), ("tiff", "tiff.make", "make"), ("tiff", "tiff.byte_order", "byte_order"),
+    ("tiff", "tiff.image_width", "image_width"), ("tiff", "tiff.image_width_pixels", "image_width"),
+    ("tiff", "tiff.first_ifd_offset", "first_ifd_offset"),
+    ("webp", "webp.dimensions", "dimensions"), ("webp", "webp.width", "width"), ("webp", "webp.height", "height"),
+    ("webp", "webp.has_alpha", "has_alpha"), ("webp", "webp.animated", "animated"), ("webp", "webp.variant", "variant"),
+    ("office", "ole.document_type", "document_type"), ("office", "ole.author", "author"),
+    ("office", "ole.title", "title"), ("office", "ole.application_name", "application_name"),
+    ("office", "ole.created_utc", "created_utc"), ("office", "ole.stream_names", "stream_names"),
 )
 
 

@@ -30,7 +30,7 @@ from ..formats import describe
 from ..state import GameMasterError, current_fields
 from ..suggest import confident, formatted, ranked
 from .base import AnswerCandidate, SolveContext, fits_format, question_items
-from .metadata import PROPERTIES, Files, _orderings
+from .metadata import Files, _orderings, property_parser
 
 _PROPERTY = re.compile(r"Determine ([a-z0-9_.]+) for ")
 _MAPPING = re.compile(r"([a-z0-9_.]+)=([a-z_]+):([A-Za-z0-9_]+)")
@@ -70,7 +70,7 @@ class AutoPropertySolver:
             return []
         items = [
             (question, match[1]) for question in question_items(context)
-            if question.artifact and (match := _PROPERTY.search(question.text)) and match[1] not in PROPERTIES
+            if question.artifact and (match := _PROPERTY.search(question.text)) and property_parser(match[1]) is None
         ]
         if not items:
             return []

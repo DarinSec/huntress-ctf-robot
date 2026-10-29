@@ -766,6 +766,16 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pcap.snaplen": _pcap_field(2),
 }
 
+def property_parser(prop: str) -> Callable[[bytes], str | None] | None:
+    """The one lane parser for a `Determine <property>`, or None when none owns it.
+
+    The single lookup this solver and autoprop both ask: autoprop guesses only where this
+    returns None, so adding a reader to PROPERTIES always keeps autoprop out of that property
+    (including a family reader registered under one key). An O(1) dict lookup, no per-question cost.
+    """
+    return PROPERTIES.get(prop)
+
+
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
     (re.compile(r"exact size in bytes", re.I), lambda data: str(len(data))),
     (re.compile(r"\bMD5 digest", re.I), lambda data: hashlib.md5(data).hexdigest()),
@@ -854,7 +864,7 @@ class MetadataSolver:
         container, data = files.resolve(question.artifact)
         prop = _PROPERTY.search(text)
         if prop:
-            parse = PROPERTIES.get(prop[1])
+            parse = property_parser(prop[1])
             if parse is None or data is None:
                 return None, ""
             return parse(data), f"Parsed {prop[1]} from the bytes of {question.artifact}."

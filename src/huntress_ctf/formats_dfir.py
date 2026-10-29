@@ -29,7 +29,10 @@ def _guarded(parse: Callable[[bytes, dict], None], data: bytes) -> dict:
     fields: dict = {}
     try:
         parse(data, fields)
-    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError, OverflowError) as exc:
+    except (struct.error, IndexError, ValueError, UnicodeDecodeError, KeyError, OverflowError,
+            TypeError, AttributeError) as exc:
+        # TypeError/AttributeError: a damaged file can still pass a reader's magic check and then
+        # subscript a None regex match or index a short field; a damaged file answers nothing.
         fields["damaged"] = f"{type(exc).__name__} while reading"
     return fields
 
@@ -530,7 +533,9 @@ def _rtf(data: bytes, f: dict) -> None:
         if match:
             parts = dict(re.findall(r"\\([a-z]+)(\d+)", match[1]))
             f[key] = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}".format(*(int(parts.get(k, 0)) for k in ("yr", "mo", "dy", "hr", "min")))
-    f["version"] = int(re.match(r"\{\\rtf(\d+)", text)[1])
+    version = re.match(r"\{\\rtf(\d+)", text)
+    if version:  # A damaged "{\rtf" with no version digit is still caught by _guarded; be explicit.
+        f["version"] = int(version[1])
 
 
 def _crx(data: bytes, f: dict) -> None:
@@ -731,7 +736,12 @@ def _usn_start(data: bytes) -> int | None:
     if at + 60 > len(data):
         return None
     length, major, minor = struct.unpack_from("<IHH", data, at)
-    name_offset = struct.unpack_from("<H", data, at + (58 if major == 2 else 74))[0] if major in (2, 3) else 0
+    # V3's name offset sits at +74 (76 bytes needed); this runs in a format-match condition,
+    # outside _guarded, so a short buffer must answer None rather than raise struct.error.
+    offset_at = at + (58 if major == 2 else 74)
+    if major not in (2, 3) or offset_at + 2 > len(data):
+        return None
+    name_offset = struct.unpack_from("<H", data, offset_at)[0]
     if 60 <= length <= 0x10000 and length % 8 == 0 and minor == 0 and name_offset == (60 if major == 2 else 76):
         return at
     return None
