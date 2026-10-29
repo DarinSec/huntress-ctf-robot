@@ -90,6 +90,28 @@ class DailyTests(unittest.TestCase):
         other_lane = {"id": "binary-day-20-x/mastery", "lane": "binary-reverse-engineering", "mode": "mastery"}
         self.assertIsNotNone(eligibility(other_lane, True, {"binary-day-20-x": {}}))
 
+    def test_a_solved_file_route_clears_a_stale_turn_down(self):
+        # The list now reports the route solved, but a later turn-down (turned_down_at after
+        # recorded_at) still blocks the race, so a proven file-lane route finished since the
+        # mark never races for Hall of Fame (day 27: a Time Trial turned down at 31/32, then
+        # completed). A solved file route's mark is stale -- clear it; web keeps its mark.
+        stale = {"solvers": ["s"], "chain": [], "recorded_at": "2026-10-27T13:00:00+00:00",
+                 "turned_down": "unresolved", "turned_down_at": "2026-10-27T13:05:00+00:00"}
+        mark_only = {"turned_down": "unresolved", "turned_down_at": "2026-10-27T13:05:00+00:00"}
+        ft = {"id": "binary-day-27-x/time_trial", "lane": "binary-reverse-engineering",
+              "mode": "time_trial", "run_for_time_supported": True, "solved": True}
+        wt = {"id": "web-exploitation-day-21-x/time_trial", "lane": "web-exploitation",
+              "mode": "time_trial", "run_for_time_supported": True, "solved": True}
+        # Solved + proven + a stale mark: it races.
+        self.assertIsNone(eligibility(ft, True, {ft["id"]: stale}))
+        # Not solved: the mark still blocks it (the fix is gated on `solved`).
+        self.assertIsNotNone(eligibility({**ft, "solved": False}, True, {ft["id"]: stale}))
+        # Web keeps its protective mark even when solved: its exploit may not fit the clock.
+        self.assertIsNotNone(
+            eligibility(wt, True, {wt["id"]: stale}, requested_lanes=("web-exploitation",)))
+        # Clearing the mark never force-races an unproven route: no solver ever scored here.
+        self.assertIsNotNone(eligibility(ft, True, {ft["id"]: mark_only}))
+
     def test_prove_runs_solved_unproven_timed_routes_once_untimed(self):
         # Day 26: Binary's Single Solve was finished by hand, so its Time Trial and Mastery
         # had no proven solver and `daily --timed` never raced them.

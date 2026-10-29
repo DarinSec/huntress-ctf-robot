@@ -5,7 +5,8 @@ the backend answer code is the data decoded by the codec ("reverse" on day 21:
 "FEDCBA9876543210-SNA" -> "ANS-0123456789ABCDEF", CORRECT live). Mastery bundles earlier
 days' codecs: "split" puts parts[i] at position order[i], "reflection" carries the code
 as is, "dynamic" names a payload DEX that holds it. Unknown codecs get the value as is,
-reversed, and one strict layer from decoders.py.
+reversed, and one strict layer from decoders.py, and a key that steps by position is read
+off the known "ANS-" prefix (day 29 "table").
 Day 23 ("huntress.mobile.puzzle.v2", codec "analysis") carries no data: the code is computed
 by the app's Java (Release.code), so dexvm.py emulates that bytecode (and a JNI long f(long)
 from lib/x86_64) without running the app. A puzzle whose data decodes to nothing is tried the
@@ -105,8 +106,12 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
             found.add(bytes(byte ^ key[i % len(key)] for i, byte in enumerate(raw)).decode("latin-1"))
     elif codec == "base58":
         found.add(_base58(data))
+    elif codec == "packet":
+        found |= _packets(data)
+    elif codec == "table":
+        found |= _progression(data)
     else:
-        found |= _search(data) | _split(puzzle)
+        found |= _search(data) | _split(puzzle) | _progression(data)
     return {value.strip() for value in found}
 
 
@@ -159,6 +164,68 @@ def _raw_bytes(text: str) -> list[bytes]:
     except ValueError:
         pass
     return out
+
+
+def _frames(raw: bytes) -> list[bytes] | None:
+    """Payloads of back-to-back frames: magic (2 bytes), length byte, payload, XOR check byte.
+
+    The check byte is the XOR of every byte before it in its frame; one bad check or a
+    frame that runs past the end rejects the whole stream (None).
+    """
+    payloads, i = [], 0
+    while i < len(raw):
+        if raw[i:i + 2] != raw[:2] or i + 3 > len(raw):
+            return None
+        end = i + 3 + raw[i + 2]
+        if end >= len(raw):
+            return None
+        check = 0
+        for byte in raw[i:end]:
+            check ^= byte
+        if check != raw[end]:
+            return None
+        payloads.append(raw[i + 3:end])
+        i = end + 1
+    return payloads or None
+
+
+def _packets(data: str) -> set[str]:
+    """Day 28 "packet": hex of one framed message, "HA" + 0x14 + "ANS-0000000000000028" + 0x11.
+
+    A code is a verified frame's payload, or all payloads joined in order; a stream
+    that does not parse as frames falls back to the codes in its bytes.
+    """
+    found: set[str] = set()
+    for raw in _raw_bytes(data):
+        payloads = _frames(raw)
+        if payloads:
+            found.update(payload.decode("latin-1") for payload in payloads)
+            found.add(b"".join(payloads).decode("latin-1"))
+        else:
+            found.update(match.decode() for match in _IN_TEXT.findall(raw))
+    return found
+
+
+_PREFIX = b"ANS-"
+
+
+def _progression(data: str) -> set[str]:
+    """Bytes moved or XORed by key + step * position, the key and step read off the "ANS-" prefix.
+
+    Day 29 "table": hex of (code[i] + 41 + 3 * i) mod 256 with "key": 41, the step only in the
+    bytes. Every code starts "ANS-", so its first four bytes give any key and step; a stream
+    whose four offsets do not step evenly gives nothing.
+    """
+    found: set[str] = set()
+    for raw in _raw_bytes(data) + [data.encode("latin-1", "replace")]:
+        if len(raw) != 20:  # "ANS-" + 16 hex digits.
+            continue
+        for undo in (lambda byte, key: (byte - key) & 0xFF, lambda byte, key: byte ^ key):
+            keys = [undo(raw[i], _PREFIX[i]) for i in range(4)]
+            step = (keys[1] - keys[0]) & 0xFF
+            if all((keys[i] - keys[i - 1]) & 0xFF == step for i in (2, 3)):
+                found.add(bytes(undo(byte, (keys[0] + step * i) & 0xFF) for i, byte in enumerate(raw)).decode("latin-1"))
+    return found
 
 
 def _steps(text: str) -> set[str]:
