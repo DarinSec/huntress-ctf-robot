@@ -28,8 +28,11 @@ from ..containers import ZIP_ERRORS, decompress
 
 MAX_LAYER_BYTES = 16 * 1024 * 1024  # A zlib/gzip layer inflates to at most this (ROBUSTNESS.md workstream 4).
 
-# Each script gets ~12 questions: decode it once per text, not once per question.
+# Each script gets ~12 questions: decode it once per text, not once per question. The same
+# text reaches recover(), sample_fields() and the deobfuscate retry from each of its questions,
+# so all three memoize on the text (day 25/26 Mastery: 10k+ questions over a few hundred texts).
 recover = functools.lru_cache(maxsize=None)(scripts.recover)
+_deobfuscate = functools.lru_cache(maxsize=None)(deobfuscate)
 
 # Mastery: "evidence-03.zip -> member" (set 3); Time Trial: "evidence.zip -> member" (one set).
 ARTIFACT = re.compile(r"evidence(?:-(\d+))?\.zip\s*->\s*(.+)$")
@@ -69,6 +72,7 @@ SAMPLE_ATTACK = {"resource_hijacking": "T1496", "synthetic_collection": "T1555.0
 FILENAME = r"^[\w.-]+\.[A-Za-z0-9]{2,4}$"
 
 
+@functools.lru_cache(maxsize=None)
 def sample_fields(text):
     r = recover(text)
     vals = list(flatten(r["record"])) if r else []
@@ -666,7 +670,8 @@ def solve(source, qs, only=None):
         v = _answer(m.group(1).split("-")[0], m.group(3), text)
         if v is None:
             # Unanswered: retry once on the text with common obfuscators undone (deobfuscate.py).
-            plain = deobfuscate(text)
+            # Many questions share one text and each fails the same way, so deobfuscate once per text.
+            plain = _deobfuscate(text)
             v = _answer(m.group(1).split("-")[0], m.group(3), plain) if plain != text else None
         if v is None:
             continue
