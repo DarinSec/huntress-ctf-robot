@@ -581,6 +581,12 @@ class BinarySolver:
         assigned = AssignedArchive(context, files)
         for question in _by_delivery(context, files, assigned, (resolved, analyses)):
             try:
+                handled, answer = assigned.structural(question)
+                if handled:  # The archive's member list itself (day 28 d01 block).
+                    if answer is not None and valid_answer(answer, question.answer_format):
+                        result.append(AnswerCandidate(question.answer_id, answer, self.name,
+                            f"Read the ZIP central directory of {question.artifact} by the public member prefix."))
+                    continue
                 family = assigned.family(question)
                 data = assigned.resolve(question)
                 if data is None:

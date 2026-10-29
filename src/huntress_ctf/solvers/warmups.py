@@ -35,6 +35,7 @@ CURRICULUM: dict[int, tuple[str, ...]] = {
     16: ("morse", "hex"), 17: ("bacon", "hex"), 18: ("railfence3",), 19: ("hex",),
     20: ("hex",), 21: ("base64", "zlib"), 22: ("base64", "zlib"), 23: ("ascii85",),
     24: ("runlength",), 25: ("unicode",), 26: ("brainfuck",), 27: ("brainfuck",),
+    28: ("reverse", "hex"),
 }
 # The sentence every warmup states; it picks the one reading when guessed lines have several.
 SENTENCE = re.compile(r"Nice work decoding this warmup! To solve, submit this exact answer to the "
@@ -126,12 +127,14 @@ class WarmupBlobSolver:
             return []
         blobs = self._blobs(context)
         chains = curriculum()
+        single = _SINGLE_ID.fullmatch(context.challenge_id)
+        day_chain = chains.get(int(single[1]), ()) if single else ()
         candidates = []
         for question in items:
             blob = self._blob_for(context, question, blobs)
             if blob is None or len(blob) > MAX_TEXT_BYTES:
                 continue
-            answer, evidence = self._decode(blob, chains)
+            answer, evidence = self._decode(blob, chains, day_chain)
             if answer and fits_format(answer, question.answer_format):
                 candidates.append(AnswerCandidate(question.answer_id, answer, self.name, evidence))
         return candidates
@@ -157,7 +160,8 @@ class WarmupBlobSolver:
         return None
 
     @staticmethod
-    def _decode(blob: bytes, chains: dict[int, tuple[str, ...]]) -> tuple[str | None, str]:
+    def _decode(blob: bytes, chains: dict[int, tuple[str, ...]],
+                day_chain: tuple[str, ...] = ()) -> tuple[str | None, str]:
         try:
             text = blob.decode("utf-8")
         except UnicodeDecodeError:
@@ -169,6 +173,11 @@ class WarmupBlobSolver:
         answers = {answer for _, _, answer in peel(blob)}
         if len(answers) == 1:
             return answers.pop(), "The blob decodes to text that states exactly one answer."
+        # Peel never guesses text ciphers (reversal, ROT): Day 28's reversed hex needs the day's chain.
+        message = decode_fragment(text.strip(), day_chain) if day_chain else None
+        answer = extract_answer(message) if message else None
+        if answer:
+            return answer, "The blob decodes with its day's chain to text that states the answer."
         return None, ""
 
 
