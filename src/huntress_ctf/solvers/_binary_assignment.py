@@ -510,12 +510,14 @@ class AssignedArchive:
                 configs = {PurePosixPath(x.filename).name for x in infos if x.filename.endswith(".runtimeconfig.json")}
                 chosen = [(i, x) for i, x in chosen
                           if PurePosixPath(x.filename).name.rsplit(".", 1)[0] + ".runtimeconfig.json" in configs]
-        if len(chosen) == 2 and "require their config objects to be byte-for-byte equal" in q:
-            # Day 24: "Decode both d24-- role members" (vulnerable and corrected build) and
-            # answer only the config they share; a mismatch has no common value.
-            members = [self.member(reference, blob, index, info) for index, info in chosen]
-            shared = {(c.crc, json.dumps(c.values, sort_keys=True)) for c in (self.config(question, m) for m in members)}
-            return members[0] if len(shared) == 1 else None
+        if "require their config objects to be byte-for-byte equal" in q:
+            # Day 24, 27, 28: "Decode both role members" or "Decode family-a.elf and family-b.elf"
+            if "do not use false-friend" in q or "family-a.elf and family-b.elf" in q:
+                chosen = [(i, x) for i, x in chosen if not PurePosixPath(x.filename).name.endswith("false-friend.elf")]
+            if len(chosen) == 2:
+                members = [self.member(reference, blob, index, info) for index, info in chosen]
+                shared = {(c.crc, json.dumps(c.values, sort_keys=True)) for c in (self.config(question, m) for m in members)}
+                return members[0] if len(shared) == 1 else None
         if len(chosen) > 1 and not self.timed and "HCFG" in q and _config_field(question, None) is not None:
             # Untimed only: a selector no rule knows left several members. Answer the config
             # that every member carrying a CRC32/JSON-valid one agrees on, else nothing; a
