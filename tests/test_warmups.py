@@ -101,12 +101,13 @@ LATER_ENCODE = {
     27: lambda t: " ".join(_BF_TO_OOK[op] for op in _brainfuck(t)),
     28: lambda t: t.encode().hex()[::-1],  # "Back in Sixteen": hex, walking backwards.
     29: lambda t: _shift(base64.b64encode(t.encode()).decode(), 13),  # "Sixty-four invited thirteen over".
+    30: lambda t: ENCODE[7](ENCODE[7](t)),  # "Percent Percent": every byte as %xx, twice.
 }
 
 
-def split_blob(slug, days=19):
-    """The message cut into `days` numbered lines, line N encoded as Day N teaches."""
-    encode = {**ENCODE, **LATER_ENCODE}
+def split_blob(slug, days=19, extra=None):
+    """The message cut into `days` numbered lines, line N encoded as Day N teaches (or as `extra`)."""
+    encode = {**ENCODE, **LATER_ENCODE, **(extra or {})}
     message = MESSAGE.format(slug)
     size = -(-len(message) // days)
     chunks = [message[i * size:(i + 1) * size] for i in range(days)]
@@ -156,6 +157,21 @@ class CourseTests(unittest.TestCase):
         # Every Day 30 Mastery blob carries a Day 29 line; a fresh Homebase reads it from CURRICULUM.
         text = split_blob("jovial-comet-nugget-31", days=29).decode()
         self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("jovial-comet-nugget-31"))
+
+    def test_split_message_joins_all_thirty_days(self):
+        # Every Day 31 Mastery blob carries a Day 30 line; a fresh Homebase (the standby) has no
+        # Day 30 hint, so CURRICULUM pins it.
+        self.assertEqual(CURRICULUM[30], ("url", "url"))
+        text = split_blob("brisk-meadow-lantern-30", days=30).decode()
+        self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("brisk-meadow-lantern-30"))
+
+    def test_a_day_31_blob_guesses_only_its_own_line(self):
+        # Day 31's encoding is unknown before its single solve: its line alone is guessed. A
+        # chain of earlier encodings (Days 28-30 were such chains) stands in for it here.
+        for stand_in in (22, 25, 28, 29):
+            with self.subTest(line_31_as_day=stand_in):
+                text = split_blob("quiet-harbor-pebble-31", days=31, extra={31: LATER_ENCODE[stand_in]}).decode()
+                self.assertEqual(split_message(text, CURRICULUM), MESSAGE.format("quiet-harbor-pebble-31"))
 
     def test_unknown_line_tries_a_course_text_cipher_before_a_strict_layer(self):
         rot47 = ENCODE[15]
@@ -213,11 +229,11 @@ class SolverTests(unittest.TestCase):
         self.assertEqual(WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id="warmups-day-03")), [])
 
     def test_unknown_day_single_blob_tries_a_text_cipher_first(self):
-        # A day after 29 in Day 29's shape (an earlier text cipher over an earlier encoding):
-        # decoded, and its chain kept so the day's Mastery line is no longer guessed.
+        # A day after the last pinned one (30) in Day 29's shape (an earlier text cipher over an
+        # earlier encoding): decoded, and its chain kept so the day's Mastery line is no longer guessed.
         atbash = ENCODE[13]
         blob = atbash(base64.b32encode(MESSAGE.format("brisk-lantern-moss-64").encode()).decode()).encode()
-        for challenge_id in ("warmups-day-30", "warmups-day-30/time_trial"):
+        for challenge_id in ("warmups-day-31", "warmups-day-31/time_trial"):
             with self.subTest(challenge_id=challenge_id):
                 answers = WarmupBlobSolver().solve(context(blob, [question(1, "blob.txt")], challenge_id=challenge_id))
                 self.assertEqual([(a.answer, a.chain) for a in answers], [("brisk-lantern-moss-64", ("atbash", "base32"))])

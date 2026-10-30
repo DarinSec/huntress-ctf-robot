@@ -14,7 +14,7 @@ Edge spaces matter ("nswer " + "to"), so lines are decoded without stripping.
 CURRICULUM was read from the Day 1-19 single solves: a line's chain is the chain that
 decoded its day's whole blob. Days 20-27 come from the Day 27 Mastery's 133 blobs: a fresh
 Homebase has no hints.json to learn them from, and guessing failed every blob there (Day 25's
-U+ line also reads as unicode/base64 noise). Days 28 and 29 come from their single solves.
+U+ line also reads as unicode/base64 noise). Days 28-30 come from their single solves.
 A later day is learned without code: once the robot scores that day's single solve, the
 proven hint's chain is used for its Mastery lines. Until then its line is guessed, and
 several readings are settled by the warmup sentence.
@@ -42,6 +42,9 @@ CURRICULUM: dict[int, tuple[str, ...]] = {
     20: ("hex",), 21: ("base64", "zlib"), 22: ("base64", "zlib"), 23: ("ascii85",),
     24: ("runlength",), 25: ("unicode",), 26: ("brainfuck",), 27: ("brainfuck",),
     28: ("reverse", "hex"), 29: ("rot13", "base64"),
+    # "Percent Percent": every byte as %xx, twice. Guessing reads it too (a fresh robot answered
+    # all 148 Day 30 Mastery blobs), but pinned, a Day 31 blob has only its own line to guess.
+    30: ("url", "url"),
 }
 # The sentence every warmup states; it picks the one reading when guessed lines have several.
 SENTENCE = re.compile(r"Nice work decoding this warmup! To solve, submit this exact answer to the "
