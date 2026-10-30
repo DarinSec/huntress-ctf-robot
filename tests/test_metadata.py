@@ -170,6 +170,44 @@ class OrderingTests(unittest.TestCase):
         self.assertEqual(candidate.alternatives, ())  # No directories, nothing left to vary.
 
 
+class RelationTests(unittest.TestCase):
+    """Day 30 "Seeing Double": relation.identical_sha256_groups of a cluster ZIP."""
+
+    QUESTION = {"id": "d30-cluster-001-relation-identical-sha256-groups", "artifact": "evidence.zip -> cluster-001.zip",
+                "question": "Determine relation.identical_sha256_groups for cluster-001.zip.",
+                "answer_format": {"kind": "json", "syntax": "compact valid JSON array with exact values and order"}}
+
+    def solve(self, cluster):
+        context = SolveContext("metadata-forensics-day-30-x/time_trial", {"lane": "metadata-forensics"},
+                               {"answer_ids": [self.QUESTION["id"]], "questions": [self.QUESTION]},
+                               zipped([("cluster-001.zip", cluster)]), Path("x"), (self.QUESTION["id"],))
+        [candidate] = MetadataSolver().solve(context)
+        return candidate
+
+    def test_groups_are_ids_without_the_directory_sorted(self):
+        # The Day 30 TT/Mastery shape: artifacts/<id> without extension, archive order unsorted.
+        candidate = self.solve(zipped([
+            ("artifacts/kelp-42", b"same"), ("artifacts/amber-49", b"lone"), ("artifacts/falcon-75", b"same"),
+            ("artifacts/bravo-02", b"twin"), ("artifacts/bravo-01", b"twin"), ("artifacts/apple-07", b"twin"),
+        ]))
+        self.assertEqual(candidate.answer, '[["apple-07","bravo-01","bravo-02"],["falcon-75","kelp-42"]]')
+        self.assertEqual(candidate.alternatives, ())  # No extension, nothing else to try.
+
+    def test_the_manifest_names_ids_but_the_bytes_decide(self):
+        # The Single Solve shape: extensions plus a delivery manifest whose sha256 claims lie.
+        manifest = (b'{"artifacts":[{"id":"kelp-42","path":"artifacts/kelp-42.txt","sha256":"00"},'
+                    b'{"id":"falcon-75","path":"artifacts/falcon-75.txt","sha256":"00","producer_id":"duplicate_ref"},'
+                    b'{"id":"amber-49","path":"artifacts/amber-49.txt","sha256":"00","producer_id":"duplicate_ref"}]}')
+        candidate = self.solve(zipped([
+            ("delivery-manifest.json", manifest), ("artifacts/kelp-42.txt", b"same"), ("artifacts/amber-49.txt", b"samf"),
+            ("artifacts/falcon-75.txt", b"same"), ("artifacts/bravo-02.ps1", b"twin"), ("artifacts/bravo-01.ps1", b"twin"),
+        ]))
+        self.assertEqual(candidate.answer, '[["bravo-01.ps1","bravo-02.ps1"],["falcon-75","kelp-42"]]')
+        self.assertEqual(candidate.alternatives, ('[["bravo-01","bravo-02"],["falcon-75","kelp-42"]]',))
+        self.assertEqual(m.relation_identical_sha256_groups(zipped([("a", b"1"), ("b", b"2")])), "[]")
+        self.assertIsNone(m.relation_identical_sha256_groups(b"not a zip"))
+
+
 class PropertyTests(unittest.TestCase):
     def test_images_documents_and_text(self):
         jpeg = b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0" + b"\0" * 9 + \

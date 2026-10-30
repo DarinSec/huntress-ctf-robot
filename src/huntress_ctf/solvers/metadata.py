@@ -238,6 +238,45 @@ def zip_central_directory_member_names(data: bytes) -> str | None:
     return json.dumps(sorted(names), separators=(",", ":"), ensure_ascii=False)
 
 
+def _identical_groups(data: bytes) -> list[tuple[str, list[str]]] | None:
+    """(SHA-256, sorted artifact ids) per set of two or more byte-identical members of a ZIP.
+
+    Day 30 ("Seeing Double"): a cluster ZIP of artifacts/<id> members, some byte for byte the
+    same. The bytes are hashed; a delivery manifest's claimed sha256 is not trusted, only its
+    path -> id naming. Without a manifest entry the id is the base name (Day 30 TT/Mastery
+    members carry no extension). The grader took ids and refused paths (13 Mastery sets).
+    """
+    by_digest: dict[str, list[str]] = {}
+    ids: dict[str, str] = {}
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                body = read_member(archive, info)
+                if PurePosixPath(info.filename).name == "delivery-manifest.json":
+                    try:
+                        listed = json.loads(body).get("artifacts")
+                        ids.update({a["path"]: a["id"] for a in listed
+                                    if isinstance(a, dict) and isinstance(a.get("path"), str) and isinstance(a.get("id"), str)})
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+                    continue
+                by_digest.setdefault(hashlib.sha256(body).hexdigest(), []).append(info.filename)
+    except ZIP_ERRORS:
+        return None
+    name = lambda path: ids.get(path) or PurePosixPath(path).name
+    return [(digest, sorted(map(name, paths))) for digest, paths in by_digest.items() if len(paths) > 1]
+
+
+def relation_identical_sha256_groups(data: bytes) -> str | None:
+    groups = _identical_groups(data)
+    if groups is None:
+        return None
+    # Each group sorted, then the groups (Day 30 TT accepted this; `_orderings` offers the rest).
+    return json.dumps(sorted(names for _, names in groups), separators=(",", ":"), ensure_ascii=False)
+
+
 def _pe(data: bytes):
     """(machine, entry RVA, data directories, sections) or None for non-PE bytes."""
     if len(data) < 64 or not data.startswith(b"MZ"):
@@ -893,6 +932,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pdf.header_version": pdf_header_version,
     "zip.eocd_total_entries": zip_eocd_total_entries,
     "zip.central_directory_member_names": zip_central_directory_member_names,
+    "relation.identical_sha256_groups": relation_identical_sha256_groups,
     "pe.coff_machine_u16_hex": pe_coff_machine_u16_hex,
     "pe.address_of_entry_point_rva_hex": pe_address_of_entry_point_rva_hex,
     "pe.version_original_filename": pe_version_original_filename,
@@ -998,10 +1038,19 @@ def _orderings(answer: str, question: Question) -> tuple[str, ...]:
         values = json.loads(answer)
     except ValueError:
         return ()
+    compact = lambda items: json.dumps(items, separators=(",", ":"), ensure_ascii=False)
+    if values and all(isinstance(group, list) and group and all(isinstance(v, str) for v in group)
+                      for group in values):
+        # Groups of artifact names (Day 30 relation.*): the same groups by base name, or by the
+        # base name without its extension (an id where no delivery manifest names one).
+        rename = lambda name_of: sorted(sorted(name_of(PurePosixPath(v)) for v in group) for group in values)
+        other = [compact(rename(lambda p: p.name)), compact(rename(lambda p: p.stem))]
+        return tuple(dict.fromkeys(
+            value for value in other if value != answer and fits_format(value, question.answer_format)
+        ))
     if not values or not all(isinstance(value, str) for value in values):
         return ()
     bases = [PurePosixPath(value).name for value in values]
-    compact = lambda items: json.dumps(items, separators=(",", ":"), ensure_ascii=False)
     other = [compact(sorted(values))]
     if bases != values:  # Nothing to try where the names carry no directory.
         other += [compact(bases), compact(sorted(bases))]
