@@ -871,6 +871,21 @@ def _pcap_field(index: int) -> Callable[[bytes], str | None]:
     return read
 
 
+def _x509_field(key: str) -> Callable[[bytes], str | None]:
+    """A field of an X.509 certificate (Day 29 "trust issues"), PEM or DER: formats_dfir's
+    certificate() reads it, and the fingerprints are over the DER bytes, which is what every
+    tool reports. Mapped here rather than left to autoprop so a *timed* race answers it too:
+    autoprop guesses only on untimed runs, so a teammate's hand-solved Single Solve confirms
+    nothing and the Time Trial then answered this question with silence (Day 29)."""
+    def read(data: bytes) -> str | None:
+        for label, fields in formats_dfir.formats(data):
+            if label == "x509" and fields and fields.get(key) is not None:
+                value = fields[key]
+                return str(value).lower() if isinstance(value, bool) else str(value)
+        return None
+    return read
+
+
 PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "text.utf8_bom_present": text_utf8_bom_present,
     "jpeg.sof_dimensions_pixels": jpeg_sof_dimensions_pixels,
@@ -903,6 +918,29 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pcap.snapshot_length": _pcap_field(2),
     "pcap.snaplen": _pcap_field(2),
     "disk.partition_start_lba_sequence": disk_partition_start_lba_sequence,
+    "x509.sha256_fingerprint": _x509_field("sha256_fingerprint"),
+    "x509.fingerprint_sha256": _x509_field("sha256_fingerprint"),
+    "certificate.sha256_fingerprint": _x509_field("sha256_fingerprint"),
+    "x509.sha1_fingerprint": _x509_field("sha1_fingerprint"),
+    "x509.fingerprint_sha1": _x509_field("sha1_fingerprint"),
+    "x509.serial_number": _x509_field("serial_number"),
+    "x509.subject": _x509_field("subject"),
+    "x509.subject_cn": _x509_field("subject_cn"),
+    "x509.subject_common_name": _x509_field("subject_cn"),
+    "x509.subject_organization": _x509_field("subject_organization"),
+    "x509.issuer": _x509_field("issuer"),
+    "x509.issuer_cn": _x509_field("issuer_cn"),
+    "x509.issuer_common_name": _x509_field("issuer_cn"),
+    "x509.issuer_organization": _x509_field("issuer_organization"),
+    "x509.not_before": _x509_field("not_before"),
+    "x509.not_before_utc": _x509_field("not_before"),
+    "x509.not_after": _x509_field("not_after"),
+    "x509.not_after_utc": _x509_field("not_after"),
+    "x509.signature_algorithm": _x509_field("signature_algorithm"),
+    "x509.public_key_algorithm": _x509_field("public_key_algorithm"),
+    "x509.version": _x509_field("version"),
+    "x509.self_signed": _x509_field("self_signed"),
+    "x509.certificate_count": _x509_field("certificate_count"),
 }
 
 

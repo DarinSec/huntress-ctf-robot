@@ -380,5 +380,57 @@ class PropertyTests(unittest.TestCase):
         self.assertEqual(m.msi_product_code_guid(b"not a compound file"), "none")
 
 
+class X509PropertyTests(unittest.TestCase):
+    """Day 29 "trust issues" asked x509.sha256_fingerprint and the Time Trial answered nothing:
+    formats_dfir read the certificate, but no PROPERTIES entry named the field, and autoprop's
+    clear guess is withheld on the clock. The fingerprints are over the DER bytes, PEM or not."""
+
+    def setUp(self):
+        import base64
+        from tests.test_formats_dfir import CERT_B64
+        self.der = base64.b64decode(CERT_B64)
+        body = b"\n".join(CERT_B64.encode()[i:i + 64] for i in range(0, len(CERT_B64), 64))
+        self.pem = b"-----BEGIN CERTIFICATE-----\n" + body + b"\n-----END CERTIFICATE-----\n"
+
+    def test_sha256_fingerprint_is_the_der_digest_for_pem_and_der(self):
+        want = hashlib.sha256(self.der).hexdigest()
+        for label, blob in (("der", self.der), ("pem", self.pem)):
+            with self.subTest(encoding=label):
+                got = m.property_parser("x509.sha256_fingerprint")(blob)
+                self.assertEqual(got, want)
+                self.assertRegex(got, r"\A[0-9a-f]{64}\Z")   # The format asks for exactly this.
+
+    def test_sha1_fingerprint_is_the_der_digest(self):
+        self.assertEqual(m.property_parser("x509.sha1_fingerprint")(self.pem),
+                         hashlib.sha1(self.der).hexdigest())
+
+    def test_the_named_fields_read_the_certificate(self):
+        self.assertEqual(
+            (m.property_parser("x509.subject_cn")(self.pem),
+             m.property_parser("x509.issuer_organization")(self.pem),
+             m.property_parser("x509.self_signed")(self.pem),
+             m.property_parser("x509.version")(self.pem)),
+            ("anticipate.example.invalid", "Synthetic Test Org", "true", "3"))
+
+    def test_every_x509_spelling_has_a_parser(self):
+        for name in ("x509.sha256_fingerprint", "x509.fingerprint_sha256", "certificate.sha256_fingerprint",
+                     "x509.sha1_fingerprint", "x509.serial_number", "x509.subject", "x509.issuer",
+                     "x509.subject_common_name", "x509.not_before", "x509.not_after_utc",
+                     "x509.signature_algorithm", "x509.public_key_algorithm"):
+            with self.subTest(property=name):
+                self.assertIsNotNone(m.property_parser(name), f"no parser for {name}")
+                self.assertIsNotNone(m.property_parser(name)(self.pem), f"{name} answered nothing")
+
+    def test_a_file_that_is_not_a_certificate_answers_nothing(self):
+        for blob in (b"", b"not a certificate at all", b"\x30\x82" + bytes(64), bytes(300)):
+            with self.subTest(blob=blob[:12]):
+                self.assertIsNone(m.property_parser("x509.sha256_fingerprint")(blob))
+
+    def test_a_truncated_certificate_answers_nothing_and_does_not_raise(self):
+        for cut in (8, 32, 100, len(self.der) // 2, len(self.der) - 1):
+            with self.subTest(cut=cut):
+                self.assertIsNone(m.property_parser("x509.sha256_fingerprint")(self.der[:cut]))
+
+
 if __name__ == "__main__":
     unittest.main()
