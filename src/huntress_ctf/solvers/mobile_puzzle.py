@@ -108,6 +108,16 @@ def _decoded(codec: str, data: str, apk: zipfile.ZipFile, puzzle: dict) -> set[s
         found.add(_base58(data))
     elif codec == "packet":
         found |= _packets(data)
+    elif codec == "layered" and isinstance(puzzle.get("key"), int):
+        # Day 30: Base64 of the code's bytes XORed with (key + index), then reversed. The
+        # neighbouring orders are read too; only an exact ANS- code survives the caller.
+        key = puzzle["key"]
+        for raw in _raw_bytes(data):
+            stepped = bytes(byte ^ ((key + i) & 0xFF) for i, byte in enumerate(raw))
+            backwards = bytes(byte ^ ((key + i) & 0xFF) for i, byte in enumerate(raw[::-1]))
+            flat = bytes(byte ^ (key & 0xFF) for byte in raw)
+            for candidate in (stepped[::-1], backwards, flat[::-1], stepped, flat):
+                found.add(candidate.decode("latin-1"))
     elif codec == "table":
         found |= _progression(data)
     else:

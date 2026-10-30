@@ -31,7 +31,7 @@ from xml.etree import ElementTree
 import zipfile
 import zlib
 
-from .. import formats, formats_dfir
+from .. import formats, formats_dfir, relations
 from ..containers import MAX_TOTAL_BYTES, ZIP_ERRORS, read_member
 from ..macho import field as macho_field, slices as macho_slices
 from ..state import deliveries
@@ -236,6 +236,15 @@ def zip_central_directory_member_names(data: bytes) -> str | None:
     # Sorted: Day 23 rejected central-directory order and accepted the sorted names. Days 7-20
     # were accepted too, because their directories were already in sorted order.
     return json.dumps(sorted(names), separators=(",", ":"), ensure_ascii=False)
+
+
+def relation_identical_sha256_groups(data: bytes) -> str | None:
+    """Day 30 ("Seeing Double"): sets of two or more byte-identical members of a cluster ZIP, each
+    named by its artifact id (relations.artifacts), each group sorted, then the groups. The bytes
+    are hashed; a manifest's sha256 claims are not trusted. The grader took ids (Day 30 TT, first
+    try) and refused full paths (13 Mastery sets)."""
+    arts = relations.artifacts(data)
+    return None if arts is None else json.dumps(relations.exact_groups(arts), separators=(",", ":"), ensure_ascii=False)
 
 
 def _pe(data: bytes):
@@ -893,6 +902,7 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
     "pdf.header_version": pdf_header_version,
     "zip.eocd_total_entries": zip_eocd_total_entries,
     "zip.central_directory_member_names": zip_central_directory_member_names,
+    "relation.identical_sha256_groups": relation_identical_sha256_groups,
     "pe.coff_machine_u16_hex": pe_coff_machine_u16_hex,
     "pe.address_of_entry_point_rva_hex": pe_address_of_entry_point_rva_hex,
     "pe.version_original_filename": pe_version_original_filename,
@@ -945,9 +955,9 @@ PROPERTIES: dict[str, Callable[[bytes], str | None]] = {
 
 
 def property_parser(name: str) -> Callable[[bytes], str | None] | None:
-    """The parser for a `Determine <property>`: an exact PROPERTIES entry, else a disk.* field.
-    autoprop and the workspace use this too, so a family reader keeps autoprop's guess out."""
-    return PROPERTIES.get(name) or disk_property(name)
+    """The parser for a `Determine <property>`: an exact PROPERTIES entry, else a disk.* or
+    relation.* field. autoprop and the workspace use this too, so a family reader keeps autoprop's guess out."""
+    return PROPERTIES.get(name) or disk_property(name) or relations.relation_property(name)
 
 _FACTS: list[tuple[re.Pattern[str], Callable[[bytes], str]]] = [
     (re.compile(r"exact size in bytes", re.I), lambda data: str(len(data))),
@@ -998,10 +1008,19 @@ def _orderings(answer: str, question: Question) -> tuple[str, ...]:
         values = json.loads(answer)
     except ValueError:
         return ()
+    compact = lambda items: json.dumps(items, separators=(",", ":"), ensure_ascii=False)
+    if values and all(isinstance(group, list) and group and all(isinstance(v, str) for v in group)
+                      for group in values):
+        # Groups of artifact names (Day 30 relation.*): the same groups by base name, or by the
+        # base name without its extension (an id where no delivery manifest names one).
+        rename = lambda name_of: sorted(sorted(name_of(PurePosixPath(v)) for v in group) for group in values)
+        other = [compact(rename(lambda p: p.name)), compact(rename(lambda p: p.stem))]
+        return tuple(dict.fromkeys(
+            value for value in other if value != answer and fits_format(value, question.answer_format)
+        ))
     if not values or not all(isinstance(value, str) for value in values):
         return ()
     bases = [PurePosixPath(value).name for value in values]
-    compact = lambda items: json.dumps(items, separators=(",", ":"), ensure_ascii=False)
     other = [compact(sorted(values))]
     if bases != values:  # Nothing to try where the names carry no directory.
         other += [compact(bases), compact(sorted(bases))]
@@ -1028,8 +1047,10 @@ class MetadataSolver:
             except (struct.error, ValueError, IndexError, UnicodeError, OverflowError, zipfile.BadZipFile):
                 continue  # A damaged file answers nothing; the other questions still do.
             if answer is not None and fits_format(answer, question.answer_format):
-                candidates.append(AnswerCandidate(question.answer_id, answer, self.name, evidence,
-                                                  alternatives=_orderings(answer, question)))
+                # A family reader may offer its own other readings (relations.Reading), tried first.
+                own = tuple(a for a in getattr(answer, "alternatives", ()) if fits_format(a, question.answer_format))
+                candidates.append(AnswerCandidate(question.answer_id, str(answer), self.name, evidence,
+                                                  alternatives=tuple(dict.fromkeys(own + _orderings(answer, question)))))
         return candidates
 
     def _answer(self, question: Question, files: Files, items: list[Question]) -> tuple[str | None, str]:
