@@ -333,6 +333,76 @@ class StoredXssPollTests(unittest.TestCase):
         self.assertLess(elapsed, 2.0)
 
 
+class Day26And27HandlerTests(unittest.TestCase):
+    def test_solve_tampered_build_day26(self):
+        proof26 = "proof_26262626262626262626262626262626"
+        feed_data = {
+            "updates": [{
+                "package": "telemetry",
+                "version": "1.0",
+                "artifact": {"build": "rel-1", "hook": "passive"},
+                "signature": "sig123",
+                "artifact_sha256": "sha123"
+            }]
+        }
+        routes = {
+            "/api/clues": (200, {}, json.dumps({"framework": "Fiber", "feature_route": "/inspect", "update_feed": "/api/updates"}).encode()),
+            "/api/updates": (200, {}, json.dumps(feed_data).encode()),
+        }
+        with _RoutedServer(routes) as server:
+            class _PostHandler(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length).decode())
+                    if body.get("artifact", {}).get("hook") == "privileged_export":
+                        resp = json.dumps({"evidence": proof26}).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(resp)))
+                        self.end_headers()
+                        self.wfile.write(resp)
+                    else:
+                        self.send_response(400)
+                        self.end_headers()
+                def do_GET(self):
+                    status, headers, body = routes.get(self.path, (404, {}, b"not found"))
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, format: str, *args: Any) -> None: pass
+
+            server_custom = ThreadingHTTPServer(("127.0.0.1", 0), _PostHandler)
+            th = threading.Thread(target=server_custom.serve_forever, daemon=True)
+            th.start()
+            custom_url = f"http://127.0.0.1:{server_custom.server_address[1]}"
+            try:
+                targets = ({"id": "Target 1", "url": custom_url},)
+                from huntress_ctf.solvers.web.curriculum import _scope
+                with _scope(scoped_http(targets)):
+                    p = handlers.detect_and_solve(custom_url, 26)
+                    self.assertEqual(p, proof26)
+            finally:
+                server_custom.shutdown()
+                server_custom.server_close()
+
+    def test_solve_ssrf_internal_day27(self):
+        proof27 = "proof_27272727272727272727272727272727"
+        import urllib.parse
+        target_val = urllib.parse.quote("http://127.0.0.1:8080/status?id=999")
+        routes = {
+            "/api/clues": (200, {}, json.dumps({"framework": "Ktor", "feature_route": "/submit", "case_directory_route": "/api/cases", "topology_route": "/api/topology"}).encode()),
+            "/api/cases": (200, {}, json.dumps({"cases": [{"id": 101, "owner": "analyst"}, {"id": 999, "owner": "executive"}]}).encode()),
+            "/api/topology": (200, {}, json.dumps({"case_service": "http://127.0.0.1:8080/status", "network": "loopback"}).encode()),
+            f"/submit?target={target_val}": (200, {}, f"success: {proof27}".encode()),
+        }
+        with _RoutedServer(routes) as server:
+            targets = ({"id": "Target 1", "url": server.url},)
+            from huntress_ctf.solvers.web.curriculum import _scope
+            with _scope(scoped_http(targets)):
+                p = handlers.detect_and_solve(server.url, 27)
+                self.assertEqual(p, proof27)
+
+
 class ParallelMasteryTests(unittest.TestCase):
     def test_distinct_mastery_targets_solve_concurrently(self):
         proof1 = "proof_11111111111111111111111111111111"

