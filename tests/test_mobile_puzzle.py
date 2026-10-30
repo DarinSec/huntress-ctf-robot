@@ -49,6 +49,14 @@ class MobileCodecTests(unittest.TestCase):
         decoy = whole[:-1] + bytes([whole[-1] ^ 1]) + frame(b"ANS-FFFFFFFFFFFFFFFF")
         self.assertIsNone(answer_code(apk({"codec": "packet", "data": decoy.hex()})))  # Two codes: ambiguous.
 
+    def test_layered_xors_by_position_then_reverses(self):
+        # Day 30: the code reversed, each byte XORed with (key + index), then Base64.
+        for key in (12, 0, 200, 250):  # 250 + 19 wraps past one byte.
+            raw = bytes(byte ^ ((key + i) & 0xFF) for i, byte in enumerate(CODE.encode()[::-1]))
+            puzzle = {"codec": "layered", "key": key, "data": base64.b64encode(raw).decode()}
+            self.assertEqual(answer_code(apk(puzzle)), CODE, key)
+        self.assertIsNone(answer_code(apk({"codec": "layered", "key": 12, "data": "not base64 at all!"})))
+
     def test_table_steps_its_key_by_position(self):
         # Day 29 "table": hex of (code[i] + key + 3 * i) mod 256, key 41; the step is only in the bytes.
         table = bytes((byte + 41 + 3 * i) & 0xFF for i, byte in enumerate(CODE.encode())).hex()
