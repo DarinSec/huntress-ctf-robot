@@ -45,8 +45,15 @@ class Config:
     storage: str = "raw"
 
 
-def config_at(data: bytes, offset: int) -> Config | None:
-    if offset < 0 or offset + 12 > len(data) or data[offset:offset + 4] != b"HCFG":
+def record_magic(q: str) -> bytes:
+    """The record a question names: HCFG, or another magic "with the same 12-byte layout as HCFG"
+    (day 30: the HGRF campaign graph in each Neko member)."""
+    named = re.search(r"CRC32-valid ([A-Z][A-Z0-9]{3}) record", q)
+    return named[1].encode("ascii") if named and "same 12-byte layout as HCFG" in q else b"HCFG"
+
+
+def config_at(data: bytes, offset: int, magic: bytes = b"HCFG") -> Config | None:
+    if offset < 0 or offset + 12 > len(data) or data[offset:offset + 4] != magic:
         return None
     version, key, length, crc = struct.unpack_from("<BBHI", data, offset + 4)
     if not length or offset + 12 + length > len(data):
@@ -81,12 +88,13 @@ def _config_field(question: Question, values: dict | None):
     """The config value a question asks for, however it is worded.
 
     "top-level campaign property" (days 20-23), "decoded HCFG JSON config.campaign" (day 19),
+    "decoded HGRF JSON property graph.config.campaign" (day 30: "graph" is the record itself),
     or failing both the answer ID ("..._config_campaign"), which only counts when exactly one
     key of that name exists in the CRC-validated record. With values=None: whether it asks one.
     """
     q = question.text
     top = re.search(r"top-level ([a-z_]+) property", q)
-    path = re.search(r"decoded HCFG JSON (?!(?:object|record|payload)\b)((?:[A-Za-z0-9_]+\.)*[A-Za-z0-9_]+)", q)
+    path = re.search(r"decoded (?:HCFG|HGRF) JSON (?:property )?(?!(?:object|record|payload)\b)((?:[A-Za-z0-9_]+\.)*[A-Za-z0-9_]+)", q)
     name = _FIELD_ID.search(question.answer_id)
     wanted = name[1] if name and name[1] not in _NOT_FIELDS and "HCFG" in q else None
     if values is None:
@@ -96,6 +104,8 @@ def _config_field(question: Question, values: dict | None):
     leaves = _leaves(values)
     if path and path[1] in leaves:
         return leaves[path[1]]
+    if path and "HGRF" in q and path[1].removeprefix("graph.") in leaves:
+        return leaves[path[1].removeprefix("graph.")]
     if wanted:
         hits = [value for key, value in leaves.items() if key.rsplit(".", 1)[-1] == wanted]
         return hits[0] if len(hits) == 1 else None
@@ -281,10 +291,10 @@ class AssignedArchive:
             self.digests[key] = hashlib.new(algorithm, data).hexdigest()
         return self.digests[key]
 
-    def record(self, data: bytes, offset: int) -> Config | None:
-        key = (id(data), offset)
+    def record(self, data: bytes, offset: int, magic: bytes = b"HCFG") -> Config | None:
+        key = (id(data), offset, magic)
         if key not in self.records:
-            self.records[key] = (data, config_at(data, offset))
+            self.records[key] = (data, config_at(data, offset, magic))
         return self.records[key][1]
 
     def encoded_config(self, data: bytes, codec: str, first: bool) -> Config | None:
@@ -563,9 +573,12 @@ class AssignedArchive:
                 # <prefix>...-<role>.<ext>: stripped/symbolized, compact/direct, loader/plugin and
                 # vulnerable/corrected so far, so a new day's pair needs no new code.
                 named = re.search(r"Use the (?:unique )?[A-Za-z0-9_.-]+-- ([A-Za-z0-9_.-]+) member", q)
+                own = re.search(r"Use ([A-Za-z0-9_.-]+)'s decoded", q)  # Day 30: "Use loader.n's decoded HGRF graph..."
                 role = re.match(r"(?:set\d+\.)?d\d+_analysis_([a-z0-9]+)_", question.answer_id)
                 pair = re.search(r"Decode ([A-Za-z0-9_.-]+) and ([A-Za-z0-9_.-]+) and require their config objects", q)
-                if pair:
+                if own:
+                    picked = [(i, x) for i, x in chosen if PurePosixPath(x.filename).name.endswith(own[1])]
+                elif pair:
                     # Day 28: "Decode family-a.elf and family-b.elf and require ... byte-for-byte
                     # equal ...; do not use false-friend.elf": exactly the two named members.
                     hits = [[hit for hit in chosen if PurePosixPath(hit[1].filename).name.endswith(name)]
@@ -586,6 +599,15 @@ class AssignedArchive:
                 configs = {PurePosixPath(x.filename).name for x in infos if x.filename.endswith(".runtimeconfig.json")}
                 chosen = [(i, x) for i, x in chosen
                           if PurePosixPath(x.filename).name.rsplit(".", 1)[0] + ".runtimeconfig.json" in configs]
+        agree = re.search(r"confirming all (\w+) canonical \w+ graphs match when (\w+) is omitted", q)
+        if agree and len(chosen) == 1:
+            # Day 30: every prefix member's record must be the same graph without its own role key.
+            group = self.ordered_members[ordered_key]
+            wanted = {"two": 2, "three": 3, "four": 4, "five": 5}.get(agree[1], len(group))
+            graphs = [self.config(question, self.member(reference, blob, index, info)).values for index, info in group]
+            bare = {json.dumps({k: v for k, v in g.items() if k != agree[2]}, sort_keys=True) for g in graphs}
+            if len(group) != wanted or len(bare) != 1:
+                return None
         if "require their config objects to be byte-for-byte equal" in q:
             # Day 24, 27, 28: "Decode both role members" or "Decode family-a.elf and family-b.elf"
             if "do not use false-friend" in q or "family-a.elf and family-b.elf" in q:
@@ -695,6 +717,8 @@ class AssignedArchive:
             scope_key = "base64"
         elif "literal HCFG" in q and re.search(r"[Ss]can backward from the end", q):
             scope_key = "last_literal"  # Day 28: the first valid record from the end is the last one.
+        elif record_magic(q) != b"HCFG" and re.search(r"record by scanning backward from the end", q):
+            scope_key = "last_literal"  # Day 30: "the unique CRC32-valid HGRF record by scanning backward".
         elif "literal HCFG" in q and ("Scan" in q or "scan" in q):
             scope_key = "first_literal" if "first record" in q else "unique_literal"
         else:
@@ -723,7 +747,7 @@ class AssignedArchive:
             # only: there an "incorrect" is resent kind by kind, so a wrong record costs one
             # kind; a timed race keeps to the public storage rules.
             scope_key = "discover"
-        key = (id(data), scope_key)
+        key = (id(data), scope_key, record_magic(question.text))
         if key not in self.configs:
             self.configs[key] = None  # Cache failed validation as well as success.
             node = self._carrier(question, data, scope_key)
@@ -790,12 +814,12 @@ class AssignedArchive:
             codec = scope_key.split("_")[0]
             node = self.encoded_config(data, codec, scope_key.endswith("_first"))
         elif scope_key == "last_literal":
-            node, end = None, len(data)
+            node, end, magic = None, len(data), record_magic(question.text)
             for _ in range(4096):
-                offset = data.rfind(b"HCFG", 0, end)
+                offset = data.rfind(magic, 0, end)
                 if offset < 0:
                     break
-                node = self.record(data, offset)
+                node = self.record(data, offset, magic)
                 if node:
                     break
                 end = offset + 3  # An earlier magic may overlap this one by at most three bytes.
