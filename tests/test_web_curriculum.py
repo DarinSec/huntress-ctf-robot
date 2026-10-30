@@ -442,5 +442,100 @@ class ParallelMasteryTests(unittest.TestCase):
             self.assertEqual(cand_map.get("q2"), proof2)
 
 
+
+
+class DelegatedIdentityTests(unittest.TestCase):
+    """Day 28 "pass the identity": an Axum app trusts a client-supplied delegation header.
+    The feature route rejects the caller with `Vary: x-delegated-user`; replaying it as the
+    records_owner from /api/identities returns the proof. Mirrors the live solve."""
+
+    FEATURE = "/execute-373d79"
+    ID_ROUTE = "/api/identities"
+
+    def _serve(self):
+        proof = PROOF
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):  # quiet
+                pass
+
+            def _send(self, code, body, headers=None):
+                raw = body.encode()
+                self.send_response(code)
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                if self.path == "/api/clues":
+                    self._send(200, json.dumps({
+                        "framework": "Axum", "current_role": "analyst",
+                        "feature_route": DelegatedIdentityTests.FEATURE,
+                        "secondary_route": "/result-31b669",
+                        "identity_directory_route": DelegatedIdentityTests.ID_ROUTE}))
+                elif self.path == DelegatedIdentityTests.ID_ROUTE:
+                    self._send(200, json.dumps({"caller": "analyst", "records_owner": "executive"}))
+                elif self.path == DelegatedIdentityTests.FEATURE:
+                    who = self.headers.get("x-delegated-user")
+                    if who == "executive":
+                        self._send(200, json.dumps({"ok": True, "effect": "delegated_identity_trusted",
+                                                     "evidence": proof}))
+                    else:
+                        self._send(403, json.dumps({"error": "delegated_identity_rejected"}),
+                                   {"Vary": "x-delegated-user"})
+                else:
+                    self._send(404, "nope")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_handler_recovers_the_proof(self):
+        server, url = self._serve()
+        try:
+            self.assertEqual(handlers.solve_delegated_identity(url), PROOF)
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_detect_and_solve_routes_to_it(self):
+        server, url = self._serve()
+        try:
+            self.assertEqual(handlers.detect_and_solve(url, 28), PROOF)
+        finally:
+            server.shutdown(); server.server_close()
+
+    def test_wrong_identity_yields_no_proof(self):
+        # If the directory offers no privileged owner and the guesses miss, nothing is returned.
+        proof = PROOF
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *a): pass
+            def do_GET(self):  # noqa: N802
+                body = {"/api/clues": {"framework": "Axum", "feature_route": "/x",
+                                       "identity_directory_route": "/api/identities"},
+                        "/api/identities": {"caller": "analyst"}}.get(self.path)
+                raw = (json.dumps(body) if body is not None else "").encode()
+                self.send_response(200 if body is not None else 403)
+                if body is None:
+                    self.send_header("Vary", "x-delegated-user")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with self.assertRaises(handlers.WebHandlerError):
+                handlers.solve_delegated_identity(url)
+        finally:
+            server.shutdown(); server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

