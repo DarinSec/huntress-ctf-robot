@@ -78,18 +78,24 @@ def answer(question: str, fields: dict[str, str]) -> str | None:
     return None
 
 
-def _lookup(described: dict[str, dict[str, str]], artifact: str) -> dict[str, str] | None:
+def _lookup(described: dict[str, dict[str, str]], by_base: dict[str, list[str]],
+            artifact: str) -> dict[str, str] | None:
     """The descriptor of the file a question names: "evidence-03.zip -> x.php" in a Mastery
     bundle is the member "evidence-03.zip/x.php"; in a single solve the archive named
     first is the artifact itself. Five sets share specimen names, so a base name alone
-    is used only when it is unique."""
+    is used only when it is unique.
+
+    `by_base` (basename -> member names) is built once so this is O(1) per question: a
+    Mastery pairs thousands of questions with thousands of members, and a per-question scan
+    of the members was quadratic (and silently answered nothing when a path prefix kept the
+    exact key from matching)."""
     parts = [part.strip() for part in artifact.split("->") if part.strip()]
     if not parts:
         return None
     for key in ("/".join(parts), "/".join(parts[1:])):
         if key in described:
             return described[key]
-    same = [key for key in described if key.rsplit("/", 1)[-1] == parts[-1]]
+    same = by_base.get(parts[-1], ())
     return described[same[0]] if len(same) == 1 else None
 
 
@@ -105,15 +111,23 @@ class ScriptDescriptorSolver:
         if not items:
             return []
         described: dict[str, dict[str, str]] = {}
+        by_base: dict[str, list[str]] = {}
         for member in context.members:
+            # Only a member that carries the marker can decode; skip the rest without paying
+            # to decode a (possibly 1 MB) body to text first.
+            if b"HUNTRESS_ANALYSIS_V1:" not in member.data[:1_000_000]:
+                continue
             text = member.data[:1_000_000].decode("utf-8", "replace")
             fields = descriptor(text)
             if fields:
                 described[member.name] = fields
+                by_base.setdefault(member.name.rsplit("/", 1)[-1], []).append(member.name)
+        if not described:
+            return []
         candidates = []
         for question in items:
             name = (question.artifact or "").rsplit("->", 1)[-1].strip()
-            fields = _lookup(described, question.artifact or "")
+            fields = _lookup(described, by_base, question.artifact or "")
             if fields is None:
                 continue
             value = answer(question.text, fields)
