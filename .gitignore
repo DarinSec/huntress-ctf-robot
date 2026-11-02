@@ -17,3 +17,21 @@ tools/
 work/
 .huntress/
 
+
+# Logs, local tool state and editor/OS files
+*.log
+logs/
+robot-logs/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+.mypy_cache/
+htmlcov/
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*

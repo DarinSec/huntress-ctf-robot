@@ -1,7 +1,8 @@
 # Huntress CTF robot: working notes for the AI
 
-`AGENTS.md` holds the game rules and is authoritative. This file is how we work in this repo.
-`PLAN.md` holds the team's priorities and lane owners (four players share one set of attempts,
+The organizer's `AGENTS.md` (Huntress material, not included in this repository) holds the
+game rules and is authoritative. This file is how we work in this repo.
+`docs/PLAN.md` holds the team's priorities and lane owners (four players share one set of attempts,
 so only one Homebase runs the robot against the Game Master).
 
 ## The core idea
@@ -185,7 +186,7 @@ milliseconds. `solve --timed` runs only start → artifact → solvers → one s
   (288 requests against a dead "maze") can't blow the race deadline. Spent, it stops that
   target with no guess (`BudgetExhausted`, a BaseException so the handlers' `except Exception`
   can't swallow it); `scoped_http` attaches the budget, the adapter resets it per target.
-- Team roles, setup and the add-a-lane workflow: `TEAM.md`. Before the robot relies on a
+- Team roles, setup and the add-a-lane workflow: `docs/TEAM.md`. Before the robot relies on a
   new solver, prove it per question kind with `scripts/verify_fields.py` (untimed).
 
 ## Live service facts (19 Oct 2026)
@@ -332,7 +333,7 @@ Three tools since Day 23 (all offline except `prepare`, which is read-only):
   script layer once parsed 64 MiB of a bomb's zeros into a "record". `scripts/fuzz.py --bomb 1024`
   and `tests/test_resources.py` send bombs past every cap (256 MiB unpacker, 16 MiB layers).
 
-`tests/test_forecast.py` is the forecast for days 26-31 (PLAN.md, "Läget 26 okt"): likely
+`tests/test_forecast.py` is the forecast for days 26-31 (docs/PLAN.md, "Läget 26 okt"): likely
 property names per format in the grader's style, each checked to get the right field on the
 first untimed answer, and the likely next Warmups encodings. A new day's property missing
 from it: add the row first, then the alias (`suggest._ALIASES`) or the reader.

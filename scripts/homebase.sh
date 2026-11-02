@@ -27,9 +27,9 @@
 #   scripts/homebase.sh report [day] the release at a glance: outcomes, then the questions and
 #                                    field suggestions of each unresolved Warmups/Metadata route
 #
-# HB_HOST and HB_KEY override the host and key.
+# HB_HOST (required, e.g. HuntressCTF@<homebase-ip>) and HB_KEY (optional) set the host and key.
 set -euo pipefail
-host="${HB_HOST:-HuntressCTF@<homebase-ip>}"
+host="${HB_HOST:?set HB_HOST=HuntressCTF@<homebase-ip> (your Homebase VM)}"
 key="${HB_KEY:-$HOME/.ssh/huntress_homebase}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$HOME/.ssh"

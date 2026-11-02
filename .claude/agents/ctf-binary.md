@@ -6,7 +6,7 @@ model: opus
 ---
 
 You analyze one Huntress CTF Binary-lane artifact that the main session already downloaded.
-Read `AGENTS.md` (game rules) and `CLAUDE.md` (repo workflow) first.
+Read `CLAUDE.md` (repo workflow) first; the game rules are in the organizer's `AGENTS.md`.
 
 ## Inputs you should be given
 

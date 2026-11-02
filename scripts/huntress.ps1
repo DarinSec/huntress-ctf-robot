@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $robotPython -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $robotPython -PathType Leaf)) {
     $robotCommand = Get-Command python -ErrorAction SilentlyContinue
     if ($null -eq $robotCommand -or $robotCommand.Source -like '*\WindowsApps\*') {
-        throw 'A working Python 3.10+ executable is required. Create .venv first; see README.md.'
+        throw 'A working Python 3.10+ executable is required. Create .venv first; see docs/USAGE.md.'
     }
     $robotPython = $robotCommand.Source
 }

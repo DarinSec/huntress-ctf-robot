@@ -21,7 +21,7 @@ Hard rules (no exceptions):
   synthetic data built in the test (see tests/ for the style).
 
 Steps:
-1. Read CLAUDE.md and TEAM.md (lane owners, conventions the grader accepted).
+1. Read CLAUDE.md and docs/TEAM.md (lane owners, conventions the grader accepted).
 2. `python3 scripts/solve_offline.py {WORK}` shows, per question kind, what the robot
    answers now. The `--` lines are the work.
 3. For each unanswered kind: read its questions in assignment.json, find the fact in the

@@ -18,7 +18,7 @@ Användaren har valt att köra roboten på sin egen Windows-dator med en parad G
 - `doctor` hämtar schema och utmaningslista samt valfria befintliga statusar. Det startar inga försök och skickar inga svar.
 - `--prompt-token` läser token dolt i terminalen utan att spara den.
 - `scripts/huntress.ps1` startar roboten med tillgänglig Python och projektets källkod.
-- Anslutnings- och parningsinstruktioner finns i `CONNECT.md`. Översikt och begränsningar finns i `README.md`.
+- Anslutnings- och parningsinstruktioner finns i `CONNECT.md`. Översikt och begränsningar finns i `USAGE.md`.
 
 ### Hastighet (18 oktober 2026)
 
